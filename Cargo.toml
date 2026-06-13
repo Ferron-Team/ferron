@@ -4,3 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+vulkano = "0.35"
+vulkano-shaders = "0.35"
+winit = "0.30"
+glam = { version = "0.30", features = ["bytemuck"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
