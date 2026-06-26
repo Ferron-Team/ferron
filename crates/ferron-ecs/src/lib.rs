@@ -233,7 +233,14 @@ impl World {
 
     /// Attach a component to `entity`, returning the previous value if one was
     /// already present.
+    ///
+    /// Does nothing and returns `None` if `entity` is stale (already despawned).
+    /// Without this guard a write through a dangling handle would create a
+    /// "zombie" component that no later despawn can ever reclaim.
     pub fn insert<T: 'static>(&mut self, entity: Entity, component: T) -> Option<T> {
+        if !self.entities.is_alive(entity) {
+            return None;
+        }
         let cell = self
             .storages
             .entry(TypeId::of::<T>())
@@ -623,6 +630,28 @@ mod tests {
         assert!(world.get::<Position>(e).is_none());
         assert!(world.get::<Health>(e).is_none());
         assert!(!world.despawn(e)); // already gone
+    }
+
+    #[test]
+    fn insert_on_stale_handle_is_ignored() {
+        let mut world = World::new();
+        let e1 = world.spawn();
+        assert!(world.despawn(e1));
+
+        // The slot is recycled with a fresh generation.
+        let e2 = world.spawn();
+        assert_eq!(e1.index(), e2.index());
+
+        // Writing through the stale handle must be a no-op, not a zombie that
+        // outlives every future despawn of this slot.
+        assert!(world.insert(e1, Health(1)).is_none());
+        assert!(!world.has::<Health>(e1));
+        assert!(!world.has::<Health>(e2));
+
+        // The live entity is unaffected and behaves normally.
+        world.insert(e2, Health(7));
+        assert_eq!(world.get::<Health>(e2).unwrap().0, 7);
+        assert!(!world.has::<Health>(e1));
     }
 
     #[test]

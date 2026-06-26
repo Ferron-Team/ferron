@@ -1,13 +1,13 @@
 mod camera;
+mod components;
 mod mesh;
 mod transform;
+//mod time;
 
 pub use camera::Camera;
+pub use components::{LocalTransform, MaterialHandle, MeshHandle};
 pub use mesh::CpuMesh;
 pub use transform::Transform;
-
-#[derive(Clone, Copy, Debug)]
-pub struct MeshHandle(pub u32);
 
 pub struct RenderObject {
     pub mesh: MeshHandle,

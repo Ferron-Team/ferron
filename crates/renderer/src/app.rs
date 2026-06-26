@@ -12,7 +12,8 @@ use winit::window::{Window, WindowId};
 
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::RenderBackend;
-use crate::scene::{Camera, CpuMesh, MeshHandle, Scene, Transform};
+use crate::scene::{Camera, CpuMesh, LocalTransform, MeshHandle, Scene, Transform};
+use ferron_ecs::World;
 
 struct Active {
     window: Arc<Window>,
@@ -26,6 +27,7 @@ pub struct App {
     scene: Scene,
     camera: Camera,
     start: Instant,
+    world: World,
 }
 
 impl App {
@@ -51,8 +53,10 @@ impl App {
             scene: Scene::default(),
             camera: Camera::default(),
             start: Instant::now(),
+            world: World::default(),
         };
 
+        app.world.insert_resource(Camera::default());
         event_loop.run_app(&mut app).unwrap();
     }
 }
@@ -74,6 +78,11 @@ impl ApplicationHandler for App {
             VulkanRenderer::new(&self.instance, surface, [size.width, size.height]);
 
         let cube = renderer.load_mesh(&CpuMesh::cube());
+
+        let e = self.world.spawn();
+        self.world.insert(e, LocalTransform::default());
+        self.world.insert(e, cube);
+
         self.scene.objects.clear();
         self.scene.spawn(cube, Transform::default());
 
