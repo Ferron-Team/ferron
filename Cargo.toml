@@ -1,9 +1,13 @@
-[package]
-name = "renderer-prototype"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+ferron-ecs = { path = "crates/ferron-ecs" }
 vulkano = "0.35"
 vulkano-shaders = "0.35"
 winit = "0.30"

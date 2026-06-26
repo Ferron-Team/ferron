@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use glam::{Quat, Vec3};
+use glam::Vec3;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::swapchain::Surface;
 use vulkano::VulkanLibrary;
@@ -12,20 +12,21 @@ use winit::window::{Window, WindowId};
 
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::RenderBackend;
-use crate::scene::{Camera, CpuMesh, MeshHandle, Scene, Transform};
+use crate::scene::{Camera, CpuMesh, LocalTransform, Spin, Time};
+use crate::systems;
+use ferron_ecs::World;
 
 struct Active {
     window: Arc<Window>,
     renderer: VulkanRenderer,
-    cube: MeshHandle,
 }
 
 pub struct App {
     instance: Arc<Instance>,
     active: Option<Active>,
-    scene: Scene,
-    camera: Camera,
+    world: World,
     start: Instant,
+    last_frame: f32,
 }
 
 impl App {
@@ -48,10 +49,14 @@ impl App {
         let mut app = App {
             instance,
             active: None,
-            scene: Scene::default(),
-            camera: Camera::default(),
+            world: World::default(),
             start: Instant::now(),
+            last_frame: 0.0,
         };
+
+        // World-global state lives in resources, not on `App`.
+        app.world.insert_resource(Camera::default());
+        app.world.insert_resource(Time::new());
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -73,15 +78,15 @@ impl ApplicationHandler for App {
         let mut renderer =
             VulkanRenderer::new(&self.instance, surface, [size.width, size.height]);
 
+        // The mesh must be uploaded before we can hand entities a `MeshHandle`.
         let cube = renderer.load_mesh(&CpuMesh::cube());
-        self.scene.objects.clear();
-        self.scene.spawn(cube, Transform::default());
 
-        self.active = Some(Active {
-            window,
-            renderer,
-            cube,
-        });
+        let entity = self.world.spawn();
+        self.world.insert(entity, LocalTransform::default());
+        self.world.insert(entity, cube);
+        self.world.insert(entity, Spin::new(Vec3::Y, 1.0));
+
+        self.active = Some(Active { window, renderer });
     }
 
     fn window_event(
@@ -100,13 +105,18 @@ impl ApplicationHandler for App {
                 active.renderer.resize([size.width, size.height]);
             }
             WindowEvent::RedrawRequested => {
-                let t = self.start.elapsed().as_secs_f32();
-                if let Some(object) = self.scene.objects.first_mut() {
-                    object.transform.rotation =
-                        Quat::from_axis_angle(Vec3::Y, t) * Quat::from_axis_angle(Vec3::X, t * 0.5);
-                }
-                active.renderer.render(&self.scene, &self.camera);
-                let _ = active.cube;
+                let elapsed = self.start.elapsed().as_secs_f32();
+                let delta = elapsed - self.last_frame;
+                self.last_frame = elapsed;
+                self.world.resource_mut::<Time>().update(delta);
+
+                // Simulation systems run, then we extract a draw list for the
+                // backend — which never sees the ECS world directly.
+                systems::spin(&self.world, delta);
+
+                let items = systems::extract_renderables(&self.world);
+                let camera = *self.world.resource::<Camera>();
+                active.renderer.render(&items, &camera);
             }
             _ => {}
         }

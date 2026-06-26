@@ -19,8 +19,8 @@ use vulkano::pipeline::{
 };
 use vulkano::render_pass::{RenderPass, Subpass};
 
-use crate::gfx::Vertex;
-use crate::scene::{Camera, Scene};
+use crate::gfx::{RenderItem, Vertex};
+use crate::scene::Camera;
 
 use super::swapchain::DEPTH_FORMAT;
 use super::VulkanRenderer;
@@ -82,7 +82,7 @@ impl ForwardPass {
             vulkano::command_buffer::PrimaryAutoCommandBuffer,
         >,
         renderer: &VulkanRenderer,
-        scene: &Scene,
+        items: &[RenderItem],
         camera: &Camera,
         extent: [u32; 2],
     ) {
@@ -104,11 +104,11 @@ impl ForwardPass {
             .bind_pipeline_graphics(self.pipeline.clone())
             .unwrap();
 
-        for object in &scene.objects {
-            let Some(mesh) = renderer.meshes.get(object.mesh.0 as usize) else {
+        for item in items {
+            let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
-            let model = object.transform.matrix();
+            let model = item.model;
             let push = PushConstants {
                 mvp: (view_proj * model).to_cols_array_2d(),
                 model: model.to_cols_array_2d(),

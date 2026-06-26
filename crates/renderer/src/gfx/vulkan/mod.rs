@@ -16,13 +16,13 @@ use vulkano::sync::GpuFuture;
 use vulkano::sync::{self, future::FenceSignalFuture};
 use vulkano::{Validated, VulkanError};
 
-use crate::scene::{Camera, CpuMesh, MeshHandle, Scene};
+use crate::scene::{Camera, CpuMesh, MeshHandle};
 
 use self::context::VkContext;
 use self::forward::{ForwardPass, GpuMesh};
 use self::swapchain::SwapchainState;
 
-use super::RenderBackend;
+use super::{RenderBackend, RenderItem};
 
 type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
 
@@ -68,7 +68,7 @@ impl RenderBackend for VulkanRenderer {
         self.recreate_swapchain = true;
     }
 
-    fn render(&mut self, scene: &Scene, camera: &Camera) {
+    fn render(&mut self, items: &[RenderItem], camera: &Camera) {
         if self.pending_extent[0] == 0 || self.pending_extent[1] == 0 {
             return;
         }
@@ -123,7 +123,7 @@ impl RenderBackend for VulkanRenderer {
             .unwrap();
 
         self.forward
-            .draw(&mut builder, self, scene, camera, self.swapchain.extent);
+            .draw(&mut builder, self, items, camera, self.swapchain.extent);
 
         builder.end_render_pass(Default::default()).unwrap();
         let command_buffer = builder.build().unwrap();
