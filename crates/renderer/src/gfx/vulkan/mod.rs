@@ -16,13 +16,13 @@ use vulkano::sync::GpuFuture;
 use vulkano::sync::{self, future::FenceSignalFuture};
 use vulkano::{Validated, VulkanError};
 
-use crate::scene::{Camera, CpuMesh, MeshHandle};
+use crate::scene::{Camera, CpuMesh, MaterialHandle, MeshHandle};
 
 use self::context::VkContext;
-use self::forward::{ForwardPass, GpuMesh};
+use self::forward::{ForwardPass, GpuMesh, GpuMaterial};
 use self::swapchain::SwapchainState;
 
-use super::{RenderBackend, RenderItem, SceneLighting};
+use super::{Material, RenderBackend, RenderItem, SceneLighting};
 
 type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
 
@@ -31,6 +31,7 @@ pub struct VulkanRenderer {
     swapchain: SwapchainState,
     forward: ForwardPass,
     pub(crate) meshes: Vec<GpuMesh>,
+    pub(crate) materials: Vec<GpuMaterial>,
     previous_frame_end: Option<FrameFuture>,
     recreate_swapchain: bool,
     pending_extent: [u32; 2],
@@ -48,6 +49,7 @@ impl VulkanRenderer {
             swapchain,
             forward,
             meshes: Vec::new(),
+            materials: vec![forward::to_gpu_material(&Material::default())],
             previous_frame_end: None,
             recreate_swapchain: false,
             pending_extent: extent,
@@ -60,6 +62,12 @@ impl RenderBackend for VulkanRenderer {
         let gpu = forward::upload_mesh(&self.ctx.memory_allocator, &mesh.vertices, &mesh.indices);
         let handle = MeshHandle(self.meshes.len() as u32);
         self.meshes.push(gpu);
+        handle
+    }
+
+    fn load_material(&mut self, material: &Material) -> MaterialHandle {
+        let handle = MaterialHandle(self.materials.len() as u32);
+        self.materials.push(forward::to_gpu_material(material));
         handle
     }
 

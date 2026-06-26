@@ -1,6 +1,6 @@
 pub mod vulkan;
 
-use crate::scene::{Camera, CpuMesh, MeshHandle};
+use crate::scene::{Camera, CpuMesh, MaterialHandle, MeshHandle};
 use glam::{Mat4, Vec3};
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
@@ -26,6 +26,7 @@ pub struct Vertex {
 pub struct RenderItem {
     pub model: Mat4,
     pub mesh: MeshHandle,
+    pub material: MaterialHandle,
 }
 
 pub const MAX_POINT_LIGHTS: usize = 16;
@@ -72,6 +73,27 @@ pub struct SceneLighting {
     pub specular_strength: f32,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct Material {
+    pub base_color: Vec3,
+    pub metallic: f32,
+    pub roughness: f32,
+    pub reflectance: f32,
+    pub emissive: Vec3,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            base_color: Vec3::splat(0.8),
+            metallic: 0.0,
+            roughness: 0.5,
+            reflectance: 0.5,
+            emissive: Vec3::ZERO,
+        }
+    }
+}
+
 impl Default for SceneLighting {
     fn default() -> Self {
         Self {
@@ -94,6 +116,7 @@ impl Default for SceneLighting {
 // other backends (e.g. wgpu, D3D12) without touching scene/app code.
 pub trait RenderBackend {
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle;
+    fn load_material(&mut self, material: &Material) -> MaterialHandle;
     fn resize(&mut self, extent: [u32; 2]);
     fn render(&mut self, items: &[RenderItem], lighting: &SceneLighting, camera: &Camera);
 }

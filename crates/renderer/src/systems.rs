@@ -9,7 +9,7 @@ use glam::Vec3;
 use ferron_ecs::World;
 
 use crate::gfx::{PointLight, RenderItem, SceneLighting, MAX_POINT_LIGHTS};
-use crate::scene::{AmbientLight, Light, LocalTransform, MeshHandle, Spin};
+use crate::scene::{AmbientLight, Light, LocalTransform, MaterialHandle, MeshHandle, Spin};
 
 /// Advance every entity that has a [`Spin`] by one frame of `dt` seconds.
 pub fn spin(world: &World, dt: f32) {
@@ -22,15 +22,24 @@ pub fn spin(world: &World, dt: f32) {
 /// [`LocalTransform`] and a [`MeshHandle`].
 ///
 /// This is the bridge from ECS data to the renderer: it produces plain
-/// [`RenderItem`]s so the backend never has to know about the world.
+/// [`RenderItem`]s so the backend never has to know about the world. An
+/// entity's [`MaterialHandle`] is optional — meshes without one fall back to
+/// `MaterialHandle(0)`, the default material the backend seeds at startup.
 pub fn extract_renderables(world: &World) -> Vec<RenderItem> {
     let mut items = Vec::new();
     world
         .query::<(&LocalTransform, &MeshHandle)>()
-        .for_each(|_entity, (transform, mesh)| {
+        .for_each(|entity, (transform, mesh)| {
+            // Distinct component type → distinct storage, so this borrow doesn't
+            // clash with the query's borrows.
+            let material = world
+                .get::<MaterialHandle>(entity)
+                .map(|m| *m)
+                .unwrap_or(MaterialHandle(0));
             items.push(RenderItem {
                 model: transform.matrix(),
                 mesh: *mesh,
+                material,
             });
         });
     items

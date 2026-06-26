@@ -22,7 +22,7 @@ impl Spin {
         Self {
             axis: axis.normalize(),
             speed,
-        }
+        } 
     }
 
     /// Re-normalizes the result so the rotation doesn't drift as error

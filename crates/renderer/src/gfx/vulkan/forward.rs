@@ -23,7 +23,7 @@ use vulkano::pipeline::{
 };
 use vulkano::render_pass::{RenderPass, Subpass};
 
-use crate::gfx::{RenderItem, SceneLighting, Vertex, MAX_POINT_LIGHTS};
+use crate::gfx::{Material, RenderItem, SceneLighting, Vertex, MAX_POINT_LIGHTS};
 use crate::scene::Camera;
 
 use super::swapchain::DEPTH_FORMAT;
@@ -45,6 +45,15 @@ struct PushConstants {
     /// correctly under non-uniform scaling. Stored as a mat4; only the upper-left
     /// 3x3 is used in the shader.
     normal_matrix: [[f32; 4]; 4],
+    material_index: u32,
+}
+
+#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[repr(C)]
+pub(crate) struct GpuMaterial {
+    base_color: [f32; 4],
+    emissive: [f32; 4],
+    params: [f32; 4], // metallic, roughness, reflectance
 }
 
 /// Pack the engine's [`SceneLighting`] into the std140 layout the shader expects.
@@ -134,6 +143,8 @@ pub struct ForwardPass {
     pipeline: Arc<GraphicsPipeline>,
     /// Pool we sub-allocate the per-frame lighting UBO from.
     uniform_buffer_allocator: SubbufferAllocator,
+    /// Separate from the uniform one because usage flag differs
+    storage_buffer_allocator: SubbufferAllocator,
 }
 
 impl ForwardPass {
@@ -184,11 +195,22 @@ impl ForwardPass {
                 ..Default::default()
             },
         );
+        
+        let storage_buffer_allocator = SubbufferAllocator::new(
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::STORAGE_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE 
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            }
+        );
 
         Self {
             render_pass,
             pipeline,
             uniform_buffer_allocator,
+            storage_buffer_allocator,
         }
     }
 
@@ -221,7 +243,24 @@ impl ForwardPass {
             [],
         )
         .unwrap();
+        
+        // Copy the table into a fresh storage buffer and bind as set 1
+        let material_buffer = self
+            .storage_buffer_allocator
+            .allocate_slice::<GpuMaterial>(renderer.materials.len() as u64)
+            .unwrap();
+        material_buffer
+            .write()
+            .unwrap()
+            .copy_from_slice(&renderer.materials);
 
+        let material_set = DescriptorSet::new(
+            renderer.ctx.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[1].clone(),
+            [WriteDescriptorSet::buffer(0, material_buffer)],
+            []
+        ).unwrap();
+        
         builder
             .set_viewport(
                 0,
@@ -240,7 +279,7 @@ impl ForwardPass {
                 PipelineBindPoint::Graphics,
                 self.pipeline.layout().clone(),
                 0,
-                lighting_set,
+                vec![lighting_set, material_set],
             )
             .unwrap();
 
@@ -249,6 +288,7 @@ impl ForwardPass {
                 continue;
             };
             let model = item.model;
+            let material_index = item.material.0;
             // Normals transform by the inverse-transpose so they stay perpendicular
             // to surfaces under non-uniform scaling.
             let normal_matrix = Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose());
@@ -256,6 +296,7 @@ impl ForwardPass {
                 mvp: (view_proj * model).to_cols_array_2d(),
                 model: model.to_cols_array_2d(),
                 normal_matrix: normal_matrix.to_cols_array_2d(),
+                material_index,
             };
 
             builder
@@ -311,6 +352,14 @@ pub fn upload_mesh(
         vertex_buffer,
         index_buffer,
         index_count: indices.len() as u32,
+    }
+}
+
+pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
+    GpuMaterial {
+        base_color: [m.base_color.x, m.base_color.y, m.base_color.z, 1.0],
+        emissive:   [m.emissive.x, m.emissive.y, m.emissive.z, 0.0],
+        params:     [m.metallic, m.roughness, m.reflectance, 0.0]
     }
 }
 
@@ -387,10 +436,13 @@ mod vs {
             layout(location = 1) out vec3 v_normal;
             layout(location = 2) out vec3 v_color;
 
+            // Declared identically to the fragment shader so the two stages
+            // share one push-constant range. `material_index` is unused here.
             layout(push_constant) uniform Push {
                 mat4 mvp;
                 mat4 model;
                 mat4 normal_matrix;
+                uint material_index;
             } push;
 
             void main() {
@@ -418,6 +470,7 @@ mod fs {
 
             // Keep in sync with MAX_POINT_LIGHTS in forward.rs.
             const int MAX_POINT_LIGHTS = 16;
+            const float PI = 3.14159265359;
 
             struct PointLight {
                 vec4 position; // xyz = world position, w = range
@@ -426,27 +479,83 @@ mod fs {
 
             layout(set = 0, binding = 0) uniform Lighting {
                 vec4 camera_pos;    // xyz = camera world position
-                vec4 ambient;       // rgb = color,    w = intensity
+                vec4 ambient;       // rgb = color, w = intensity
                 vec4 sun_direction; // xyz = direction toward the sun (normalized)
-                vec4 sun_color;     // rgb = color,    w = intensity
-                vec4 params;        // x = point light count, y = shininess, z = specular strength
+                vec4 sun_color;     // rgb = color, w = intensity
+                vec4 params;        // x = point light count (y,z legacy, unused by PBR)
                 PointLight point_lights[MAX_POINT_LIGHTS];
             } lighting;
 
-            // Blinn-Phong response for a single light direction L with incoming
-            // radiance, given surface normal N and view direction V.
-            vec3 shade(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo,
-                       float shininess, float specular_strength) {
-                float ndotl = max(dot(N, L), 0.0);
-                vec3 diffuse = albedo * ndotl;
+            // Mirrors GpuMaterial in forward.rs. std430 packs this exactly like
+            // the Rust #[repr(C)] struct because every field is a vec4.
+            struct GpuMaterial {
+                vec4 base_color; // rgb = albedo
+                vec4 emissive;   // rgb = emissive
+                vec4 params;     // x = metallic, y = roughness, z = reflectance
+            };
 
-                // Half-vector specular; gated by ndotl so highlights don't bleed
-                // onto faces turned away from the light.
+            // Material table indexed by the per-draw material_index. A storage
+            // buffer so the array can be sized at runtime (one entry per material).
+            layout(set = 1, binding = 0, std430) readonly buffer Materials {
+                GpuMaterial materials[];
+            };
+
+            // Declared identically to the vertex shader so the stages share one
+            // push-constant range; only material_index is read here.
+            layout(push_constant) uniform Push {
+                mat4 mvp;
+                mat4 model;
+                mat4 normal_matrix;
+                uint material_index;
+            } push;
+
+            // --- Cook-Torrance terms (metallic-roughness workflow) ---
+
+            // GGX / Trowbridge-Reitz normal distribution.
+            float distribution_ggx(float n_dot_h, float a) {
+                float a2 = a * a;
+                float d = (n_dot_h * n_dot_h) * (a2 - 1.0) + 1.0;
+                return a2 / max(PI * d * d, 1e-7);
+            }
+
+            // Smith height-correlated visibility (already folds in the 1/(4 NoL NoV) denom).
+            float visibility_smith_ggx(float n_dot_v, float n_dot_l, float a) {
+                float a2 = a * a;
+                float gv = n_dot_l * sqrt(n_dot_v * n_dot_v * (1.0 - a2) + a2);
+                float gl = n_dot_v * sqrt(n_dot_l * n_dot_l * (1.0 - a2) + a2);
+                return 0.5 / max(gv + gl, 1e-5);
+            }
+
+            // Fresnel-Schlick reflectance.
+            vec3 fresnel_schlick(float v_dot_h, vec3 f0) {
+                return f0 + (1.0 - f0) * pow(clamp(1.0 - v_dot_h, 0.0, 1.0), 5.0);
+            }
+
+            // Outgoing radiance toward the camera from one light direction L.
+            vec3 brdf(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo,
+                      float metallic, float roughness, vec3 f0) {
+                float n_dot_l = max(dot(N, L), 0.0);
+                if (n_dot_l <= 0.0) {
+                    return vec3(0.0);
+                }
                 vec3 H = normalize(L + V);
-                float spec = (ndotl > 0.0) ? pow(max(dot(N, H), 0.0), shininess) : 0.0;
-                vec3 specular = vec3(specular_strength * spec);
+                float n_dot_v = max(dot(N, V), 1e-4);
+                float n_dot_h = max(dot(N, H), 0.0);
+                float v_dot_h = max(dot(V, H), 0.0);
 
-                return radiance * (diffuse + specular);
+                float a = roughness * roughness; // perceptual -> linear roughness
+
+                float D = distribution_ggx(n_dot_h, a);
+                float Vis = visibility_smith_ggx(n_dot_v, n_dot_l, a);
+                vec3 F = fresnel_schlick(v_dot_h, f0);
+
+                vec3 specular = D * Vis * F;
+
+                // Diffuse keeps the energy not reflected (1 - F) and not metallic.
+                vec3 kd = (vec3(1.0) - F) * (1.0 - metallic);
+                vec3 diffuse = kd * albedo / PI;
+
+                return (diffuse + specular) * radiance * n_dot_l;
             }
 
             // Smooth, range-limited falloff (windowed inverse-square).
@@ -458,21 +567,29 @@ mod fs {
             }
 
             void main() {
+                GpuMaterial m = materials[push.material_index];
+
+                // Vertex color tints the material albedo; drop `* v_color` for a
+                // pure material color.
+                vec3  albedo      = m.base_color.rgb * v_color;
+                float metallic    = clamp(m.params.x, 0.0, 1.0);
+                float roughness   = clamp(m.params.y, 0.04, 1.0); // floor avoids a singular highlight
+                float reflectance = m.params.z;
+
+                // Dielectric F0 from reflectance (0.5 -> ~4%); metals use albedo as F0.
+                vec3 f0 = mix(vec3(0.16 * reflectance * reflectance), albedo, metallic);
+
                 vec3 N = normalize(v_normal);
                 vec3 V = normalize(lighting.camera_pos.xyz - v_world_pos);
-                vec3 albedo = v_color;
 
-                float shininess = lighting.params.y;
-                float specular_strength = lighting.params.z;
-
-                // Ambient fill.
+                // Crude diffuse ambient (stands in for image-based lighting).
                 vec3 color = lighting.ambient.rgb * lighting.ambient.w * albedo;
 
                 // Directional sun.
                 {
                     vec3 L = normalize(lighting.sun_direction.xyz);
                     vec3 radiance = lighting.sun_color.rgb * lighting.sun_color.w;
-                    color += shade(N, V, L, radiance, albedo, shininess, specular_strength);
+                    color += brdf(N, V, L, radiance, albedo, metallic, roughness, f0);
                 }
 
                 // Point lights.
@@ -485,8 +602,11 @@ mod fs {
                     if (atten <= 0.0) continue;
                     vec3 L = to_light / max(dist, 1e-4);
                     vec3 radiance = light.color.rgb * light.color.w * atten;
-                    color += shade(N, V, L, radiance, albedo, shininess, specular_strength);
+                    color += brdf(N, V, L, radiance, albedo, metallic, roughness, f0);
                 }
+
+                // Emissive adds on top, unaffected by scene lighting.
+                color += m.emissive.rgb;
 
                 f_color = vec4(color, 1.0);
             }

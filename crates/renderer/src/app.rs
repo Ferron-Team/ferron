@@ -12,7 +12,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::gfx::vulkan::VulkanRenderer;
-use crate::gfx::RenderBackend;
+use crate::gfx::{Material, RenderBackend};
 use crate::scene::{AmbientLight, Camera, CpuMesh, Light, LocalTransform, Spin, Time, Transform};
 use crate::systems;
 use ferron_ecs::World;
@@ -93,6 +93,42 @@ impl ApplicationHandler for App {
         // The mesh must be uploaded before we can hand entities a `MeshHandle`.
         let cube = renderer.load_mesh(&CpuMesh::cube());
 
+        // A small palette spanning the metallic-roughness range so the PBR BRDF
+        // is visible across the field. `load_material` returns a `MaterialHandle`
+        // that doubles as the shader's index into the material table.
+        let materials = [
+            // Polished gold: full metal, tight highlight.
+            Material {
+                base_color: Vec3::new(1.0, 0.84, 0.40),
+                metallic: 1.0,
+                roughness: 0.18,
+                ..Material::default()
+            },
+            // Brushed copper: metal, broader highlight.
+            Material {
+                base_color: Vec3::new(0.95, 0.64, 0.54),
+                metallic: 1.0,
+                roughness: 0.45,
+                ..Material::default()
+            },
+            // Glossy dielectric: no metal, sharp specular over a diffuse base.
+            Material {
+                base_color: Vec3::new(0.9, 0.9, 0.95),
+                metallic: 0.0,
+                roughness: 0.12,
+                reflectance: 0.7,
+                ..Material::default()
+            },
+            // Matte clay: rough dielectric, mostly diffuse.
+            Material {
+                base_color: Vec3::splat(0.8),
+                metallic: 0.0,
+                roughness: 0.85,
+                ..Material::default()
+            },
+        ]
+        .map(|material| renderer.load_material(&material));
+
         let half = (GRID - 1) as f32 * SPACING * 0.5;
         for x in 0..GRID {
             for z in 0..GRID {
@@ -102,9 +138,13 @@ impl ApplicationHandler for App {
                 // Vary spin speed a little so the field isn't perfectly uniform.
                 let speed = 0.5 + ((x + z) % 5) as f32 * 0.4;
 
+                // Tile the palette across the grid so neighbours differ.
+                let material = materials[(x + z) as usize % materials.len()];
+
                 let entity = self.world.spawn();
                 self.world.insert(entity, transform);
                 self.world.insert(entity, cube);
+                self.world.insert(entity, material);
                 self.world.insert(entity, Spin::new(Vec3::Y, speed));
             }
         }
