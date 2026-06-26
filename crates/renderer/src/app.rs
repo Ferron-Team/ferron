@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
-use glam::Vec3;
+use glam::{Quat, Vec3};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::swapchain::Surface;
 use vulkano::VulkanLibrary;
@@ -13,7 +13,7 @@ use winit::window::{Window, WindowId};
 
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::RenderBackend;
-use crate::scene::{Camera, CpuMesh, LocalTransform, Spin, Time};
+use crate::scene::{AmbientLight, Camera, CpuMesh, Light, LocalTransform, Spin, Time, Transform};
 use crate::systems;
 use ferron_ecs::World;
 
@@ -68,6 +68,7 @@ impl App {
         // World-global state lives in resources, not on `App`.
         app.world.insert_resource(Camera::default());
         app.world.insert_resource(Time::new());
+        app.world.insert_resource(AmbientLight::default());
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -95,9 +96,8 @@ impl ApplicationHandler for App {
         let half = (GRID - 1) as f32 * SPACING * 0.5;
         for x in 0..GRID {
             for z in 0..GRID {
-                let mut transform = LocalTransform::default();
-                transform.translation =
-                    Vec3::new(x as f32 * SPACING - half, 0.0, z as f32 * SPACING - half);
+                let pos = Vec3::new(x as f32 * SPACING - half, 0.0, z as f32 * SPACING - half);
+                let transform = LocalTransform::from(Transform::from_translation(pos));
 
                 // Vary spin speed a little so the field isn't perfectly uniform.
                 let speed = 0.5 + ((x + z) % 5) as f32 * 0.4;
@@ -107,6 +107,33 @@ impl ApplicationHandler for App {
                 self.world.insert(entity, cube);
                 self.world.insert(entity, Spin::new(Vec3::Y, speed));
             }
+        }
+
+        // Lights are ordinary entities: a transform plus a `Light`. The sun's
+        // direction comes from its rotation (forward = -Z); point lights sit at
+        // their transform's translation.
+        let sun_dir = Vec3::new(-0.4, -1.0, -0.6).normalize();
+        let sun = self.world.spawn();
+        self.world.insert(
+            sun,
+            LocalTransform::from(Transform {
+                rotation: Quat::from_rotation_arc(Vec3::NEG_Z, sun_dir),
+                ..Default::default()
+            }),
+        );
+        self.world
+            .insert(sun, Light::directional(Vec3::new(1.0, 0.97, 0.92), 1.0));
+
+        // A few colored point lights hovering over the field to show off falloff.
+        for (pos, color) in [
+            (Vec3::new(-4.0, 3.0, -4.0), Vec3::new(1.0, 0.35, 0.1)), // warm
+            (Vec3::new(4.0, 3.0, 4.0), Vec3::new(0.2, 0.5, 1.0)),    // cool
+            (Vec3::new(4.0, 3.0, -4.0), Vec3::new(0.2, 1.0, 0.4)),   // green
+        ] {
+            let light = self.world.spawn();
+            self.world
+                .insert(light, LocalTransform::from(Transform::from_translation(pos)));
+            self.world.insert(light, Light::point(color, 8.0, 10.0));
         }
 
         // Pull the camera back so the whole field is in frame.
@@ -146,8 +173,9 @@ impl ApplicationHandler for App {
                 systems::spin(&self.world, delta);
 
                 let items = systems::extract_renderables(&self.world);
+                let lighting = systems::extract_lighting(&self.world);
                 let camera = *self.world.resource::<Camera>();
-                active.renderer.render(&items, &camera);
+                active.renderer.render(&items, &lighting, &camera);
 
                 // Average FPS over ~1s windows
                 self.fps_accum += delta;

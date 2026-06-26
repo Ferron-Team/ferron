@@ -22,12 +22,12 @@ use self::context::VkContext;
 use self::forward::{ForwardPass, GpuMesh};
 use self::swapchain::SwapchainState;
 
-use super::{RenderBackend, RenderItem};
+use super::{RenderBackend, RenderItem, SceneLighting};
 
 type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
 
 pub struct VulkanRenderer {
-    ctx: VkContext,
+    pub(crate) ctx: VkContext,
     swapchain: SwapchainState,
     forward: ForwardPass,
     pub(crate) meshes: Vec<GpuMesh>,
@@ -40,7 +40,7 @@ impl VulkanRenderer {
     pub fn new(instance: &Arc<Instance>, surface: Arc<Surface>, extent: [u32; 2]) -> Self {
         let ctx = VkContext::new(instance, &surface);
         let format = swapchain_color_format(&ctx, &surface);
-        let forward = ForwardPass::new(&ctx.device, format);
+        let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, format);
         let swapchain = SwapchainState::new(&ctx, &surface, &forward.render_pass, format, extent);
 
         Self {
@@ -68,7 +68,7 @@ impl RenderBackend for VulkanRenderer {
         self.recreate_swapchain = true;
     }
 
-    fn render(&mut self, items: &[RenderItem], camera: &Camera) {
+    fn render(&mut self, items: &[RenderItem], lighting: &SceneLighting, camera: &Camera) {
         if self.pending_extent[0] == 0 || self.pending_extent[1] == 0 {
             return;
         }
@@ -126,8 +126,14 @@ impl RenderBackend for VulkanRenderer {
             )
             .unwrap();
 
-        self.forward
-            .draw(&mut builder, self, items, camera, self.swapchain.extent);
+        self.forward.draw(
+            &mut builder,
+            self,
+            items,
+            lighting,
+            camera,
+            self.swapchain.extent,
+        );
 
         builder.end_render_pass(Default::default()).unwrap();
         let command_buffer = builder.build().unwrap();
