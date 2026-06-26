@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -27,6 +28,9 @@ pub struct App {
     world: World,
     start: Instant,
     last_frame: f32,
+    // FPS counter: frames and elapsed time accumulated over the current window.
+    fps_accum: f32,
+    fps_frames: u32,
 }
 
 impl App {
@@ -52,6 +56,8 @@ impl App {
             world: World::default(),
             start: Instant::now(),
             last_frame: 0.0,
+            fps_accum: 0.0,
+            fps_frames: 0,
         };
 
         // World-global state lives in resources, not on `App`.
@@ -117,6 +123,17 @@ impl ApplicationHandler for App {
                 let items = systems::extract_renderables(&self.world);
                 let camera = *self.world.resource::<Camera>();
                 active.renderer.render(&items, &camera);
+
+                // Average FPS over ~1s windows
+                self.fps_accum += delta;
+                self.fps_frames += 1;
+                if self.fps_accum >= 1.0 {
+                    let fps = self.fps_frames as f32 / self.fps_accum;
+                    print!("\rFPS: {fps:6.1}  ({:5.2} ms/frame)", 1000.0 / fps);
+                    let _ = std::io::stdout().flush();
+                    self.fps_accum = 0.0;
+                    self.fps_frames = 0;
+                }
             }
             _ => {}
         }
