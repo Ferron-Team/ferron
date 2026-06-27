@@ -10,6 +10,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
+use crate::editor::Editor;
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::RenderBackend;
 use crate::scene::entities::build_default_scene;
@@ -20,6 +21,7 @@ use ferron_ecs::World;
 struct Active {
     window: Arc<Window>,
     renderer: VulkanRenderer,
+    editor: Editor,
 }
 
 pub struct App {
@@ -85,11 +87,17 @@ impl ApplicationHandler for App {
         let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
         let size = window.inner_size();
         let mut renderer =
-            VulkanRenderer::new(&self.instance, surface, [size.width, size.height]);
+            VulkanRenderer::new(&self.instance, surface.clone(), [size.width, size.height]);
 
         build_default_scene(&mut self.world, &mut renderer);
 
-        self.active = Some(Active { window, renderer });
+        let editor = Editor::new(event_loop, surface, renderer.queue(), renderer.color_format());
+
+        self.active = Some(Active {
+            window,
+            renderer,
+            editor,
+        });
     }
 
     fn window_event(
@@ -101,6 +109,9 @@ impl ApplicationHandler for App {
         let Some(active) = self.active.as_mut() else {
             return;
         };
+
+        // The returned flag (egui wants this event) could gate camera input later.
+        let _ui_used_event = active.editor.on_window_event(&event);
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -117,12 +128,24 @@ impl ApplicationHandler for App {
                 // backend — which never sees the ECS world directly.
                 systems::spin(&self.world, delta);
 
+                // Build the editor UI; it may spawn/despawn/edit entities, so it
+                // runs before we extract this frame's draw data.
+                active.editor.run(&mut self.world);
+
                 let items = systems::extract_renderables(&self.world);
                 let lighting = systems::extract_lighting(&self.world);
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
-                active.renderer.render(&items, &lighting, &camera, &ssao, &hdr);
+
+                // Render the scene, then composite the editor onto the final
+                // image before present.
+                let Active {
+                    renderer, editor, ..
+                } = active;
+                let mut overlay = |before, image| editor.draw(before, image);
+                renderer
+                    .render_with_overlay(&items, &lighting, &camera, &ssao, &hdr, &mut overlay);
 
                 // Average FPS over ~1s windows
                 self.fps_accum += delta;

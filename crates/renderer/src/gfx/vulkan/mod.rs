@@ -12,6 +12,7 @@ use vulkano::command_buffer::{
     SubpassContents,
 };
 use vulkano::descriptor_set::DescriptorSet;
+use vulkano::device::Queue;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::instance::Instance;
@@ -33,6 +34,13 @@ use self::hdr::{HdrPass, HDR_FORMAT};
 use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
 
 type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
+
+/// A hook that draws over the final swapchain image between the tonemap pass and
+/// present (the editor UI). Given the future to wait on and that image's view, it
+/// returns the future to present. A plain closure, so this module stays free of
+/// any UI/egui types.
+pub type Overlay<'a> =
+    &'a mut dyn FnMut(Box<dyn GpuFuture>, Arc<ImageView>) -> Box<dyn GpuFuture>;
 
 pub struct VulkanRenderer {
     pub(crate) ctx: VkContext,
@@ -136,6 +144,42 @@ impl RenderBackend for VulkanRenderer {
         camera: &Camera,
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
+    ) {
+        self.render_frame(items, lighting, camera, ssao, hdr, None);
+    }
+}
+
+impl VulkanRenderer {
+    pub fn queue(&self) -> Arc<Queue> {
+        self.ctx.queue.clone()
+    }
+
+    pub fn color_format(&self) -> Format {
+        self.swapchain.swapchain.image_format()
+    }
+
+    /// Like [`render`](RenderBackend::render) but composites `overlay` (the
+    /// editor UI) onto the final image before present.
+    pub fn render_with_overlay(
+        &mut self,
+        items: &[RenderItem],
+        lighting: &SceneLighting,
+        camera: &Camera,
+        ssao: &SsaoSettings,
+        hdr: &HdrSettings,
+        overlay: Overlay<'_>,
+    ) {
+        self.render_frame(items, lighting, camera, ssao, hdr, Some(overlay));
+    }
+
+    fn render_frame(
+        &mut self,
+        items: &[RenderItem],
+        lighting: &SceneLighting,
+        camera: &Camera,
+        ssao: &SsaoSettings,
+        hdr: &HdrSettings,
+        overlay: Option<Overlay<'_>>,
     ) {
         if self.pending_extent[0] == 0 || self.pending_extent[1] == 0 {
             return;
@@ -262,7 +306,7 @@ impl RenderBackend for VulkanRenderer {
             prev.cleanup_finished();
         }
 
-        let future = self
+        let after_scene = self
             .previous_frame_end
             .take()
             .map(|f| f.boxed())
@@ -270,6 +314,19 @@ impl RenderBackend for VulkanRenderer {
             .join(acquire_future)
             .then_execute(self.ctx.queue.clone(), command_buffer)
             .unwrap()
+            .boxed();
+
+        // Let the overlay (editor UI) draw onto the same swapchain image before
+        // present. Without one, present the tonemapped scene directly.
+        let before_present = match overlay {
+            Some(draw) => draw(
+                after_scene,
+                self.swapchain.image_views[image_index as usize].clone(),
+            ),
+            None => after_scene,
+        };
+
+        let future = before_present
             .then_swapchain_present(
                 self.ctx.queue.clone(),
                 SwapchainPresentInfo::swapchain_image_index(

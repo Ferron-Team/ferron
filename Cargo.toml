@@ -13,6 +13,8 @@ vulkano-shaders = "0.35"
 winit = "0.30"
 glam = { version = "0.30", features = ["bytemuck"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+egui = "0.31"
+egui_winit_vulkano = "0.28"
 
 [profile.dev]
 opt-level = 1

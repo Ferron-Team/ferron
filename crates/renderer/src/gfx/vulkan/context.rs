@@ -6,7 +6,7 @@ use vulkano::command_buffer::allocator::{
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
-    Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
+    Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
 };
 use vulkano::instance::Instance;
 use vulkano::memory::allocator::StandardMemoryAllocator;
@@ -22,7 +22,7 @@ pub struct VkContext {
 
 impl VkContext {
     pub fn new(instance: &Arc<Instance>, surface: &Arc<Surface>) -> Self {
-        let device_extensions = DeviceExtensions {
+        let mut device_extensions = DeviceExtensions {
             khr_swapchain: true,
             ..DeviceExtensions::empty()
         };
@@ -36,6 +36,16 @@ impl VkContext {
             physical_device.properties().device_type,
         );
 
+        // On portability-subset devices (MoltenVK on macOS) the extension must be
+        // enabled if present, and egui's font/texture image views use a
+        // non-identity component swizzle, which needs `image_view_format_swizzle`.
+        let swizzle = physical_device
+            .supported_features()
+            .image_view_format_swizzle;
+        if physical_device.supported_extensions().khr_portability_subset {
+            device_extensions.khr_portability_subset = true;
+        }
+
         let (device, mut queues) = Device::new(
             physical_device,
             DeviceCreateInfo {
@@ -44,6 +54,10 @@ impl VkContext {
                     ..Default::default()
                 }],
                 enabled_extensions: device_extensions,
+                enabled_features: DeviceFeatures {
+                    image_view_format_swizzle: swizzle,
+                    ..DeviceFeatures::empty()
+                },
                 ..Default::default()
             },
         )
