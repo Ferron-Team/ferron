@@ -7,10 +7,12 @@ mod light;
 mod local_transform;
 mod material_handle;
 mod mesh_handle;
+mod name;
 mod spin;
 
 pub use light::{AmbientLight, Light};
 pub use local_transform::LocalTransform;
 pub use material_handle::MaterialHandle;
 pub use mesh_handle::MeshHandle;
+pub use name::Name;
 pub use spin::Spin;
