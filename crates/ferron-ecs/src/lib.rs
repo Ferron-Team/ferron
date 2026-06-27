@@ -85,6 +85,19 @@ impl EntityAllocator {
         let i = entity.index as usize;
         i < self.generations.len() && self.alive[i] && self.generations[i] == entity.generation
     }
+
+    /// Iterate over every currently-live entity, skipping freed slots.
+    fn iter_alive(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.alive
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, &alive)| {
+                alive.then(|| Entity {
+                    index: i as u32,
+                    generation: self.generations[i],
+                })
+            })
+    }
 }
 
 //
@@ -213,9 +226,37 @@ impl World {
         self.entities.allocate()
     }
 
+    /// Spawn a new entity and return a builder for attaching components to it in
+    /// one chained expression:
+    ///
+    /// ```
+    /// # use ferron_ecs::World;
+    /// # struct Position(f32);
+    /// # struct Velocity(f32);
+    /// let mut world = World::new();
+    /// let entity = world
+    ///     .spawn_entity()
+    ///     .with(Position(0.0))
+    ///     .with(Velocity(1.0))
+    ///     .id();
+    /// ```
+    pub fn spawn_entity(&mut self) -> EntityBuilder<'_> {
+        let entity = self.spawn();
+        EntityBuilder { world: self, entity }
+    }
+
     /// Returns `true` while `entity` refers to a live (not yet despawned) entity.
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.entities.is_alive(entity)
+    }
+
+    /// Iterate over every live entity in the world.
+    ///
+    /// Unlike [`query`](World::query), this needs no component and visits even
+    /// entities with no components attached — handy for tooling that walks the
+    /// whole world (e.g. an editor hierarchy, or a "despawn everything" pass).
+    pub fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.entities.iter_alive()
     }
 
     /// Remove an entity and all of its components.
@@ -352,6 +393,36 @@ impl World {
         Some(RefMut::map(cell.borrow_mut(), |b| {
             b.downcast_mut::<R>().expect("resource type mismatch")
         }))
+    }
+}
+
+//
+// Entity builder
+//
+
+/// A fluent builder for attaching components to a freshly-spawned entity.
+///
+/// Returned by [`World::spawn_entity`]. Each [`with`](EntityBuilder::with) call
+/// attaches one component and returns the builder, so spawning reads as a single
+/// expression instead of a `spawn` followed by a run of `insert` calls. Finish
+/// with [`id`](EntityBuilder::id) to get the [`Entity`] handle.
+pub struct EntityBuilder<'w> {
+    world: &'w mut World,
+    entity: Entity,
+}
+
+impl<'w> EntityBuilder<'w> {
+    /// Attach a component to the entity being built.
+    #[inline]
+    pub fn with<T: 'static>(self, component: T) -> Self {
+        self.world.insert(self.entity, component);
+        self
+    }
+
+    /// Finish building and return the entity's handle.
+    #[inline]
+    pub fn id(self) -> Entity {
+        self.entity
     }
 }
 
@@ -662,5 +733,41 @@ mod tests {
         assert_eq!(world.resource::<DeltaTime>().0, 2.0);
         assert_eq!(world.remove_resource::<DeltaTime>().unwrap().0, 2.0);
         assert!(world.get_resource::<DeltaTime>().is_none());
+    }
+
+    #[test]
+    fn entity_builder_attaches_all_components() {
+        let mut world = World::new();
+        let e = world
+            .spawn_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .with(Velocity { x: 3.0, y: 4.0 })
+            .with(Frozen)
+            .id();
+
+        assert_eq!(world.get::<Position>(e).unwrap().x, 1.0);
+        assert_eq!(world.get::<Velocity>(e).unwrap().y, 4.0);
+        assert!(world.has::<Frozen>(e));
+    }
+
+    #[test]
+    fn entities_lists_only_live_entities() {
+        let mut world = World::new();
+        let a = world.spawn();
+        let b = world.spawn();
+        let c = world.spawn();
+        assert!(world.despawn(b));
+
+        // The freed slot `b` is gone; a recycled slot reappears once reused.
+        let mut live: Vec<_> = world.entities().collect();
+        live.sort_by_key(|e| e.index());
+        assert_eq!(live, vec![a, c]);
+
+        let d = world.spawn(); // recycles b's index with a fresh generation
+        assert_eq!(d.index(), b.index());
+        assert_ne!(d.generation(), b.generation());
+        assert!(world.entities().any(|e| e == d));
+        assert!(!world.entities().any(|e| e == b));
+        assert_eq!(world.entities().count(), 3);
     }
 }
