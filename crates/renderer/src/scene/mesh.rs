@@ -32,12 +32,20 @@ impl CpuMesh {
             let base = vertices.len() as u32;
             let color = (n * 0.5 + 0.5).to_array();
 
+            // The tangent follows the +U texture axis (= u). The bitangent the
+            // shader rebuilds is `cross(N, T) * w`; pick w so that lands on +v.
+            let w = if n.cross(u).dot(v) >= 0.0 { 1.0 } else { -1.0 };
+            let tangent = [u.x, u.y, u.z, w];
+
             for (su, sv) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
                 let pos = (n + u * su + v * sv) * 0.5;
                 vertices.push(Vertex {
                     position: pos.to_array(),
                     normal,
                     color,
+                    // Map the [-1,1] quad corners to [0,1] UVs along u and v.
+                    uv: [su * 0.5 + 0.5, sv * 0.5 + 0.5],
+                    tangent,
                 });
             }
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use vulkano::command_buffer::allocator::{
     StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
 };
+use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
@@ -16,6 +17,7 @@ pub struct VkContext {
     pub queue: Arc<Queue>,
     pub memory_allocator: Arc<StandardMemoryAllocator>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 }
 
 impl VkContext {
@@ -53,12 +55,17 @@ impl VkContext {
             device.clone(),
             StandardCommandBufferAllocatorCreateInfo::default(),
         ));
+        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+            device.clone(),
+            Default::default(),
+        ));
 
         Self {
             device,
             queue,
             memory_allocator,
             command_buffer_allocator,
+            descriptor_set_allocator,
         }
     }
 }

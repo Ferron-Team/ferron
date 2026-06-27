@@ -1,0 +1,12 @@
+[package]
+name = "renderer-prototype"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ferron-ecs.workspace = true
+vulkano.workspace = true
+vulkano-shaders.workspace = true
+winit.workspace = true
+glam.workspace = true
+image.workspace = true
