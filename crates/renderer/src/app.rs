@@ -6,10 +6,11 @@ use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::swapchain::Surface;
 use vulkano::VulkanLibrary;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
+use crate::camera_controller::CameraController;
 use crate::editor::Editor;
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::RenderBackend;
@@ -28,6 +29,7 @@ pub struct App {
     instance: Arc<Instance>,
     active: Option<Active>,
     world: World,
+    camera_controller: CameraController,
     start: Instant,
     last_frame: f32,
     // FPS counter: frames and elapsed time accumulated over the current window.
@@ -56,6 +58,7 @@ impl App {
             instance,
             active: None,
             world: World::default(),
+            camera_controller: CameraController::new(),
             start: Instant::now(),
             last_frame: 0.0,
             fps_accum: 0.0,
@@ -90,6 +93,8 @@ impl ApplicationHandler for App {
             VulkanRenderer::new(&self.instance, surface.clone(), [size.width, size.height]);
 
         build_default_scene(&mut self.world, &mut renderer);
+        self.camera_controller
+            .sync_from(&self.world.resource::<Camera>());
 
         let editor = Editor::new(event_loop, surface, renderer.queue(), renderer.color_format());
 
@@ -110,8 +115,28 @@ impl ApplicationHandler for App {
             return;
         };
 
-        // The returned flag (egui wants this event) could gate camera input later.
-        let _ui_used_event = active.editor.on_window_event(&event);
+        // The editor sees events first; when it doesn't want one, the camera
+        // controller may. Toggling look mode grabs/hides the cursor.
+        let egui_wants = active.editor.on_window_event(&event);
+        let was_looking = self.camera_controller.looking();
+        self.camera_controller.process_window_event(&event, egui_wants);
+        if self.camera_controller.looking() != was_looking {
+            let looking = self.camera_controller.looking();
+            active.window.set_cursor_visible(!looking);
+            let grab = if looking {
+                CursorGrabMode::Locked
+            } else {
+                CursorGrabMode::None
+            };
+            // Locked is unsupported on some platforms; fall back to Confined.
+            let _ = active.window.set_cursor_grab(grab).or_else(|_| {
+                active.window.set_cursor_grab(if looking {
+                    CursorGrabMode::Confined
+                } else {
+                    CursorGrabMode::None
+                })
+            });
+        }
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -131,6 +156,11 @@ impl ApplicationHandler for App {
                 // Build the editor UI; it may spawn/despawn/edit entities, so it
                 // runs before we extract this frame's draw data.
                 active.editor.run(&mut self.world);
+
+                // Apply this frame's camera input (after the UI, so the editor's
+                // own camera edits are the baseline the controller builds on).
+                self.camera_controller
+                    .update(&mut self.world.resource_mut::<Camera>(), delta);
 
                 let items = systems::extract_renderables(&self.world);
                 let lighting = systems::extract_lighting(&self.world);
@@ -160,6 +190,17 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // Raw mouse motion drives look mode; the controller ignores it unless the
+        // right button is held.
+        self.camera_controller.process_device_event(&event);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {

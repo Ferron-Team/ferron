@@ -562,121 +562,17 @@ impl SsaoPass {
 }
 
 mod fullscreen_vs {
-    vulkano_shaders::shader! { ty: "vertex", src: r"
-        #version 460
-        layout(location = 0) out vec2 v_uv;
-        void main() {
-            v_uv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-            gl_Position = vec4(v_uv * 2.0 - 1.0, 0.0, 1.0);
-        }
-    " }
+    vulkano_shaders::shader! { ty: "vertex", path: "shaders/fullscreen.vert" }
 }
 mod prepass_vs {
-    vulkano_shaders::shader! { ty: "vertex", src: r"
-        #version 460
-
-        layout(location = 0) in vec3 position;
-        layout(location = 1) in vec3 normal;
-
-        layout(location = 0) out vec3 v_view_normal;
-
-        layout(push_constant) uniform Push {
-            mat4 mvp;
-            mat4 normal_matrix; // world inverse-transpose; upper 3x3 used
-        } push;
-
-        layout(set = 0, binding = 0) uniform Frame {
-            mat4 view;
-            mat4 proj;
-            mat4 inv_proj;
-        } frame;
-
-        void main() {
-            vec3 world_n = mat3(push.normal_matrix) * normal;
-            v_view_normal = mat3(frame.view) * world_n; // view is rigid → pure rotation
-            gl_Position = push.mvp * vec4(position, 1.0);
-        }
-    " }
+    vulkano_shaders::shader! { ty: "vertex", path: "shaders/ssao_prepass.vert" }
 }
 mod prepass_fs {
-    vulkano_shaders::shader! { ty: "fragment", src: r"
-        #version 460
-        layout(location = 0) in vec3 v_view_normal;
-        layout(location = 0) out vec4 f_normal;
-        void main() {
-            f_normal = vec4(normalize(v_view_normal) * 0.5 + 0.5, 1.0);
-        }
-    " }
+    vulkano_shaders::shader! { ty: "fragment", path: "shaders/ssao_prepass.frag" }
 }
 mod ssao_fs {
-    vulkano_shaders::shader! { ty: "fragment", src: r"
-        #version 460
-
-        layout(location = 0) in vec2 v_uv;
-        layout(location = 0) out float f_ao;
-
-        const int KERNEL_MAX = 64;
-
-        layout(set = 0, binding = 0) uniform Frame {
-            mat4 view;
-            mat4 proj;
-            mat4 inv_proj;
-        } frame;
-
-        layout(set = 0, binding = 1) uniform Params {
-            vec4  kernel[KERNEL_MAX]; // xyz used; vec4 keeps std140 stride at 16
-            vec2  noise_scale;        // screen_size / 4.0  (noise is 4x4)
-            float radius;             // world units, e.g. 0.5
-            float bias;               // e.g. 0.025
-            float power;              // contrast on the result, e.g. 1.5
-            int   kernel_size;        // <= KERNEL_MAX, e.g. 32
-        } p;
-
-        layout(set = 1, binding = 0) uniform sampler2D u_depth;  // D32,   nearest + clamp
-        layout(set = 1, binding = 1) uniform sampler2D u_normal; // RGBA8, nearest + clamp
-        layout(set = 1, binding = 2) uniform sampler2D u_noise;  // RGBA8, nearest + repeat
-
-        vec3 view_pos(vec2 uv) {
-            float d = texture(u_depth, uv).r;
-            vec4 c = frame.inv_proj * vec4(uv * 2.0 - 1.0, d, 1.0);
-            return c.xyz / c.w;
-        }
-
-        void main() {
-            vec3 P = view_pos(v_uv);
-            vec3 N = normalize(texture(u_normal, v_uv).xyz * 2.0 - 1.0);
-            vec3 rnd = vec3(texture(u_noise, v_uv * p.noise_scale).xy * 2.0 - 1.0, 0.0);
-
-            vec3 T = normalize(rnd - N * dot(rnd, N)); // Gram-Schmidt around N
-            vec3 B = cross(N, T);
-            mat3 TBN = mat3(T, B, N);
-
-            float occ = 0.0;
-            for (int i = 0; i < p.kernel_size; ++i) {
-                vec3 sp = P + TBN * p.kernel[i].xyz * p.radius;      // sample point, view space
-                vec4 clip = frame.proj * vec4(sp, 1.0);
-                vec2 suv = (clip.xy / clip.w) * 0.5 + 0.5;           // project to screen UV
-                float scene_z = view_pos(suv).z;                     // real geometry z at suv
-                float range = smoothstep(0.0, 1.0, p.radius / max(abs(P.z - scene_z), 1e-4));
-                occ += (scene_z >= sp.z + p.bias ? 1.0 : 0.0) * range;
-            }
-            f_ao = pow(1.0 - occ / float(p.kernel_size), p.power);
-        }
-    " }
+    vulkano_shaders::shader! { ty: "fragment", path: "shaders/ssao.frag" }
 }
 mod blur_fs {
-    vulkano_shaders::shader! { ty: "fragment", src: r"
-        #version 460
-        layout(location = 0) in vec2 v_uv;
-        layout(location = 0) out float f_ao;
-        layout(set = 0, binding = 0) uniform sampler2D u_ao;
-        void main() {
-            vec2 texel = 1.0 / vec2(textureSize(u_ao, 0));
-            float s = 0.0;
-            for (int x = -2; x < 2; ++x)
-                for (int y = -2; y < 2; ++y)
-                    s += texture(u_ao, v_uv + vec2(x, y) * texel).r;
-            f_ao = s / 16.0;
-        }
-    " }
+    vulkano_shaders::shader! { ty: "fragment", path: "shaders/ssao_blur.frag" }
 }
