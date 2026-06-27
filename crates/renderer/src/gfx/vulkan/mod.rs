@@ -11,6 +11,7 @@ use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, RenderPassBeginInfo, SubpassBeginInfo,
     SubpassContents,
 };
+use vulkano::descriptor_set::DescriptorSet;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::instance::Instance;
@@ -44,6 +45,10 @@ pub struct VulkanRenderer {
     /// Texture views indexed by `TextureHandle`. Index 0 is a 1x1 white texture
     /// and index 1 a flat normal map; materials without a given map point here.
     pub(crate) textures: Vec<Arc<ImageView>>,
+    /// Cached set-1 (materials) and set-2 (textures) descriptor sets. `None` =
+    /// dirty; rebuilt lazily in `render` after a `load_material`/`load_texture`.
+    material_set: Option<Arc<DescriptorSet>>,
+    texture_set: Option<Arc<DescriptorSet>>,
     previous_frame_end: Option<FrameFuture>,
     recreate_swapchain: bool,
     pending_extent: [u32; 2],
@@ -74,6 +79,8 @@ impl VulkanRenderer {
             meshes: Vec::new(),
             materials: vec![forward::to_gpu_material(&Material::default())],
             textures,
+            material_set: None,
+            texture_set: None,
             previous_frame_end: None,
             recreate_swapchain: false,
             pending_extent: extent,
@@ -92,6 +99,7 @@ impl RenderBackend for VulkanRenderer {
     fn load_material(&mut self, material: &Material) -> MaterialHandle {
         let handle = MaterialHandle(self.materials.len() as u32);
         self.materials.push(forward::to_gpu_material(material));
+        self.material_set = None; // invalidate cache
         handle
     }
 
@@ -112,6 +120,7 @@ impl RenderBackend for VulkanRenderer {
         let view = texture::upload_texture(&self.ctx, pixels, [width, height], format);
         let handle = TextureHandle(self.textures.len() as u32);
         self.textures.push(view);
+        self.texture_set = None; // invalidate cache
         handle
     }
 
@@ -178,6 +187,18 @@ impl RenderBackend for VulkanRenderer {
         self.ssao.bias = ssao.bias;
         self.ssao.power = ssao.power;
         self.hdr.exposure = hdr.exposure;
+
+        // Material table and texture array are static after asset load, so cache
+        // their descriptor sets and rebuild only when invalidated (set to None).
+        if self.material_set.is_none() {
+            self.material_set = Some(self.forward.build_material_set(&self.ctx, &self.materials));
+        }
+        if self.texture_set.is_none() {
+            self.texture_set = Some(self.forward.build_texture_set(&self.ctx, &self.textures));
+        }
+        let material_set = self.material_set.clone().unwrap();
+        let texture_set = self.texture_set.clone().unwrap();
+
         let ao_view = if ssao.enabled {
             self.ssao.record(&mut builder, self, items, camera, self.swapchain.extent);
             self.ssao.ao_view()
@@ -209,7 +230,9 @@ impl RenderBackend for VulkanRenderer {
             lighting,
             camera,
             self.swapchain.extent,
-            ao_view
+            ao_view,
+            material_set,
+            texture_set,
         );
 
         builder.end_render_pass(Default::default()).unwrap();

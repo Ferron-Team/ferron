@@ -28,6 +28,7 @@ use vulkano::render_pass::{RenderPass, Subpass};
 use crate::gfx::{Material, RenderItem, SceneLighting, Vertex, MAX_POINT_LIGHTS, MAX_TEXTURES};
 use crate::scene::Camera;
 
+use super::context::VkContext;
 use super::swapchain::DEPTH_FORMAT;
 use super::VulkanRenderer;
 
@@ -155,8 +156,6 @@ pub struct ForwardPass {
     pipeline: Arc<GraphicsPipeline>,
     /// Pool we sub-allocate the per-frame lighting UBO from.
     uniform_buffer_allocator: SubbufferAllocator,
-    /// Separate from the uniform one because usage flag differs
-    storage_buffer_allocator: SubbufferAllocator,
     /// Shared sampler used for every texture in the set-2 array.
     sampler: Arc<Sampler>,
     ao_sampler: Arc<Sampler>,
@@ -211,16 +210,6 @@ impl ForwardPass {
             },
         );
         
-        let storage_buffer_allocator = SubbufferAllocator::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            }
-        );
-
         let sampler = Sampler::new(
             device.clone(),
             SamplerCreateInfo::simple_repeat_linear_no_mipmap(),
@@ -239,10 +228,62 @@ impl ForwardPass {
             render_pass,
             pipeline,
             uniform_buffer_allocator,
-            storage_buffer_allocator,
             sampler,
             ao_sampler
         }
+    }
+
+    /// Build the set-1 material storage buffer + descriptor set. Cached by the
+    /// renderer and only rebuilt when the material table changes.
+    pub fn build_material_set(
+        &self,
+        ctx: &VkContext,
+        materials: &[GpuMaterial],
+    ) -> Arc<DescriptorSet> {
+        let buffer = Buffer::from_iter(
+            ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            materials.iter().copied(),
+        )
+        .expect("failed to allocate material buffer");
+
+        DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[1].clone(),
+            [WriteDescriptorSet::buffer(0, buffer)],
+            [],
+        )
+        .unwrap()
+    }
+
+    /// Build the set-2 texture array + sampler descriptor set. Cached by the
+    /// renderer and only rebuilt when a texture is added.
+    pub fn build_texture_set(
+        &self,
+        ctx: &VkContext,
+        textures: &[Arc<ImageView>],
+    ) -> Arc<DescriptorSet> {
+        let default_view = textures[0].clone();
+        let texture_array =
+            (0..MAX_TEXTURES).map(|i| textures.get(i).cloned().unwrap_or_else(|| default_view.clone()));
+        DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[2].clone(),
+            [
+                WriteDescriptorSet::image_view_array(0, 0, texture_array),
+                WriteDescriptorSet::sampler(1, self.sampler.clone()),
+            ],
+            [],
+        )
+        .unwrap()
     }
 
     pub fn draw(
@@ -256,6 +297,8 @@ impl ForwardPass {
         camera: &Camera,
         extent: [u32; 2],
         ao_view: Arc<ImageView>,
+        material_set: Arc<DescriptorSet>,
+        texture_set: Arc<DescriptorSet>,
     ) {
         let aspect = extent[0] as f32 / extent[1] as f32;
         let view_proj = camera.view_projection(aspect);
@@ -283,45 +326,6 @@ impl ForwardPass {
             [],
         ).unwrap();
         
-        // Copy the table into a fresh storage buffer and bind as set 1
-        let material_buffer = self
-            .storage_buffer_allocator
-            .allocate_slice::<GpuMaterial>(renderer.materials.len() as u64)
-            .unwrap();
-        material_buffer
-            .write()
-            .unwrap()
-            .copy_from_slice(&renderer.materials);
-
-        let material_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[1].clone(),
-            [WriteDescriptorSet::buffer(0, material_buffer)],
-            []
-        ).unwrap();
-
-        // Bind every texture as one fixed-size array at set 2 (binding 0), plus a
-        // single shared sampler (binding 1). The shader's array must be fully
-        // populated, so pad unused slots with the default (white) view at index 0.
-        let default_view = renderer.textures[0].clone();
-        let texture_array = (0..MAX_TEXTURES).map(|i| {
-            renderer
-                .textures
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| default_view.clone())
-        });
-        let texture_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[2].clone(),
-            [
-                WriteDescriptorSet::image_view_array(0, 0, texture_array),
-                WriteDescriptorSet::sampler(1, self.sampler.clone()),
-            ],
-            [],
-        )
-        .unwrap();
-
         builder
             .set_viewport(
                 0,

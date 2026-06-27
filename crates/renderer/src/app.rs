@@ -137,7 +137,7 @@ impl ApplicationHandler for App {
                 metallic: 0.0,
                 roughness: 0.0,
                 reflectance: 0.0,
-                emissive: Vec3::new(1.0, 1.0, 1.0),
+                emissive: Vec3::new(8.0, 8.0, 8.0),
                 ..Material::default()
             },
         ]

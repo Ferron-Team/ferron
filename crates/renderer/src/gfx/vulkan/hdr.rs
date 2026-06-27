@@ -15,7 +15,8 @@ use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage, SampleCount};
-use vulkano::memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator};
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::memory::MemoryPropertyFlags;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
@@ -61,7 +62,7 @@ impl HdrTargets {
         forward_rp: &Arc<RenderPass>,
         extent: [u32; 2],
     ) -> Self {
-        let make = |format: Format, usage: ImageUsage, samples: SampleCount| {
+        let make = |format: Format, usage: ImageUsage, samples: SampleCount, alloc: AllocationCreateInfo| {
             ImageView::new_default(
                 Image::new(
                     mem.clone(),
@@ -73,29 +74,44 @@ impl HdrTargets {
                         samples,
                         ..Default::default()
                     },
-                    AllocationCreateInfo::default(),
+                    alloc,
                 )
                 .unwrap(),
             )
             .unwrap()
         };
 
-        // MSAA color + depth are transient: consumed by the resolve, never stored.
+        // MSAA color + depth are transient and never read back, so prefer
+        // lazily-allocated memory: on Apple/MoltenVK these become memoryless
+        // (tile-only), so the heavy 4x HDR + depth targets cost ~no DRAM. On
+        // backends without a lazy memory type the allocator just falls back.
+        let lazy = AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter {
+                preferred_flags: MemoryPropertyFlags::DEVICE_LOCAL
+                    | MemoryPropertyFlags::LAZILY_ALLOCATED,
+                ..MemoryTypeFilter::PREFER_DEVICE
+            },
+            ..Default::default()
+        };
+
         let msaa_hdr = make(
             HDR_FORMAT,
             ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
             MSAA,
+            lazy.clone(),
         );
         let depth = make(
             DEPTH_FORMAT,
             ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
             MSAA,
+            lazy,
         );
 
         let hdr_view = make(
             HDR_FORMAT,
             ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
             SampleCount::Sample1,
+            AllocationCreateInfo::default(),
         );
 
         let forward_fb = Framebuffer::new(
