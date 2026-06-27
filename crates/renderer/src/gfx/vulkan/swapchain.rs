@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage, SampleCount};
-use vulkano::memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator};
+use vulkano::image::{Image, ImageUsage};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
 use vulkano::swapchain::{PresentMode, Surface, Swapchain, SwapchainCreateInfo};
 use super::context::VkContext;
@@ -69,8 +68,7 @@ impl SwapchainState {
         )
         .expect("failed to create swapchain");
 
-        let framebuffers =
-            build_framebuffers(&ctx.memory_allocator, render_pass, &images, extent);
+        let framebuffers = build_framebuffers(render_pass, &images);
 
         Self {
             swapchain,
@@ -82,7 +80,6 @@ impl SwapchainState {
     // Returns false if the surface has zero area (minimized) and recreation is skipped.
     pub fn recreate(
         &mut self,
-        memory_allocator: &Arc<StandardMemoryAllocator>,
         render_pass: &Arc<RenderPass>,
         extent: [u32; 2],
     ) -> bool {
@@ -99,65 +96,24 @@ impl SwapchainState {
             .expect("failed to recreate swapchain");
 
         self.swapchain = swapchain;
-        self.framebuffers = build_framebuffers(memory_allocator, render_pass, &images, extent);
+        self.framebuffers = build_framebuffers(render_pass, &images);
         self.extent = extent;
         true
     }
 }
 
 fn build_framebuffers(
-    memory_allocator: &Arc<StandardMemoryAllocator>,
     render_pass: &Arc<RenderPass>,
     images: &[Arc<Image>],
-    extent: [u32; 2],
 ) -> Vec<Arc<Framebuffer>> {
-    let color_format = images[0].format();
-
-    // Scratch multisampled color target. TRANSIENT because it never leaves the GPU
-    // the resolve consumes it, so it's never stored or sampled
-    let msaa_color = ImageView::new_default(
-        Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: color_format,
-                extent: [extent[0], extent[1], 1],
-                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
-                samples: SampleCount::Sample4,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-
-
-    let depth = ImageView::new_default(
-        Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: DEPTH_FORMAT,
-                extent: [extent[0], extent[1], 1],
-                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
-                samples: SampleCount::Sample4,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-
     images
         .iter()
         .map(|image| {
-            let color = ImageView::new_default(image.clone()).unwrap();
+            let view = ImageView::new_default(image.clone()).unwrap();
             Framebuffer::new(
                 render_pass.clone(),
                 FramebufferCreateInfo {
-                    attachments: vec![msaa_color.clone(), depth.clone(), color],
+                    attachments: vec![view],
                     ..Default::default()
                 },
             )

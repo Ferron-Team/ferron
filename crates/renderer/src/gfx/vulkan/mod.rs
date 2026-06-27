@@ -1,5 +1,6 @@
 mod context;
 mod forward;
+mod hdr;
 mod swapchain;
 mod texture;
 mod ssao;
@@ -20,12 +21,13 @@ use vulkano::sync::GpuFuture;
 use vulkano::sync::{self, future::FenceSignalFuture};
 use vulkano::{Validated, VulkanError};
 
-use crate::scene::{Camera, CpuMesh, MaterialHandle, MeshHandle, SsaoSettings};
+use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings};
 
 use self::context::VkContext;
 use self::forward::{ForwardPass, GpuMesh, GpuMaterial};
 use self::swapchain::SwapchainState;
 use self::ssao::SsaoPass;
+use self::hdr::{HdrPass, HDR_FORMAT};
 
 use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
 
@@ -35,6 +37,7 @@ pub struct VulkanRenderer {
     pub(crate) ctx: VkContext,
     swapchain: SwapchainState,
     forward: ForwardPass,
+    hdr: HdrPass,
     ssao: SsaoPass,
     pub(crate) meshes: Vec<GpuMesh>,
     pub(crate) materials: Vec<GpuMaterial>,
@@ -50,9 +53,10 @@ impl VulkanRenderer {
     pub fn new(instance: &Arc<Instance>, surface: Arc<Surface>, extent: [u32; 2]) -> Self {
         let ctx = VkContext::new(instance, &surface);
         let format = swapchain_color_format(&ctx, &surface);
-        let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, format);
+        let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, HDR_FORMAT);
+        let hdr = HdrPass::new(&ctx, &forward.render_pass, format, extent);
         let ssao = SsaoPass::new(&ctx, extent);
-        let swapchain = SwapchainState::new(&ctx, &surface, &forward.render_pass, format, extent);
+        let swapchain = SwapchainState::new(&ctx, &surface, &hdr.tonemap_rp, format, extent);
 
         // Default textures so every material slot resolves to a valid view:
         // index 0 = white (a no-op multiply), index 1 = flat normal (0,0,1).
@@ -65,6 +69,7 @@ impl VulkanRenderer {
             ctx,
             swapchain,
             forward,
+            hdr,
             ssao,
             meshes: Vec::new(),
             materials: vec![forward::to_gpu_material(&Material::default())],
@@ -121,6 +126,7 @@ impl RenderBackend for VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        hdr: &HdrSettings,
     ) {
         if self.pending_extent[0] == 0 || self.pending_extent[1] == 0 {
             return;
@@ -128,10 +134,14 @@ impl RenderBackend for VulkanRenderer {
 
         if self.recreate_swapchain {
             if self.swapchain.recreate(
-                &self.ctx.memory_allocator,
-                &self.forward.render_pass,
+                &self.hdr.tonemap_rp,
                 self.pending_extent,
             ) {
+                self.hdr.resize(
+                    &self.ctx.memory_allocator,
+                    &self.forward.render_pass,
+                    self.pending_extent,
+                );
                 self.ssao.resize(&self.ctx.memory_allocator, self.pending_extent);
                 self.recreate_swapchain = false;
             } else {
@@ -167,6 +177,7 @@ impl RenderBackend for VulkanRenderer {
         self.ssao.radius = ssao.radius;
         self.ssao.bias = ssao.bias;
         self.ssao.power = ssao.power;
+        self.hdr.exposure = hdr.exposure;
         let ao_view = if ssao.enabled {
             self.ssao.record(&mut builder, self, items, camera, self.swapchain.extent);
             self.ssao.ao_view()
@@ -182,9 +193,7 @@ impl RenderBackend for VulkanRenderer {
                         Some(1.0.into()),
                         None,
                     ],
-                    ..RenderPassBeginInfo::framebuffer(
-                        self.swapchain.framebuffers[image_index as usize].clone(),
-                    )
+                    ..RenderPassBeginInfo::framebuffer(self.hdr.forward_framebuffer())
                 },
                 SubpassBeginInfo {
                     contents: SubpassContents::Inline,
@@ -204,6 +213,26 @@ impl RenderBackend for VulkanRenderer {
         );
 
         builder.end_render_pass(Default::default()).unwrap();
+
+        // Tonemap the resolved HDR target into the acquired swapchain image.
+        builder
+            .begin_render_pass(
+                RenderPassBeginInfo {
+                    clear_values: vec![None],
+                    ..RenderPassBeginInfo::framebuffer(
+                        self.swapchain.framebuffers[image_index as usize].clone(),
+                    )
+                },
+                SubpassBeginInfo {
+                    contents: SubpassContents::Inline,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        self.hdr
+            .record_tonemap(&mut builder, &self.ctx, self.swapchain.extent);
+        builder.end_render_pass(Default::default()).unwrap();
+
         let command_buffer = builder.build().unwrap();
 
         if let Some(prev) = self.previous_frame_end.as_mut() {

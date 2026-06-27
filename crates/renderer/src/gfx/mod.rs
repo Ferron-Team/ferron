@@ -1,6 +1,6 @@
 pub mod vulkan;
 
-use crate::scene::{Camera, CpuMesh, MaterialHandle, MeshHandle, SsaoSettings};
+use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings};
 use glam::{Mat4, Vec3};
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
@@ -158,5 +158,6 @@ pub trait RenderBackend {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        hdr: &HdrSettings,
     );
 }
