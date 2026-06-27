@@ -13,16 +13,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install shaderc
+      # Build deps for shaderc-sys. With no system libshaderc_shared present,
+      # shaderc-sys builds a *static* libshaderc from source, so the
+      # vulkano-shaders proc-macro is self-contained — nothing for rustc to
+      # dynamically resolve when it loads the macro (the E0463 we were hitting).
+      - name: Install shaderc build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libshaderc-dev
+          sudo apt-get install -y cmake ninja-build python3 build-essential git
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
+        with:
+          # Bump this suffix to drop any poisoned proc-macro artifact cached by
+          # an earlier failing run.
+          prefix-key: "v2-rust"
 
       - name: Build
         run: cargo build --workspace --verbose
