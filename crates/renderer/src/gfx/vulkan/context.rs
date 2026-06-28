@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ash::vk;
 use vulkano::command_buffer::allocator::{
     StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
 };
@@ -10,7 +11,9 @@ use vulkano::device::{
 };
 use vulkano::instance::Instance;
 use vulkano::memory::allocator::StandardMemoryAllocator;
+use vulkano::memory::MemoryHeapFlags;
 use vulkano::swapchain::Surface;
+use vulkano::{Version, VulkanObject};
 
 pub struct VkContext {
     pub device: Arc<Device>,
@@ -44,6 +47,13 @@ impl VkContext {
             .image_view_format_swizzle;
         if physical_device.supported_extensions().khr_portability_subset {
             device_extensions.khr_portability_subset = true;
+        }
+
+        // VK_EXT_memory_budget exposes live VRAM usage/budget per heap for the
+        // performance overlay. Enable it when present; `vram_bytes` falls back to
+        // reporting total heap size when it isn't.
+        if physical_device.supported_extensions().ext_memory_budget {
+            device_extensions.ext_memory_budget = true;
         }
 
         let (device, mut queues) = Device::new(
@@ -81,6 +91,55 @@ impl VkContext {
             command_buffer_allocator,
             descriptor_set_allocator,
         }
+    }
+
+    /// Live device-local VRAM as `(used, total)` bytes. `used` is `None` when
+    /// `VK_EXT_memory_budget` isn't available (e.g. some drivers); `total` is the
+    /// summed size of all device-local heaps and is always reported.
+    ///
+    /// On unified-memory devices (Apple Silicon) the "device-local" heap is system
+    /// RAM, so `total` there is the shared pool, not a dedicated VRAM bank.
+    pub fn vram_bytes(&self) -> (Option<u64>, u64) {
+        let phys = self.device.physical_device();
+        let mem_props = phys.memory_properties();
+
+        // Collect device-local heap indices and their summed size up front; the
+        // budget extension reports usage per heap against these same indices.
+        let mut total = 0u64;
+        let device_local: Vec<usize> = mem_props
+            .memory_heaps
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.flags.intersects(MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|(i, h)| {
+                total += h.size;
+                i
+            })
+            .collect();
+
+        let instance = self.device.instance();
+        if !self.device.enabled_extensions().ext_memory_budget
+            || instance.api_version() < Version::V1_1
+        {
+            return (None, total);
+        }
+
+        // Chain the budget struct onto a memory-properties2 query, mirroring how
+        // vulkano makes the same call internally.
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        {
+            let mut props2 =
+                vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            unsafe {
+                (instance.fns().v1_1.get_physical_device_memory_properties2)(
+                    phys.handle(),
+                    &mut props2,
+                );
+            }
+        }
+
+        let used = device_local.iter().map(|&i| budget.heap_usage[i]).sum();
+        (Some(used), total)
     }
 }
 

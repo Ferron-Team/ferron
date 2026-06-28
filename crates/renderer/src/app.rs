@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,9 +12,10 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 use crate::camera_controller::CameraController;
 use crate::editor::Editor;
 use crate::gfx::vulkan::VulkanRenderer;
-use crate::gfx::RenderBackend;
+use crate::gfx::{RenderBackend, RenderItem, SceneLighting};
 use crate::scene::entities::build_default_scene;
 use crate::scene::{AmbientLight, Camera, HdrSettings, SsaoSettings, Time};
+use crate::stats::FrameStats;
 use crate::systems;
 use ferron_ecs::World;
 
@@ -32,9 +32,9 @@ pub struct App {
     camera_controller: CameraController,
     start: Instant,
     last_frame: f32,
-    // FPS counter: frames and elapsed time accumulated over the current window.
-    fps_accum: f32,
-    fps_frames: u32,
+    // Reused each frame so a steady scene does no per-frame allocation.
+    render_items: Vec<RenderItem>,
+    lighting: SceneLighting,
 }
 
 impl App {
@@ -61,8 +61,8 @@ impl App {
             camera_controller: CameraController::new(),
             start: Instant::now(),
             last_frame: 0.0,
-            fps_accum: 0.0,
-            fps_frames: 0,
+            render_items: Vec::new(),
+            lighting: SceneLighting::default(),
         };
 
         // World-global state lives in resources, not on `App`.
@@ -71,6 +71,7 @@ impl App {
         app.world.insert_resource(AmbientLight::default());
         app.world.insert_resource(SsaoSettings::default());
         app.world.insert_resource(HdrSettings::default());
+        app.world.insert_resource(FrameStats::new());
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -148,6 +149,7 @@ impl ApplicationHandler for App {
                 let delta = elapsed - self.last_frame;
                 self.last_frame = elapsed;
                 self.world.resource_mut::<Time>().update(delta);
+                self.world.resource_mut::<FrameStats>().record(delta);
 
                 // Simulation systems run, then we extract a draw list for the
                 // backend — which never sees the ECS world directly.
@@ -162,8 +164,8 @@ impl ApplicationHandler for App {
                 self.camera_controller
                     .update(&mut self.world.resource_mut::<Camera>(), delta);
 
-                let items = systems::extract_renderables(&self.world);
-                let lighting = systems::extract_lighting(&self.world);
+                systems::extract_renderables(&self.world, &mut self.render_items);
+                systems::extract_lighting(&self.world, &mut self.lighting);
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
@@ -174,19 +176,22 @@ impl ApplicationHandler for App {
                     renderer, editor, ..
                 } = active;
                 let mut overlay = |before, image| editor.draw(before, image);
-                renderer
-                    .render_with_overlay(&items, &lighting, &camera, &ssao, &hdr, &mut overlay);
+                renderer.render_with_overlay(
+                    &self.render_items,
+                    &self.lighting,
+                    &camera,
+                    &ssao,
+                    &hdr,
+                    &mut overlay,
+                );
 
-                // Average FPS over ~1s windows
-                self.fps_accum += delta;
-                self.fps_frames += 1;
-                if self.fps_accum >= 1.0 {
-                    let fps = self.fps_frames as f32 / self.fps_accum;
-                    print!("\rFPS: {fps:6.1}  ({:5.2} ms/frame)", 1000.0 / fps);
-                    let _ = std::io::stdout().flush();
-                    self.fps_accum = 0.0;
-                    self.fps_frames = 0;
-                }
+                // Pull this frame's GPU timing and VRAM from the backend into the
+                // stats resource the overlay reads (one frame of latency is fine).
+                let gpu_ms = renderer.gpu_frame_ms();
+                let (vram_used, vram_total) = renderer.gpu_memory();
+                self.world
+                    .resource_mut::<FrameStats>()
+                    .set_gpu_stats(gpu_ms, vram_used, vram_total);
             }
             _ => {}
         }

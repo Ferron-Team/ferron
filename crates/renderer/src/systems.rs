@@ -25,8 +25,10 @@ pub fn spin(world: &World, dt: f32) {
 /// [`RenderItem`]s so the backend never has to know about the world. An
 /// entity's [`MaterialHandle`] is optional — meshes without one fall back to
 /// `MaterialHandle(0)`, the default material the backend seeds at startup.
-pub fn extract_renderables(world: &World) -> Vec<RenderItem> {
-    let mut items = Vec::new();
+pub fn extract_renderables(world: &World, out: &mut Vec<RenderItem>) {
+    // Reuse the caller's buffer: `clear` keeps the capacity, so a steady scene
+    // does no per-frame heap allocation.
+    out.clear();
     world
         .query::<(&LocalTransform, &MeshHandle)>()
         .for_each(|entity, (transform, mesh)| {
@@ -36,13 +38,12 @@ pub fn extract_renderables(world: &World) -> Vec<RenderItem> {
                 .get::<MaterialHandle>(entity)
                 .map(|m| *m)
                 .unwrap_or(MaterialHandle(0));
-            items.push(RenderItem {
+            out.push(RenderItem {
                 model: transform.matrix(),
                 mesh: *mesh,
                 material,
             });
         });
-    items
 }
 
 /// Build this frame's [`SceneLighting`] from the world.
@@ -53,15 +54,22 @@ pub fn extract_renderables(world: &World) -> Vec<RenderItem> {
 /// shader supports one directional "sun", so the first directional light wins;
 /// any directional lights and the ambient term fall back to sensible defaults
 /// when not supplied.
-pub fn extract_lighting(world: &World) -> SceneLighting {
-    // Start from the defaults so a scene with no light entities still renders.
-    let mut lighting = SceneLighting::default();
+pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
+    // Reset the scalar fields to defaults each frame so a scene with no light
+    // entities still renders, but reuse `point_lights`' allocation via `clear`.
+    let defaults = SceneLighting::default();
+    out.ambient_color = defaults.ambient_color;
+    out.ambient_intensity = defaults.ambient_intensity;
+    out.sun = defaults.sun;
+    out.shininess = defaults.shininess;
+    out.specular_strength = defaults.specular_strength;
+    out.point_lights.clear();
 
     // Ambient is a world-global, so it lives in a resource rather than on an
     // entity. Use it if present, otherwise keep the default fill.
     if let Some(ambient) = world.get_resource::<AmbientLight>() {
-        lighting.ambient_color = ambient.color;
-        lighting.ambient_intensity = ambient.intensity;
+        out.ambient_color = ambient.color;
+        out.ambient_intensity = ambient.intensity;
     }
 
     let mut has_sun = false;
@@ -73,9 +81,9 @@ pub fn extract_lighting(world: &World) -> SceneLighting {
                 // until the shader grows support for more.
                 if !has_sun {
                     let direction = (transform.rotation * Vec3::NEG_Z).normalize_or_zero();
-                    lighting.sun.direction = direction;
-                    lighting.sun.color = color;
-                    lighting.sun.intensity = intensity;
+                    out.sun.direction = direction;
+                    out.sun.color = color;
+                    out.sun.intensity = intensity;
                     has_sun = true;
                 }
             }
@@ -84,8 +92,8 @@ pub fn extract_lighting(world: &World) -> SceneLighting {
                 intensity,
                 range,
             } => {
-                if lighting.point_lights.len() < MAX_POINT_LIGHTS {
-                    lighting.point_lights.push(PointLight {
+                if out.point_lights.len() < MAX_POINT_LIGHTS {
+                    out.point_lights.push(PointLight {
                         position: transform.translation,
                         color,
                         intensity,
@@ -94,6 +102,4 @@ pub fn extract_lighting(world: &World) -> SceneLighting {
                 }
             }
         });
-
-    lighting
 }

@@ -12,3 +12,6 @@ glam.workspace = true
 image.workspace = true
 egui.workspace = true
 egui_winit_vulkano.workspace = true
+sysinfo = "0.33"
+# Raw VK_EXT_memory_budget query for VRAM usage; pinned to vulkano 0.35's ash.
+ash = "0.38"

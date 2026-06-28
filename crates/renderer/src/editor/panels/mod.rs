@@ -4,6 +4,7 @@
 mod environment;
 mod hierarchy;
 mod inspector;
+mod performance;
 
 use glam::Vec3;
 
@@ -17,6 +18,7 @@ pub fn draw(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
     hierarchy::show(ctx, world, state);
     inspector::show(ctx, world, state);
     environment::show(ctx, world);
+    performance::show(ctx, world);
 }
 
 pub(super) fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut Vec3, speed: f32) {
