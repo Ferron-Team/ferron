@@ -35,6 +35,8 @@ pub struct App {
     // Reused each frame so a steady scene does no per-frame allocation.
     render_items: Vec<RenderItem>,
     lighting: SceneLighting,
+    #[cfg(feature = "scripting")]
+    scripting: Option<crate::scripting::Scripting>,
 }
 
 impl App {
@@ -63,6 +65,8 @@ impl App {
             last_frame: 0.0,
             render_items: Vec::new(),
             lighting: SceneLighting::default(),
+            #[cfg(feature = "scripting")]
+            scripting: None,
         };
 
         // World-global state lives in resources, not on `App`.
@@ -96,6 +100,28 @@ impl ApplicationHandler for App {
         build_default_scene(&mut self.world, &mut renderer);
         self.camera_controller
             .sync_from(&self.world.resource::<Camera>());
+
+        // Boot C# scripting and attach the demo Behaviour to the first renderable.
+        #[cfg(feature = "scripting")]
+        {
+            let scripting = crate::scripting::Scripting::boot(std::path::Path::new(
+                "scripting/Ferron/bin/Debug/net10.0",
+            ));
+            if let Some(scripting) = &scripting {
+                let mut target = None;
+                self.world
+                    .query::<&crate::scene::MeshHandle>()
+                    .for_each(|entity, _| {
+                        if target.is_none() {
+                            target = Some(entity);
+                        }
+                    });
+                if let Some(entity) = target {
+                    scripting.attach(&mut self.world, entity, "Ferron.Demo.Spinner, Ferron");
+                }
+            }
+            self.scripting = scripting;
+        }
 
         let editor = Editor::new(event_loop, surface, renderer.queue(), renderer.color_format());
 
@@ -154,6 +180,12 @@ impl ApplicationHandler for App {
                 // Simulation systems run, then we extract a draw list for the
                 // backend — which never sees the ECS world directly.
                 systems::spin(&self.world, delta);
+
+                // Tick C# scripts (their OnUpdate may edit components this frame).
+                #[cfg(feature = "scripting")]
+                if let Some(scripting) = &self.scripting {
+                    scripting.tick(&mut self.world, delta);
+                }
 
                 // Build the editor UI; it may spawn/despawn/edit entities, so it
                 // runs before we extract this frame's draw data.

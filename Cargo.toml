@@ -1,12 +1,17 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# ferron-script hosts CoreCLR (downloads nethost at build time, targets .NET 10),
+# so it's kept out of the default workspace build/CI. Build it explicitly:
+#   cargo build --manifest-path crates/ferron-script/Cargo.toml
+exclude = ["crates/ferron-script"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+ferron-script = { path = "crates/ferron-script" }
 ferron-ecs = { path = "crates/ferron-ecs" }
 vulkano = "0.35"
 vulkano-shaders = "0.35"
