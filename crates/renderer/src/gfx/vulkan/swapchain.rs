@@ -20,6 +20,10 @@ pub const PRESENT_MODE: PresentMode = PresentMode::Immediate;
 pub struct SwapchainState {
     pub swapchain: Arc<Swapchain>,
     pub framebuffers: Vec<Arc<Framebuffer>>,
+    /// One view per swapchain image, parallel to `framebuffers`. An overlay
+    /// (e.g. the editor UI) draws onto these directly, after the tonemap pass
+    /// has written the scene into the same image.
+    pub image_views: Vec<Arc<ImageView>>,
     pub extent: [u32; 2],
 }
 
@@ -68,11 +72,12 @@ impl SwapchainState {
         )
         .expect("failed to create swapchain");
 
-        let framebuffers = build_framebuffers(render_pass, &images);
+        let (framebuffers, image_views) = build_framebuffers(render_pass, &images);
 
         Self {
             swapchain,
             framebuffers,
+            image_views,
             extent,
         }
     }
@@ -96,28 +101,33 @@ impl SwapchainState {
             .expect("failed to recreate swapchain");
 
         self.swapchain = swapchain;
-        self.framebuffers = build_framebuffers(render_pass, &images);
+        let (framebuffers, image_views) = build_framebuffers(render_pass, &images);
+        self.framebuffers = framebuffers;
+        self.image_views = image_views;
         self.extent = extent;
         true
     }
 }
 
+/// Build a framebuffer and keep its color view for each swapchain image. The
+/// views are returned alongside so an overlay can target the same images.
 fn build_framebuffers(
     render_pass: &Arc<RenderPass>,
     images: &[Arc<Image>],
-) -> Vec<Arc<Framebuffer>> {
+) -> (Vec<Arc<Framebuffer>>, Vec<Arc<ImageView>>) {
     images
         .iter()
         .map(|image| {
             let view = ImageView::new_default(image.clone()).unwrap();
-            Framebuffer::new(
+            let framebuffer = Framebuffer::new(
                 render_pass.clone(),
                 FramebufferCreateInfo {
-                    attachments: vec![view],
+                    attachments: vec![view.clone()],
                     ..Default::default()
                 },
             )
-            .unwrap()
+            .unwrap();
+            (framebuffer, view)
         })
-        .collect()
+        .unzip()
 }

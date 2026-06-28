@@ -1,0 +1,42 @@
+//! The editor's panels. Each is a self-contained module; add a new one by
+//! writing a `show(...)` fn and calling it from [`draw`].
+
+mod environment;
+mod hierarchy;
+mod inspector;
+mod performance;
+
+use glam::Vec3;
+
+use ferron_ecs::World;
+
+use super::state::EditorState;
+
+/// Side/bottom panels only — no `CentralPanel`, so the center stays transparent
+/// and the 3D scene shows through behind the editor.
+pub fn draw(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
+    hierarchy::show(ctx, world, state);
+    inspector::show(ctx, world, state);
+    environment::show(ctx, world);
+    performance::show(ctx, world);
+}
+
+pub(super) fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut Vec3, speed: f32) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::DragValue::new(&mut v.x).speed(speed));
+        ui.add(egui::DragValue::new(&mut v.y).speed(speed));
+        ui.add(egui::DragValue::new(&mut v.z).speed(speed));
+    });
+}
+
+/// Edits an RGB `Vec3`; the picker clamps each channel to `[0, 1]`.
+pub(super) fn color_row(ui: &mut egui::Ui, label: &str, c: &mut Vec3) {
+    let mut rgb = [c.x, c.y, c.z];
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if ui.color_edit_button_rgb(&mut rgb).changed() {
+            *c = Vec3::from(rgb);
+        }
+    });
+}

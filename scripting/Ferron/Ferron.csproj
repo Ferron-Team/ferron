@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Must match the netcorehost framework feature in crates/ferron-script. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Needed for `unsafe`, function pointers, and [UnmanagedCallersOnly]. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Emit Ferron.runtimeconfig.json next to the DLL so the Rust host can load
+         it via hostfxr's initialize_for_runtime_config. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+  </PropertyGroup>
+
+</Project>

@@ -11,6 +11,8 @@ mod transform;
 pub use assets::Assets;
 pub use camera::Camera;
 pub use components::{AmbientLight, Light, LocalTransform, MaterialHandle, MeshHandle, Name, Spin};
+#[cfg(feature = "scripting")]
+pub use components::ScriptComponent;
 pub use hdr::HdrSettings;
 pub use mesh::CpuMesh;
 pub use ssao::SsaoSettings;

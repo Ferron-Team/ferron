@@ -1,0 +1,2 @@
+# This crate is excluded from the workspace, so it builds to its own target/.
+/target
