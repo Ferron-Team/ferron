@@ -117,7 +117,7 @@ impl ApplicationHandler for App {
                         }
                     });
                 if let Some(entity) = target {
-                    scripting.attach(&mut self.world, entity, "Ferron.Demo.Spinner, Ferron");
+                    scripting.attach(&mut self.world, entity, "Ferron.Demo.Hover, Ferron");
                 }
             }
             self.scripting = scripting;
