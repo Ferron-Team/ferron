@@ -36,6 +36,11 @@ pub struct FerronApi {
     pub spawn_renderable:
         extern "C" fn(*const c_char, *const c_char, *const CTransform) -> CEntity,
     pub despawn: extern "C" fn(CEntity) -> bool,
+    // Frame timing, read from the engine's `Time` resource. Engine-side (like
+    // input), so the renderer supplies the real implementations.
+    pub time_delta: extern "C" fn() -> f32,
+    pub time_total: extern "C" fn() -> f32,
+    pub time_frame_count: extern "C" fn() -> u64,
 }
 
 /// A table with the generic functions wired and the rest stubbed; the engine
@@ -54,7 +59,18 @@ pub fn default_api() -> FerronApi {
         cursor_pos: stub_cursor_pos,
         spawn_renderable: stub_spawn_renderable,
         despawn: stub_despawn,
+        time_delta: stub_time_seconds,
+        time_total: stub_time_seconds,
+        time_frame_count: stub_time_frame_count,
     }
+}
+
+extern "C" fn stub_time_seconds() -> f32 {
+    0.0
+}
+
+extern "C" fn stub_time_frame_count() -> u64 {
+    0
 }
 
 extern "C" fn stub_spawn_renderable(

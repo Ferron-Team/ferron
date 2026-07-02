@@ -15,7 +15,7 @@ use ferron_ecs::{Entity, World};
 use ferron_script::{CEntity, CTransform, FerronApi, ScriptHost};
 
 use crate::scene::{
-    Assets, InputState, LocalTransform, MaterialHandle, MeshHandle, Name, ScriptComponent,
+    Assets, InputState, LocalTransform, MaterialHandle, MeshHandle, Name, ScriptComponent, Time,
     Transform,
 };
 
@@ -107,6 +107,33 @@ extern "C" fn cursor_pos(x: *mut f32, y: *mut f32) {
         // SAFETY: as above.
         unsafe { *y = cy };
     }
+}
+
+// --- time ---------------------------------------------------------------------
+// The `Time` resource is engine-side, so these live here (like the input
+// functions) and read it through the active-world seam. Outside a dispatch
+// window, or before the resource exists, they report zero.
+
+fn with_time<R: Default>(query: impl FnOnce(&Time) -> R) -> R {
+    // TODO: ferron_script::with_world + world.get_resource::<Time>(),
+    //       defaulting when no world/resource is available (see `with_input`)
+    let _ = query;
+    todo!()
+}
+
+extern "C" fn time_delta() -> f32 {
+    // TODO: with_time(|time| time.delta_time())
+    todo!()
+}
+
+extern "C" fn time_total() -> f32 {
+    // TODO: with_time(|time| time.elapsed_time())
+    todo!()
+}
+
+extern "C" fn time_frame_count() -> u64 {
+    // TODO: with_time(|time| time.frame_count())
+    todo!()
 }
 
 // --- deferred structural changes ---------------------------------------------
@@ -241,6 +268,9 @@ fn build_api() -> FerronApi {
         cursor_pos,
         spawn_renderable,
         despawn,
+        time_delta,
+        time_total,
+        time_frame_count,
         ..ferron_script::default_api()
     }
 }

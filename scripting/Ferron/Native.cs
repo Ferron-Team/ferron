@@ -18,6 +18,9 @@ public unsafe struct FerronApi
     public delegate* unmanaged<float*, float*, void> CursorPos;
     public delegate* unmanaged<byte*, byte*, Transform*, Entity> SpawnRenderable;
     public delegate* unmanaged<Entity, byte> Despawn;
+    public delegate* unmanaged<float> TimeDelta;
+    public delegate* unmanaged<float> TimeTotal;
+    public delegate* unmanaged<ulong> TimeFrameCount;
 }
 
 public static unsafe class Native
@@ -73,6 +76,24 @@ public static unsafe class Native
     }
 
     public static bool Despawn(Entity entity) => _api.Despawn(entity) != 0;
+
+    public static float TimeDelta()
+    {
+        // TODO: call through _api.TimeDelta
+        return 0f;
+    }
+
+    public static float TimeTotal()
+    {
+        // TODO: call through _api.TimeTotal
+        return 0f;
+    }
+
+    public static ulong TimeFrameCount()
+    {
+        // TODO: call through _api.TimeFrameCount
+        return 0;
+    }
 
     private static byte[] NulTerminated(string value)
     {
