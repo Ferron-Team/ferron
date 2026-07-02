@@ -11,6 +11,13 @@ public unsafe struct FerronApi
     public delegate* unmanaged<Entity> Spawn;
     public delegate* unmanaged<Entity, Transform*, byte> GetTransform;
     public delegate* unmanaged<Entity, Transform*, byte> SetTransform;
+    public delegate* unmanaged<uint, byte> KeyDown;
+    public delegate* unmanaged<uint, byte> KeyPressed;
+    public delegate* unmanaged<uint, byte> KeyReleased;
+    public delegate* unmanaged<uint, byte> MouseButtonDown;
+    public delegate* unmanaged<float*, float*, void> CursorPos;
+    public delegate* unmanaged<byte*, byte*, Transform*, Entity> SpawnRenderable;
+    public delegate* unmanaged<Entity, byte> Despawn;
 }
 
 public static unsafe class Native
@@ -40,4 +47,37 @@ public static unsafe class Native
 
     public static void SetTransform(Entity entity, Transform value) =>
         _api.SetTransform(entity, &value);
+
+    public static bool KeyDown(uint code) => _api.KeyDown(code) != 0;
+
+    public static bool KeyPressed(uint code) => _api.KeyPressed(code) != 0;
+
+    public static bool KeyReleased(uint code) => _api.KeyReleased(code) != 0;
+
+    public static bool MouseButtonDown(uint button) => _api.MouseButtonDown(button) != 0;
+
+    public static (float X, float Y) CursorPos()
+    {
+        float x = 0, y = 0;
+        _api.CursorPos(&x, &y);
+        return (x, y);
+    }
+
+    public static Entity SpawnRenderable(string mesh, string material, Transform transform)
+    {
+        var meshBytes = NulTerminated(mesh);
+        var materialBytes = NulTerminated(material);
+        fixed (byte* meshPtr = meshBytes)
+        fixed (byte* materialPtr = materialBytes)
+            return _api.SpawnRenderable(meshPtr, materialPtr, &transform);
+    }
+
+    public static bool Despawn(Entity entity) => _api.Despawn(entity) != 0;
+
+    private static byte[] NulTerminated(string value)
+    {
+        var bytes = new byte[Encoding.UTF8.GetByteCount(value) + 1];
+        Encoding.UTF8.GetBytes(value, 0, value.Length, bytes, 0);
+        return bytes;
+    }
 }

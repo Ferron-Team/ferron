@@ -7,6 +7,7 @@ mod mesh;
 mod ssao;
 mod time;
 mod transform;
+mod input;
 
 pub use assets::Assets;
 pub use camera::Camera;
@@ -14,6 +15,7 @@ pub use components::{AmbientLight, Light, LocalTransform, MaterialHandle, MeshHa
 #[cfg(feature = "scripting")]
 pub use components::ScriptComponent;
 pub use hdr::HdrSettings;
+pub use input::InputState;
 pub use mesh::CpuMesh;
 pub use ssao::SsaoSettings;
 pub use time::Time;

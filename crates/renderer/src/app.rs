@@ -14,7 +14,7 @@ use crate::editor::Editor;
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::{RenderBackend, RenderItem, SceneLighting};
 use crate::scene::entities::build_default_scene;
-use crate::scene::{AmbientLight, Camera, HdrSettings, SsaoSettings, Time};
+use crate::scene::{AmbientLight, Camera, HdrSettings, InputState, SsaoSettings, Time};
 use crate::stats::FrameStats;
 use crate::systems;
 use ferron_ecs::World;
@@ -76,6 +76,7 @@ impl App {
         app.world.insert_resource(SsaoSettings::default());
         app.world.insert_resource(HdrSettings::default());
         app.world.insert_resource(FrameStats::new());
+        app.world.insert_resource(InputState::new());
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -101,24 +102,31 @@ impl ApplicationHandler for App {
         self.camera_controller
             .sync_from(&self.world.resource::<Camera>());
 
-        // Boot C# scripting and attach the demo Behaviour to the first renderable.
+        // Boot C# scripting and attach one entry Behaviour to a fresh entity;
+        // the entry script finds or spawns everything else itself through the
+        // script API. Both the assembly location and the entry type are
+        // overridable (FERRON_SCRIPT_DIR / FERRON_ENTRY).
         #[cfg(feature = "scripting")]
         {
-            let scripting = crate::scripting::Scripting::boot(std::path::Path::new(
-                "scripting/Ferron/bin/Debug/net10.0",
-            ));
-            if let Some(scripting) = &scripting {
-                let mut target = None;
-                self.world
-                    .query::<&crate::scene::MeshHandle>()
-                    .for_each(|entity, _| {
-                        if target.is_none() {
-                            target = Some(entity);
-                        }
-                    });
-                if let Some(entity) = target {
-                    scripting.attach(&mut self.world, entity, "Ferron.Demo.Hover, Ferron");
+            let scripting = match crate::scripting::Scripting::find_assembly_dir() {
+                Some(dir) => crate::scripting::Scripting::boot(&dir),
+                None => {
+                    eprintln!(
+                        "scripting disabled: no built Ferron assembly found \
+                         (run `dotnet build scripting/Ferron` or set FERRON_SCRIPT_DIR)"
+                    );
+                    None
                 }
+            };
+            if let Some(scripting) = &scripting {
+                let entry = std::env::var("FERRON_ENTRY")
+                    .unwrap_or_else(|_| "Ferron.Demo.Game, Ferron".to_string());
+                let entity = self
+                    .world
+                    .spawn_entity()
+                    .with(crate::scene::Name::new("Script Entry"))
+                    .id();
+                scripting.attach(&mut self.world, entity, &entry);
             }
             self.scripting = scripting;
         }
@@ -145,6 +153,11 @@ impl ApplicationHandler for App {
         // The editor sees events first; when it doesn't want one, the camera
         // controller may. Toggling look mode grabs/hides the cursor.
         let egui_wants = active.editor.on_window_event(&event);
+        // Scripts poll this resource through the scripting ABI; it applies the
+        // same egui gate as the camera controller.
+        self.world
+            .resource_mut::<InputState>()
+            .on_window_event(&event, egui_wants);
         let was_looking = self.camera_controller.looking();
         self.camera_controller.process_window_event(&event, egui_wants);
         if self.camera_controller.looking() != was_looking {
@@ -224,6 +237,10 @@ impl ApplicationHandler for App {
                 self.world
                     .resource_mut::<FrameStats>()
                     .set_gpu_stats(gpu_ms, vram_used, vram_total);
+
+                // The frame is over: clear the one-frame pressed/released edges
+                // (scripts have already observed them during the tick above).
+                self.world.resource_mut::<InputState>().end_frame();
             }
             _ => {}
         }
@@ -238,6 +255,7 @@ impl ApplicationHandler for App {
         // Raw mouse motion drives look mode; the controller ignores it unless the
         // right button is held.
         self.camera_controller.process_device_event(&event);
+        self.world.resource_mut::<InputState>().on_device_event(&event);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
