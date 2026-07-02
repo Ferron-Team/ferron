@@ -23,17 +23,50 @@ pub struct FerronApi {
     pub spawn: extern "C" fn() -> CEntity,
     pub get_transform: extern "C" fn(CEntity, *mut CTransform) -> bool,
     pub set_transform: extern "C" fn(CEntity, *const CTransform) -> bool,
+    // Input polling; key/button codes are the engine's stable numbering (see
+    // the renderer's `scene::input::map_key` and C# `Ferron.KeyCode`).
+    pub key_down: extern "C" fn(u32) -> bool,
+    pub key_pressed: extern "C" fn(u32) -> bool,
+    pub key_released: extern "C" fn(u32) -> bool,
+    pub mouse_button_down: extern "C" fn(u32) -> bool,
+    pub cursor_pos: extern "C" fn(*mut f32, *mut f32),
+    // Structural ops. The engine queues these and applies them after the
+    // dispatch window closes, but `spawn_renderable` reserves and returns a
+    // real entity id immediately.
+    pub spawn_renderable:
+        extern "C" fn(*const c_char, *const c_char, *const CTransform) -> CEntity,
+    pub despawn: extern "C" fn(CEntity) -> bool,
 }
 
-/// A table with the generic functions wired and transform stubbed; the engine
-/// overrides `get_transform`/`set_transform` with real implementations.
+/// A table with the generic functions wired and the rest stubbed; the engine
+/// overrides `get_transform`/`set_transform` and the input functions with real
+/// implementations (they touch engine-side resources).
 pub fn default_api() -> FerronApi {
     FerronApi {
         log: ferron_log,
         spawn: ferron_spawn,
         get_transform: stub_get_transform,
         set_transform: stub_set_transform,
+        key_down: stub_key_query,
+        key_pressed: stub_key_query,
+        key_released: stub_key_query,
+        mouse_button_down: stub_key_query,
+        cursor_pos: stub_cursor_pos,
+        spawn_renderable: stub_spawn_renderable,
+        despawn: stub_despawn,
     }
+}
+
+extern "C" fn stub_spawn_renderable(
+    _mesh: *const c_char,
+    _material: *const c_char,
+    _transform: *const CTransform,
+) -> CEntity {
+    CEntity::NULL
+}
+
+extern "C" fn stub_despawn(_entity: CEntity) -> bool {
+    false
 }
 
 extern "C" fn stub_get_transform(_entity: CEntity, _out: *mut CTransform) -> bool {
@@ -42,6 +75,21 @@ extern "C" fn stub_get_transform(_entity: CEntity, _out: *mut CTransform) -> boo
 
 extern "C" fn stub_set_transform(_entity: CEntity, _value: *const CTransform) -> bool {
     false
+}
+
+extern "C" fn stub_key_query(_code: u32) -> bool {
+    false
+}
+
+extern "C" fn stub_cursor_pos(x: *mut f32, y: *mut f32) {
+    if !x.is_null() {
+        // SAFETY: C# passes valid, writable f32 pointers.
+        unsafe { *x = 0.0 };
+    }
+    if !y.is_null() {
+        // SAFETY: as above.
+        unsafe { *y = 0.0 };
+    }
 }
 
 /// Logging callback C# invokes through [`FerronApi::log`].
