@@ -1,9 +1,11 @@
-using System.Numerics;
 using System.Runtime.InteropServices;
+
+using Ferron.Math;
 
 namespace Ferron;
 
-// Layout must match Rust CTransform.
+// Layout must match Rust CTransform (position, rotation xyzw, scale — ten
+// sequential floats; Ferron.Math types are layout-compatible by construction).
 [StructLayout(LayoutKind.Sequential)]
 public struct Transform
 {
@@ -13,8 +15,8 @@ public struct Transform
 
     public static Transform Identity => new()
     {
-        Position = Vector3.Zero,
-        Rotation = Quaternion.Identity,
-        Scale = Vector3.One,
+        Position = Vector3.zero,
+        Rotation = Quaternion.identity,
+        Scale = Vector3.one,
     };
 }
