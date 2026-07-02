@@ -1,4 +1,4 @@
-using System.Numerics;
+using Ferron.Math;
 
 namespace Ferron.Demo;
 
@@ -28,23 +28,23 @@ public class Game : Behaviour
 
     public override void OnUpdate(float deltaTime)
     {
-        var direction = Vector3.Zero;
-        if (Input.GetKey(KeyCode.LeftArrow)) direction.X -= 1f;
-        if (Input.GetKey(KeyCode.RightArrow)) direction.X += 1f;
-        if (Input.GetKey(KeyCode.UpArrow)) direction.Z -= 1f;
-        if (Input.GetKey(KeyCode.DownArrow)) direction.Z += 1f;
+        var direction = Vector3.zero;
+        if (Input.GetKey(KeyCode.LeftArrow)) direction += Vector3.left;
+        if (Input.GetKey(KeyCode.RightArrow)) direction += Vector3.right;
+        if (Input.GetKey(KeyCode.UpArrow)) direction += Vector3.forward;
+        if (Input.GetKey(KeyCode.DownArrow)) direction += Vector3.back;
 
-        if (direction != Vector3.Zero)
+        if (direction != Vector3.zero)
         {
-            _playerTransform.Position += Vector3.Normalize(direction) * MoveSpeed * deltaTime;
+            _playerTransform.Position += direction.normalized * MoveSpeed * deltaTime;
             Native.SetTransform(_player, _playerTransform);
         }
 
         if (Input.GetKeyDown(KeyCode.Space))
         {
             var drop = Transform.Identity;
-            drop.Position = _playerTransform.Position + new Vector3(0f, 1.75f, 0f);
-            drop.Scale = new Vector3(0.5f);
+            drop.Position = _playerTransform.Position + Vector3.up * 1.75f;
+            drop.Scale = Vector3.one * 0.5f;
             var material = Palette[_spawned++ % Palette.Length];
             var entity = World.SpawnRenderable("cube", material, drop);
             Native.Log($"spawned {entity} ({material})");

@@ -1,5 +1,6 @@
-using System.Numerics;
 using Ferron;
+using Ferron.Math;
+using Quaternion = Ferron.Math.Quaternion;
 
 namespace SampleGame;
 
@@ -13,8 +14,8 @@ public class Spinner : Behaviour
     {
         var t = Transform;
         var radians = MathF.PI / 180f * DegreesPerSecond * deltaTime;
-        t.Rotation = Quaternion.Normalize(
-            Quaternion.Concatenate(t.Rotation, Quaternion.CreateFromAxisAngle(Vector3.UnitY, radians)));
+        t.Rotation =
+            Quaternion.Normalize(Quaternion.Euler(0, radians,0));
         Transform = t;
     }
 }
