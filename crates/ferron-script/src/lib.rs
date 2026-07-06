@@ -1,8 +1,9 @@
 //! C# scripting host for the Ferron engine.
 //!
 //! [`ScriptHost`] boots CoreCLR, loads the `Ferron` assembly, hands it the engine
-//! function table ([`FerronApi`]), and exposes the `Create`/`Start`/`Update`
-//! entry points the engine drives each frame. Generic, World-only ABI functions
+//! function table ([`FerronApi`]), and exposes the lifecycle entry points
+//! (`Create`/`Enable`/`Start`/`Update`/`Disable`, plus the global
+//! [`destroy_handle`]) the engine drives. Generic, World-only ABI functions
 //! live here; component-specific ones are supplied by the engine via
 //! `FerronApi { get_transform, set_transform, ..default_api() }`.
 
@@ -163,25 +164,34 @@ pub fn with_world<R>(default: R, op: impl FnOnce(&mut World) -> R) -> R {
     op(unsafe { &mut *ptr })
 }
 
-/// Signature of the C# `Ferron.Bootstrap.Free(nint)` entry point; `extern
+/// Signature of the C# `Ferron.Behaviours.Destroy(nint)` entry point; `extern
 /// "system"` matches the convention netcorehost hands back.
-type FreeFn = extern "system" fn(u64);
+type DestroyFn = extern "system" fn(u64);
 
-static FREE_HANDLE: AtomicUsize = AtomicUsize::new(0);
+static DESTROY_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
-/// Install the managed handle-free callback (called once by [`ScriptHost::boot`]).
-pub fn set_free_handle(free: FreeFn) {
-    FREE_HANDLE.store(free as usize, Ordering::Release);
+/// Install the managed teardown callback (called once by [`ScriptHost::boot`]).
+pub fn set_destroy_handle(destroy: DestroyFn) {
+    DESTROY_HANDLE.store(destroy as usize, Ordering::Release);
 }
 
-/// Release the managed `GCHandle` behind `handle`. A no-op before the host is
-/// booted, so it's safe to call unconditionally from `ScriptComponent::drop`.
-pub fn free_handle(handle: u64) {
-    let ptr = FREE_HANDLE.load(Ordering::Acquire);
+/// Tear down the behaviour behind `handle`: the managed side fires
+/// OnDisable (if still active) and OnDestroy, then frees the `GCHandle` — in
+/// that order, enforced in one place (C# `Behaviours.Destroy`). A no-op before
+/// the host is booted, so it's safe to call unconditionally from
+/// `ScriptComponent::drop`.
+///
+/// This usually runs from `Drop`, *outside* a dispatch window: `ACTIVE_WORLD`
+/// is null, so any engine API the callbacks touch returns defaults instead of
+/// aliasing whatever `&mut World` triggered the despawn. Safe, but it means
+/// OnDestroy cannot usefully read the world — document that as a script-facing
+/// limitation (Unity has an equivalent one).
+pub fn destroy_handle(handle: u64) {
+    let ptr = DESTROY_HANDLE.load(Ordering::Acquire);
     if ptr != 0 {
-        // SAFETY: only ever set by `set_free_handle` from a valid C# `FreeFn`.
-        let free: FreeFn = unsafe { std::mem::transmute::<usize, FreeFn>(ptr) };
-        free(handle);
+        // SAFETY: only ever set by `set_destroy_handle` from a valid C# `DestroyFn`.
+        let destroy: DestroyFn = unsafe { std::mem::transmute::<usize, DestroyFn>(ptr) };
+        destroy(handle);
     }
 }
 
@@ -218,6 +228,8 @@ pub struct ScriptHost {
     create_fn: extern "system" fn(CEntity, *const c_char) -> u64,
     start_fn: extern "system" fn(u64),
     update_fn: extern "system" fn(u64, f32),
+    enable_fn: extern "system" fn(u64),
+    disable_fn: extern "system" fn(u64),
 }
 
 impl ScriptHost {
@@ -241,7 +253,7 @@ impl ScriptHost {
 
         // Deref each `ManagedFunction` to its raw `extern "system"` fn pointer.
         // The loader is scoped so its borrow of `context` ends before the move.
-        let (init, create_fn, start_fn, update_fn, free) = {
+        let (init, create_fn, start_fn, update_fn, enable_fn, disable_fn, destroy) = {
             let loader = context.get_delegate_loader_for_assembly(pdcstr!("Ferron.dll"))?;
             (
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const FerronApi) -> i32>(
@@ -260,9 +272,20 @@ impl ScriptHost {
                     pdcstr!("Ferron.Behaviours, Ferron"),
                     pdcstr!("Update"),
                 )?,
-                *loader.get_function_with_unmanaged_callers_only::<FreeFn>(
-                    pdcstr!("Ferron.Bootstrap, Ferron"),
-                    pdcstr!("Free"),
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64)>(
+                    pdcstr!("Ferron.Behaviours, Ferron"),
+                    pdcstr!("Enable"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64)>(
+                    pdcstr!("Ferron.Behaviours, Ferron"),
+                    pdcstr!("Disable"),
+                )?,
+                // Teardown is a process-wide global, not a `ScriptHost` method:
+                // it must stay reachable from `ScriptComponent::drop`, which
+                // has no `&Scripting` in scope.
+                *loader.get_function_with_unmanaged_callers_only::<DestroyFn>(
+                    pdcstr!("Ferron.Behaviours, Ferron"),
+                    pdcstr!("Destroy"),
                 )?,
             )
         };
@@ -271,13 +294,15 @@ impl ScriptHost {
         if status != 0 {
             return Err(format!("Ferron.Bootstrap.Init returned {status}").into());
         }
-        set_free_handle(free);
+        set_destroy_handle(destroy);
 
         Ok(Self {
             _context: context,
             create_fn,
             start_fn,
             update_fn,
+            enable_fn,
+            disable_fn,
         })
     }
 
@@ -293,5 +318,13 @@ impl ScriptHost {
 
     pub fn update(&self, handle: u64, delta_time: f32) {
         (self.update_fn)(handle, delta_time)
+    }
+
+    pub fn enable(&self, handle: u64) {
+        (self.enable_fn)(handle)
+    }
+
+    pub fn disable(&self, handle: u64) {
+        (self.disable_fn)(handle)
     }
 }

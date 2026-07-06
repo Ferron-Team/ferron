@@ -2,6 +2,20 @@ using System.Runtime.InteropServices;
 
 namespace Ferron;
 
+/// Lifecycle of a Behaviour, in dispatch order:
+///
+///   1. ctor + Entity assignment   — `Create`, when the engine attaches the script
+///   2. OnEnable                   — first activation, and every re-activation
+///   3. OnStart                    — once, on the first tick the behaviour is active
+///   4. OnUpdate                   — every tick while active
+///   5. OnDisable                  — every deactivation; also fired by `Destroy`
+///                                   if the behaviour is still active
+///   6. OnDestroy                  — once, just before the GCHandle is freed
+///   7. GCHandle.Free              — last step of `Destroy`; the object is
+///                                   unreachable from Rust after this
+///
+/// Steps 2–5 can cycle (enable/disable). `Destroy` is the only path that frees
+/// the handle, so OnDestroy always precedes the free by construction.
 public static unsafe class Behaviours
 {
     [UnmanagedCallersOnly]
@@ -31,6 +45,42 @@ public static unsafe class Behaviours
     {
         if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
             behaviour.OnUpdate(deltaTime);
+    }
+
+    [UnmanagedCallersOnly]
+    public static void Enable(nint handle)
+    {
+        // TODO: resolve the behaviour (same pattern as Start), then:
+        //   - decide the ordering of `Active = true` vs `OnEnable()` — which
+        //     state should OnEnable observe if it reads its own Active flag?
+        //   - should a redundant Enable (already active) re-fire OnEnable?
+    }
+
+    [UnmanagedCallersOnly]
+    public static void Disable(nint handle)
+    {
+        // TODO: mirror of Enable — set Active and call OnDisable, with the
+        // same two ordering/idempotency questions.
+    }
+
+    /// Tears the behaviour down and frees its GCHandle. This is the single
+    /// managed release point: Rust's `ScriptComponent::drop` lands here.
+    [UnmanagedCallersOnly]
+    public static void Destroy(nint handle)
+    {
+        // TODO:
+        //   1. resolve the behaviour; if the handle is 0, bail
+        //   2. if still Active, fire the OnDisable step (despawn while enabled
+        //      owes a disable — see the lifecycle comment above)
+        //   3. fire OnDestroy
+        //   4. free the GCHandle — after this the object is collectible.
+        //      NOTE: you cannot call Bootstrap.Free from here;
+        //      [UnmanagedCallersOnly] methods are uncallable from managed
+        //      code. Free the handle directly.
+        //
+        // Consider: what should happen if OnDisable/OnDestroy throws? An
+        // exception escaping an [UnmanagedCallersOnly] method aborts the
+        // process — and skipping step 4 leaks the handle.
     }
 
     static Type? ResolveType(string name)

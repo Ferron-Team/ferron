@@ -339,28 +339,61 @@ impl Scripting {
                 ScriptComponent {
                     handle,
                     started: false,
+                    // Desired-on from birth; `active` stays false until the
+                    // first tick actually dispatches OnEnable.
+                    enabled: true,
+                    active: false,
                 },
             );
+        }
+    }
+
+    /// Request an activation change; the transition (OnEnable/OnDisable) is
+    /// dispatched by the next `tick`, not here.
+    pub fn set_enabled(&self, world: &mut World, entity: Entity, enabled: bool) {
+        if let Some(mut script) = world.get_mut::<ScriptComponent>(entity) {
+            script.enabled = enabled;
         }
     }
 
     /// Tick every script. Collect handles first, drop the world borrow, then
     /// dispatch — so the ABI's `&mut World` reconstruction never aliases.
     pub fn tick(&self, world: &mut World, delta_time: f32) {
-        let mut pending: Vec<(Entity, u64, bool)> = Vec::new();
-        world
-            .query::<&ScriptComponent>()
-            .for_each(|entity, script| pending.push((entity, script.handle, script.started)));
+        struct Pending {
+            entity: Entity,
+            handle: u64,
+            started: bool,
+            enabled: bool,
+            active: bool,
+        }
+
+        let mut pending: Vec<Pending> = Vec::new();
+        world.query::<&ScriptComponent>().for_each(|entity, script| {
+            pending.push(Pending {
+                entity,
+                handle: script.handle,
+                started: script.started,
+                enabled: script.enabled,
+                active: script.active,
+            })
+        });
         if pending.is_empty() {
             return;
         }
 
         ferron_script::with_active_world(world, || {
-            for &(_, handle, started) in &pending {
-                if !started {
-                    self.host.start(handle);
+            for script in &pending {
+                if script.enabled && !script.active {
+                    self.host.enable(script.handle);
+                    if !script.started {
+                        self.host.start(script.handle);
+                    }
+                } else if !script.enabled && script.active {
+                    self.host.disable(script.handle);
+                    continue // Skip tick update as the script is disabled
                 }
-                self.host.update(handle, delta_time);
+
+                self.host.update(script.handle, delta_time);
             }
         });
 
@@ -368,12 +401,13 @@ impl Scripting {
         // has run — so this frame's extraction already sees new renderables.
         apply_commands(world);
 
-        for (entity, _, started) in pending {
-            if !started {
-                if let Some(mut script) = world.get_mut::<ScriptComponent>(entity) {
-                    script.started = true;
-                }
-            }
+        // TODO: write back what actually got dispatched: `active` ← the state
+        // the script was left in, `started` ← whether OnStart has ever fired.
+        // Mirror of the collection loop above; `world.get_mut::<ScriptComponent>`
+        // per entity, guarded — a script may have despawned itself via
+        // apply_commands, so the component can be gone by now.
+        for script in pending {
+            let _ = script;
         }
     }
 }
