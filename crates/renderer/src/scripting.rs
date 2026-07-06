@@ -115,25 +115,23 @@ extern "C" fn cursor_pos(x: *mut f32, y: *mut f32) {
 // window, or before the resource exists, they report zero.
 
 fn with_time<R: Default>(query: impl FnOnce(&Time) -> R) -> R {
-    // TODO: ferron_script::with_world + world.get_resource::<Time>(),
-    //       defaulting when no world/resource is available (see `with_input`)
-    let _ = query;
-    todo!()
+    ferron_script::with_world(R::default(), |world| {
+        world
+            .get_resource::<Time>()
+            .map_or_else(R::default, |time| query(&time))
+    })
 }
 
 extern "C" fn time_delta() -> f32 {
-    // TODO: with_time(|time| time.delta_time())
-    todo!()
+    with_time(|time| time.delta_time())
 }
 
 extern "C" fn time_total() -> f32 {
-    // TODO: with_time(|time| time.elapsed_time())
-    todo!()
+    with_time(|time| time.elapsed_time())
 }
 
 extern "C" fn time_frame_count() -> u64 {
-    // TODO: with_time(|time| time.frame_count())
-    todo!()
+    with_time(|time| time.frame_count())
 }
 
 // --- deferred structural changes ---------------------------------------------

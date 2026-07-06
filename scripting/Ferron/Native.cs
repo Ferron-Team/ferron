@@ -77,23 +77,11 @@ public static unsafe class Native
 
     public static bool Despawn(Entity entity) => _api.Despawn(entity) != 0;
 
-    public static float TimeDelta()
-    {
-        // TODO: call through _api.TimeDelta
-        return 0f;
-    }
+    public static float TimeDelta() => _api.TimeDelta();
 
-    public static float TimeTotal()
-    {
-        // TODO: call through _api.TimeTotal
-        return 0f;
-    }
+    public static float TimeTotal() => _api.TimeTotal();
 
-    public static ulong TimeFrameCount()
-    {
-        // TODO: call through _api.TimeFrameCount
-        return 0;
-    }
+    public static ulong TimeFrameCount() => _api.TimeFrameCount();
 
     private static byte[] NulTerminated(string value)
     {
