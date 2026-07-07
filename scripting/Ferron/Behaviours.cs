@@ -50,17 +50,27 @@ public static unsafe class Behaviours
     [UnmanagedCallersOnly]
     public static void Enable(nint handle)
     {
-        // TODO: resolve the behaviour (same pattern as Start), then:
-        //   - decide the ordering of `Active = true` vs `OnEnable()` — which
-        //     state should OnEnable observe if it reads its own Active flag?
-        //   - should a redundant Enable (already active) re-fire OnEnable?
+        if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
+        {
+            if (!behaviour.Active)
+            {
+                 behaviour.Active = true;
+                 behaviour.OnEnable();
+            } 
+        }
     }
 
     [UnmanagedCallersOnly]
     public static void Disable(nint handle)
     {
-        // TODO: mirror of Enable — set Active and call OnDisable, with the
-        // same two ordering/idempotency questions.
+        if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
+        {
+            if (behaviour.Active)
+            {
+                behaviour.Active = false;
+                behaviour.OnDisable();
+            }
+        }       
     }
 
     /// Tears the behaviour down and frees its GCHandle. This is the single
@@ -68,19 +78,17 @@ public static unsafe class Behaviours
     [UnmanagedCallersOnly]
     public static void Destroy(nint handle)
     {
-        // TODO:
-        //   1. resolve the behaviour; if the handle is 0, bail
-        //   2. if still Active, fire the OnDisable step (despawn while enabled
-        //      owes a disable — see the lifecycle comment above)
-        //   3. fire OnDestroy
-        //   4. free the GCHandle — after this the object is collectible.
-        //      NOTE: you cannot call Bootstrap.Free from here;
-        //      [UnmanagedCallersOnly] methods are uncallable from managed
-        //      code. Free the handle directly.
-        //
-        // Consider: what should happen if OnDisable/OnDestroy throws? An
-        // exception escaping an [UnmanagedCallersOnly] method aborts the
-        // process — and skipping step 4 leaks the handle.
+        if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
+        {
+            if (behaviour.Active)
+            {
+                behaviour.Active = false;
+                behaviour.OnDisable();
+            }
+            
+            behaviour.OnDestroy();
+            GCHandle.FromIntPtr(handle).Free();
+        }
     }
 
     static Type? ResolveType(string name)

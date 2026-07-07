@@ -407,7 +407,9 @@ impl Scripting {
         // per entity, guarded — a script may have despawned itself via
         // apply_commands, so the component can be gone by now.
         for script in pending {
-            let _ = script;
+            if let Some(mut script) = world.get_mut::<ScriptComponent>(entity) {
+                //
+            }
         }
     }
 }
