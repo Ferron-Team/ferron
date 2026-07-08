@@ -8,6 +8,8 @@ use ferron_ecs::{Entity, World};
 
 use super::{color_row, vec3_row};
 use crate::editor::state::EditorState;
+#[cfg(feature = "scripting")]
+use crate::scene::ScriptComponent;
 use crate::scene::{Assets, Light, LocalTransform, MaterialHandle, MeshHandle, Name};
 
 pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
@@ -32,6 +34,8 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
             transform_section(ui, world, entity);
             mesh_material_section(ui, world, entity);
             light_section(ui, world, entity);
+            #[cfg(feature = "scripting")]
+            script_section(ui, world, entity);
         });
 }
 
@@ -148,6 +152,25 @@ fn name_of<H: Copy + PartialEq>(options: &[(String, H)], handle: Option<H>) -> S
         .and_then(|h| options.iter().find(|(_, opt)| *opt == h))
         .map(|(name, _)| name.clone())
         .unwrap_or_else(|| "—".to_owned())
+}
+
+#[cfg(feature = "scripting")]
+fn script_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
+    let Some(mut script) = world.get_mut::<ScriptComponent>(entity) else {
+        return;
+    };
+    egui::CollapsingHeader::new("Script")
+        .default_open(true)
+        .show(ui, |ui| {
+            // Only the desired state is written here; the script tick sees the
+            // change next frame and dispatches OnEnable/OnDisable itself.
+            ui.checkbox(&mut script.enabled, "Enabled");
+            ui.weak(match (script.active, script.started) {
+                (true, _) => "active",
+                (false, true) => "inactive",
+                (false, false) => "not started",
+            });
+        });
 }
 
 fn light_section(ui: &mut egui::Ui, world: &World, entity: Entity) {

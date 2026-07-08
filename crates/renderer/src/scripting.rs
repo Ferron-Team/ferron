@@ -393,7 +393,7 @@ impl Scripting {
                 } else if !script.enabled && script.active {
                     self.host.disable(script.handle);
                     script.active = false;
-                    continue // Skip tick update
+                    continue; // Skip tick update
                 }
 
                 self.host.update(script.handle, delta_time);
