@@ -54,9 +54,9 @@ public static unsafe class Behaviours
         {
             if (!behaviour.Active)
             {
-                 behaviour.Active = true;
-                 behaviour.OnEnable();
-            } 
+                behaviour.Active = true;
+                behaviour.OnEnable();
+            }
         }
     }
 
@@ -70,7 +70,7 @@ public static unsafe class Behaviours
                 behaviour.Active = false;
                 behaviour.OnDisable();
             }
-        }       
+        }
     }
 
     /// Tears the behaviour down and frees its GCHandle. This is the single
@@ -85,7 +85,7 @@ public static unsafe class Behaviours
                 behaviour.Active = false;
                 behaviour.OnDisable();
             }
-            
+
             behaviour.OnDestroy();
             GCHandle.FromIntPtr(handle).Free();
         }

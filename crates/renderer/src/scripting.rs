@@ -382,15 +382,18 @@ impl Scripting {
         }
 
         ferron_script::with_active_world(world, || {
-            for script in &pending {
+            for script in &mut pending {
                 if script.enabled && !script.active {
                     self.host.enable(script.handle);
+                    script.active = true;
                     if !script.started {
                         self.host.start(script.handle);
+                        script.started = true;
                     }
                 } else if !script.enabled && script.active {
                     self.host.disable(script.handle);
-                    continue // Skip tick update as the script is disabled
+                    script.active = false;
+                    continue // Skip tick update
                 }
 
                 self.host.update(script.handle, delta_time);
@@ -401,14 +404,10 @@ impl Scripting {
         // has run — so this frame's extraction already sees new renderables.
         apply_commands(world);
 
-        // TODO: write back what actually got dispatched: `active` ← the state
-        // the script was left in, `started` ← whether OnStart has ever fired.
-        // Mirror of the collection loop above; `world.get_mut::<ScriptComponent>`
-        // per entity, guarded — a script may have despawned itself via
-        // apply_commands, so the component can be gone by now.
-        for script in pending {
-            if let Some(mut script) = world.get_mut::<ScriptComponent>(entity) {
-                //
+        for script in &pending {
+            if let Some(mut component) = world.get_mut::<ScriptComponent>(script.entity) {
+                component.active = script.active;
+                component.started = script.started;
             }
         }
     }
