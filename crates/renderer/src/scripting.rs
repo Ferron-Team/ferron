@@ -396,7 +396,9 @@ impl Scripting {
                     continue; // Skip tick update
                 }
 
-                self.host.update(script.handle, delta_time);
+                if script.active {
+                    self.host.update(script.handle, delta_time);
+                }
             }
         });
 
