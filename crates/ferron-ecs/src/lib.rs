@@ -578,11 +578,31 @@ impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
         }
         matched
     }
+
+    /// The first matching entity (in storage order) for which `pred` returns true.
+    pub fn find<F>(&self, mut pred: F) -> Option<Entity>
+    where
+        F: FnMut(Entity, Q::Item<'_>) -> bool,
+    {
+        let mut fetch = Q::init(self.world)?;
+        let total = Q::len(&fetch);
+        for i in 0..total {
+            let entity = Q::entity_at(&fetch, i);
+            if let Some(item) = Q::get(&mut fetch, entity) {
+                if pred(entity, item) {
+                    return Some(entity);
+                }
+            }
+        }
+        None
+    }
+
+
 }
 
 //
 // Tests
-//
+//i
 
 #[cfg(test)]
 mod tests {
