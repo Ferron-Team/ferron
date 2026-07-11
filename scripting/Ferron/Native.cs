@@ -21,6 +21,11 @@ public unsafe struct FerronApi
     public delegate* unmanaged<float> TimeDelta;
     public delegate* unmanaged<float> TimeTotal;
     public delegate* unmanaged<ulong> TimeFrameCount;
+    public delegate* unmanaged<byte*, Entity*, byte> FindByTag;
+    public delegate* unmanaged<byte*, Entity*, int, int> FindAllByTag;
+    public delegate* unmanaged<Entity, uint, byte> HasComponent;
+    public delegate* unmanaged<Entity, byte*, int, int> GetTag;
+    public delegate* unmanaged<Entity, byte*, byte> SetTag;
 }
 
 public static unsafe class Native
@@ -82,6 +87,58 @@ public static unsafe class Native
     public static float TimeTotal() => _api.TimeTotal();
 
     public static ulong TimeFrameCount() => _api.TimeFrameCount();
+
+    public static Entity? FindByTag(string tag)
+    {
+        var tagBytes = NulTerminated(tag);
+        Entity entity = default;
+        fixed (byte* tagPtr = tagBytes)
+            return _api.FindByTag(tagPtr, &entity) != 0 ? entity : null;
+    }
+
+    public static Entity[] FindAllByTag(string tag)
+    {
+        var tagBytes = NulTerminated(tag);
+        var buffer = new Entity[16];
+        while (true)
+        {
+            int total;
+            fixed (byte* tagPtr = tagBytes)
+            fixed (Entity* outPtr = buffer)
+                total = _api.FindAllByTag(tagPtr, outPtr, buffer.Length);
+            if (total <= buffer.Length)
+                return buffer[..total];
+            // The world can't change between the two calls (scripts are the
+            // only mutator inside a tick), so one retry always suffices.
+            buffer = new Entity[total];
+        }
+    }
+
+    public static bool HasComponent(Entity entity, uint kind) =>
+        _api.HasComponent(entity, kind) != 0;
+
+    public static string? GetTag(Entity entity)
+    {
+        Span<byte> buffer = stackalloc byte[64];
+        int length;
+        fixed (byte* p = buffer)
+            length = _api.GetTag(entity, p, buffer.Length);
+        if (length < 0)
+            return null;
+        if (length <= buffer.Length)
+            return Encoding.UTF8.GetString(buffer[..length]);
+        var bytes = new byte[length];
+        fixed (byte* p = bytes)
+            _api.GetTag(entity, p, bytes.Length);
+        return Encoding.UTF8.GetString(bytes);
+    }
+
+    public static bool SetTag(Entity entity, string tag)
+    {
+        var tagBytes = NulTerminated(tag);
+        fixed (byte* tagPtr = tagBytes)
+            return _api.SetTag(entity, tagPtr) != 0;
+    }
 
     private static byte[] NulTerminated(string value)
     {

@@ -20,4 +20,18 @@ public static class World
     /// Queue the entity for despawn at the end of this tick. Returns false if
     /// the handle was already stale.
     public static bool Despawn(Entity entity) => Native.Despawn(entity);
+
+    /// First entity whose Tag equals `tag`, or null if none. "First" is the
+    /// engine's storage order — stable between structural changes but
+    /// otherwise arbitrary, so don't rely on it when several entities share a
+    /// tag; use FindAllByTag instead.
+    public static Entity? FindByTag(string tag) => Native.FindByTag(tag);
+
+    /// Every entity whose Tag equals `tag`; empty array if none.
+    public static Entity[] FindAllByTag(string tag) => Native.FindAllByTag(tag);
+
+    /// Queue a tag assignment (set or replace) for `entity`. Applied after
+    /// this tick like other structural changes, so a FindByTag in the same
+    /// tick won't see it yet. Returns false if the handle was stale.
+    public static bool SetTag(Entity entity, string tag) => Native.SetTag(entity, tag);
 }
