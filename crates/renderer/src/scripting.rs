@@ -151,14 +151,14 @@ extern "C" fn find_by_tag(tag: *const c_char, out: *mut CEntity) -> bool {
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
     let tag = unsafe { CStr::from_ptr(tag) }.to_string_lossy();
     ferron_script::with_world(false, |world| {
-        // TODO: query::<&Tag>() for the first entity whose tag matches `tag`,
-        // write its CEntity through `out` (SAFETY to state: C# passed a valid,
-        // writable slot), and return true; false if nothing matched. "First"
-        // is dense-storage order — stable between structural changes, so the
-        // C# doc comment warns against relying on it when tags are shared.
-        // `for_each` has no early exit: either track an Option in the closure,
-        // or add a `find`-style method to ferron-ecs's QueryRunner (nicer).
-        todo!("find first entity with a matching Tag")
+        let found = world.query::<&Tag>().find(|_, t| t.as_str() == tag.as_ref());
+
+        match found {
+            // SAFETY: `out` was null-checked above; C# pass a pointer to a
+            // single stack allocated Entity slot (see Native.FindByTag)
+            Some(e) => unsafe { *out = CEntity { index: e.index, generation: e.generation }; }
+            None => return false,
+        }
     })
 }
 
@@ -169,16 +169,23 @@ extern "C" fn find_all_by_tag(tag: *const c_char, out: *mut CEntity, capacity: i
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
     let tag = unsafe { CStr::from_ptr(tag) }.to_string_lossy();
     ferron_script::with_world(0, |world| {
-        // TODO:
-        // 1. Collect every matching entity into a Vec<CEntity> via
-        //    query::<&Tag>().for_each — collecting first means the storage Ref
-        //    is dropped before anything is written to C#-owned memory.
-        // 2. Copy the first min(matches.len(), capacity as usize) entries into
-        //    `out`. SAFETY to uphold: C# guarantees `out` points at `capacity`
-        //    writable CEntity slots (see Native.FindAllByTag).
-        // 3. Return the TOTAL match count even when it exceeds `capacity` —
-        //    snprintf semantics; C# resizes its buffer and retries.
-        todo!("collect matches, copy up to capacity, return total count")
+        let mut matches: Vec<CEntity> = Vec::new();
+        world.query::<&Tag>().for_each(|e, t| {
+            if t.as_str() == tag.as_ref() {
+                matches.push(Centity { index: e.index, generation: e.generation });
+            }
+        });
+
+        if tag.is_null() || (out.is_null() && capacity > 0) { return 0; }
+
+        let n = matches.len().min(capacity.max(0) as usize);
+        if n > 0 {
+            // SAFETY: C# guarantees `out` points at `capacity` writable CEntity slots
+            // (pinned managed Entity[] in Native.FindAllByTag); src is our own Vec,
+            // so the ranges cannot overlap.
+            unsafe { std::ptr::copy_nonoverlapping(matches.as_ptr(), out, n) };
+        }
+        matches.len() as i32
     })
 }
 

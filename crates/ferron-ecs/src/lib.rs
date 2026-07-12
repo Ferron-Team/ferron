@@ -596,8 +596,6 @@ impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
         }
         None
     }
-
-
 }
 
 //
