@@ -156,8 +156,8 @@ extern "C" fn find_by_tag(tag: *const c_char, out: *mut CEntity) -> bool {
         match found {
             // SAFETY: `out` was null-checked above; C# pass a pointer to a
             // single stack allocated Entity slot (see Native.FindByTag)
-            Some(e) => unsafe { *out = CEntity { index: e.index, generation: e.generation }; }
-            None => return false,
+            Some(e) => { unsafe { *out = CEntity { index: e.index, generation: e.generation } } true }
+            None => return false
         }
     })
 }
@@ -172,11 +172,9 @@ extern "C" fn find_all_by_tag(tag: *const c_char, out: *mut CEntity, capacity: i
         let mut matches: Vec<CEntity> = Vec::new();
         world.query::<&Tag>().for_each(|e, t| {
             if t.as_str() == tag.as_ref() {
-                matches.push(Centity { index: e.index, generation: e.generation });
+                matches.push(CEntity { index: e.index, generation: e.generation });
             }
         });
-
-        if tag.is_null() || (out.is_null() && capacity > 0) { return 0; }
 
         let n = matches.len().min(capacity.max(0) as usize);
         if n > 0 {
