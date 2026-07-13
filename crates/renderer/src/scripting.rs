@@ -154,10 +154,13 @@ extern "C" fn find_by_tag(tag: *const c_char, out: *mut CEntity) -> bool {
         let found = world.query::<&Tag>().find(|_, t| t.as_str() == tag.as_ref());
 
         match found {
-            // SAFETY: `out` was null-checked above; C# pass a pointer to a
-            // single stack allocated Entity slot (see Native.FindByTag)
-            Some(e) => { unsafe { *out = CEntity { index: e.index, generation: e.generation } } true }
-            None => return false
+            Some(e) => {
+                // SAFETY: `out` was null-checked above; C# passes a pointer to
+                // a single stack-allocated Entity slot (see Native.FindByTag).
+                unsafe { *out = CEntity { index: e.index, generation: e.generation } }
+                true
+            }
+            None => false,
         }
     })
 }
@@ -196,7 +199,7 @@ extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
 
         match kind {
             0 => world.has::<LocalTransform>(entity),
-            1 => world.has::<Transform>(entity),
+            1 => world.has::<Tag>(entity),
             _ => false,
         }
     })
@@ -228,7 +231,7 @@ extern "C" fn get_tag(entity: CEntity, out: *mut c_char, capacity: i32) -> i32 {
                 }
                 bytes.len() as i32
             }
-            None => return -1,
+            None => -1,
         }
     })
 }
