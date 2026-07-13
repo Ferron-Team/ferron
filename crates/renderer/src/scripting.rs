@@ -215,11 +215,21 @@ extern "C" fn get_tag(entity: CEntity, out: *mut c_char, capacity: i32) -> i32 {
             index: entity.index,
             generation: entity.generation,
         };
-        // TODO: world.get::<Tag>(entity); if present, copy up to `capacity`
-        // bytes of its UTF-8 into `out` (SAFETY to uphold: C# guarantees
-        // `capacity` writable bytes) and return the full byte length; -1 when
-        // the component is absent or the handle is stale.
-        todo!("copy tag bytes into out, return full byte length")
+
+        match world.get::<Tag>(entity) {
+            Some(tag) => {
+                let bytes = tag.as_str().as_bytes();
+                let n = bytes.len().min(capacity.max(0) as usize);
+                if n > 0 {
+                    // SAFETY: C# guarantees `out` points at `capacity` writable bytes
+                    // (stackalloc'd or pinned in Native.GetTag); src is the tag's own
+                    // storage, so the ranges cannot overlap.
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, n) };
+                }
+                bytes.len() as i32
+            }
+            None => return -1,
+        }
     })
 }
 
