@@ -193,11 +193,12 @@ extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
             index: entity.index,
             generation: entity.generation,
         };
-        // TODO: match `kind` per the numbering above (0 =>
-        // world.has::<LocalTransform>(entity), 1 => world.has::<Tag>(entity)),
-        // returning false for unknown kinds — a newer C# assembly probing an
-        // older engine must degrade gracefully, not misbehave.
-        todo!("map kind to a world.has::<T>() check")
+
+        match kind {
+            0 => world.has::<LocalTransform>(entity),
+            1 => world.has::<Transform>(entity),
+            _ => false,
+        }
     })
 }
 
