@@ -15,8 +15,8 @@ use ferron_ecs::{Entity, World};
 use ferron_script::{CEntity, CTransform, FerronApi, ScriptHost};
 
 use crate::scene::{
-    Assets, InputState, LocalTransform, MaterialHandle, MeshHandle, Name, ScriptComponent, Time,
-    Transform,
+    Assets, InputState, LocalTransform, MaterialHandle, MeshHandle, Name, ScriptComponent, Tag,
+    Time, Transform,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -134,6 +134,127 @@ extern "C" fn time_frame_count() -> u64 {
     with_time(|time| time.frame_count())
 }
 
+// --- entity querying -----------------------------------------------------------
+// Read-only world inspection for scripts. These are leaf calls: any RefCell
+// borrow a query takes lives only inside the `with_world` closure and is
+// released before control returns to C#, so no storage borrow is ever held
+// across a dispatch. The find functions copy results into caller-owned memory
+// for the same reason — results outlive the query borrow, never vice versa.
+//
+// `kind` numbering is lock-step with C# `Ferron.ComponentKind` (same rule as
+// key codes: append, never renumber): 0 = Transform (LocalTransform), 1 = Tag.
+
+extern "C" fn find_by_tag(tag: *const c_char, out: *mut CEntity) -> bool {
+    if tag.is_null() || out.is_null() {
+        return false;
+    }
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    let tag = unsafe { CStr::from_ptr(tag) }.to_string_lossy();
+    ferron_script::with_world(false, |world| {
+        let found = world.query::<&Tag>().find(|_, t| t.as_str() == tag.as_ref());
+
+        match found {
+            Some(e) => {
+                // SAFETY: `out` was null-checked above; C# passes a pointer to
+                // a single stack-allocated Entity slot (see Native.FindByTag).
+                unsafe { *out = CEntity { index: e.index, generation: e.generation } }
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+extern "C" fn find_all_by_tag(tag: *const c_char, out: *mut CEntity, capacity: i32) -> i32 {
+    if tag.is_null() || (out.is_null() && capacity > 0) {
+        return 0;
+    }
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    let tag = unsafe { CStr::from_ptr(tag) }.to_string_lossy();
+    ferron_script::with_world(0, |world| {
+        let mut matches: Vec<CEntity> = Vec::new();
+        world.query::<&Tag>().for_each(|e, t| {
+            if t.as_str() == tag.as_ref() {
+                matches.push(CEntity { index: e.index, generation: e.generation });
+            }
+        });
+
+        let n = matches.len().min(capacity.max(0) as usize);
+        if n > 0 {
+            // SAFETY: C# guarantees `out` points at `capacity` writable CEntity slots
+            // (pinned managed Entity[] in Native.FindAllByTag); src is our own Vec,
+            // so the ranges cannot overlap.
+            unsafe { std::ptr::copy_nonoverlapping(matches.as_ptr(), out, n) };
+        }
+        matches.len() as i32
+    })
+}
+
+extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
+    ferron_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+
+        match kind {
+            0 => world.has::<LocalTransform>(entity),
+            1 => world.has::<Tag>(entity),
+            _ => false,
+        }
+    })
+}
+
+// String out-param protocol: returns the tag's UTF-8 byte length (no nul
+// terminator — the return value carries the size), or -1 if the entity has no
+// Tag. Writes min(len, capacity) bytes; C# retries with an exact-size buffer
+// when len > capacity.
+extern "C" fn get_tag(entity: CEntity, out: *mut c_char, capacity: i32) -> i32 {
+    if out.is_null() && capacity > 0 {
+        return -1;
+    }
+    ferron_script::with_world(-1, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+
+        match world.get::<Tag>(entity) {
+            Some(tag) => {
+                let bytes = tag.as_str().as_bytes();
+                let n = bytes.len().min(capacity.max(0) as usize);
+                if n > 0 {
+                    // SAFETY: C# guarantees `out` points at `capacity` writable bytes
+                    // (stackalloc'd or pinned in Native.GetTag); src is the tag's own
+                    // storage, so the ranges cannot overlap.
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, n) };
+                }
+                bytes.len() as i32
+            }
+            None => -1,
+        }
+    })
+}
+
+extern "C" fn set_tag(entity: CEntity, tag: *const c_char) -> bool {
+    if tag.is_null() {
+        return false;
+    }
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    let tag = unsafe { CStr::from_ptr(tag) }.to_string_lossy().into_owned();
+    ferron_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        if !world.is_alive(entity) {
+            return false;
+        }
+        COMMANDS.with(|commands| commands.borrow_mut().push(Command::SetTag { entity, tag }));
+        true
+    })
+}
+
 // --- deferred structural changes ---------------------------------------------
 // Structural edits requested from inside a script dispatch are queued and
 // applied by `apply_commands` once the dispatch window closes. Direct mutation
@@ -152,6 +273,9 @@ enum Command {
         transform: CTransform,
     },
     Despawn(Entity),
+    // Adding a component changes which entities queries match, so it defers
+    // like the other structural edits; a same-tick FindByTag won't see it.
+    SetTag { entity: Entity, tag: String },
 }
 
 thread_local! {
@@ -251,6 +375,11 @@ fn apply_commands(world: &mut World) {
             Command::Despawn(entity) => {
                 world.despawn(entity);
             }
+            Command::SetTag { entity, tag } => {
+                // `insert` is a stale-handle no-op, so a despawn queued earlier
+                // this tick wins — same rule as the other commands.
+                world.insert(entity, Tag::new(tag));
+            }
         }
     }
 }
@@ -269,6 +398,11 @@ fn build_api() -> FerronApi {
         time_delta,
         time_total,
         time_frame_count,
+        find_by_tag,
+        find_all_by_tag,
+        has_component,
+        get_tag,
+        set_tag,
         ..ferron_script::default_api()
     }
 }

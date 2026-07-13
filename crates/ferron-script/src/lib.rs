@@ -42,6 +42,18 @@ pub struct FerronApi {
     pub time_delta: extern "C" fn() -> f32,
     pub time_total: extern "C" fn() -> f32,
     pub time_frame_count: extern "C" fn() -> u64,
+    // Entity querying. Engine-side (the `Tag` component and the component-kind
+    // numbering live in the renderer). `find_all_by_tag` and `get_tag` write
+    // into caller-allocated buffers and return the *total* count/byte length —
+    // snprintf semantics, so C# can resize and retry when the buffer was too
+    // small. `has_component` takes the kind numbering shared with C#
+    // `Ferron.ComponentKind`. `set_tag` is a deferred structural change, like
+    // `despawn`.
+    pub find_by_tag: extern "C" fn(*const c_char, *mut CEntity) -> bool,
+    pub find_all_by_tag: extern "C" fn(*const c_char, *mut CEntity, i32) -> i32,
+    pub has_component: extern "C" fn(CEntity, u32) -> bool,
+    pub get_tag: extern "C" fn(CEntity, *mut c_char, i32) -> i32,
+    pub set_tag: extern "C" fn(CEntity, *const c_char) -> bool,
 }
 
 /// A table with the generic functions wired and the rest stubbed; the engine
@@ -63,7 +75,32 @@ pub fn default_api() -> FerronApi {
         time_delta: stub_time_seconds,
         time_total: stub_time_seconds,
         time_frame_count: stub_time_frame_count,
+        find_by_tag: stub_find_by_tag,
+        find_all_by_tag: stub_find_all_by_tag,
+        has_component: stub_has_component,
+        get_tag: stub_get_tag,
+        set_tag: stub_set_tag,
     }
+}
+
+extern "C" fn stub_find_by_tag(_tag: *const c_char, _out: *mut CEntity) -> bool {
+    false
+}
+
+extern "C" fn stub_find_all_by_tag(_tag: *const c_char, _out: *mut CEntity, _capacity: i32) -> i32 {
+    0
+}
+
+extern "C" fn stub_has_component(_entity: CEntity, _kind: u32) -> bool {
+    false
+}
+
+extern "C" fn stub_get_tag(_entity: CEntity, _out: *mut c_char, _capacity: i32) -> i32 {
+    -1
+}
+
+extern "C" fn stub_set_tag(_entity: CEntity, _tag: *const c_char) -> bool {
+    false
 }
 
 extern "C" fn stub_time_seconds() -> f32 {

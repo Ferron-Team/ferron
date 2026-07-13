@@ -578,11 +578,29 @@ impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
         }
         matched
     }
+
+    /// The first matching entity (in storage order) for which `pred` returns true.
+    pub fn find<F>(&self, mut pred: F) -> Option<Entity>
+    where
+        F: FnMut(Entity, Q::Item<'_>) -> bool,
+    {
+        let mut fetch = Q::init(self.world)?;
+        let total = Q::len(&fetch);
+        for i in 0..total {
+            let entity = Q::entity_at(&fetch, i);
+            if let Some(item) = Q::get(&mut fetch, entity) {
+                if pred(entity, item) {
+                    return Some(entity);
+                }
+            }
+        }
+        None
+    }
 }
 
 //
 // Tests
-//
+//i
 
 #[cfg(test)]
 mod tests {
@@ -669,6 +687,41 @@ mod tests {
             .query::<(&mut Position, &Velocity, &Frozen)>()
             .for_each(|e, (_pos, _vel, _frozen)| matched.push(e));
         assert_eq!(matched, vec![a]);
+    }
+
+    #[test]
+    fn find_first_match_in_storage_order() {
+        let mut world = World::new();
+        let a = world.spawn();
+        world.insert(a, Health(10));
+        let b = world.spawn();
+        world.insert(b, Health(3));
+        world.spawn(); // no components; never a candidate
+
+        // First match follows dense (insertion) order.
+        assert_eq!(world.query::<&Health>().find(|_, h| h.0 > 0), Some(a));
+        // The predicate can select a later entity.
+        assert_eq!(world.query::<&Health>().find(|_, h| h.0 < 5), Some(b));
+        // No matching entity, and no storage registered at all, both give None.
+        assert_eq!(world.query::<&Health>().find(|_, h| h.0 > 99), None);
+        assert_eq!(world.query::<&Position>().find(|_, _| true), None);
+    }
+
+    #[test]
+    fn find_stops_at_first_match() {
+        let mut world = World::new();
+        for hp in [1, 2, 3] {
+            let e = world.spawn();
+            world.insert(e, Health(hp));
+        }
+
+        let mut visited = 0;
+        let found = world.query::<&Health>().find(|_, _| {
+            visited += 1;
+            true
+        });
+        assert!(found.is_some());
+        assert_eq!(visited, 1);
     }
 
     #[test]
