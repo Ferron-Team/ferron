@@ -74,16 +74,18 @@ pub struct Aabb {
 impl Aabb {
     /// True when the boxes overlap (touching counts as overlapping).
     pub fn overlaps(&self, other: &Aabb) -> bool {
-        // TODO(owner): two AABBs overlap iff they overlap on *every* axis —
-        // a.min <= b.max && b.min <= a.max, per component. This is the single
-        // most load-bearing predicate in the whole system.
-        todo!("Aabb::overlaps")
+        if (self.min.cmple(other.max) & other.min.cmple(self.max)).all() == true {
+            return true
+        }
+        false
     }
 
     /// The smallest AABB containing both boxes (the BVH's node bound).
     pub fn union(&self, other: &Aabb) -> Aabb {
-        // TODO(owner): component-wise min of mins, max of maxes.
-        todo!("Aabb::union")
+        Aabb {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+        }
     }
 
     pub fn center(&self) -> Vec3 {
