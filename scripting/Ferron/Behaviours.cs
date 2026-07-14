@@ -111,6 +111,34 @@ public static unsafe class Behaviours
         }
     }
 
+    [UnmanagedCallersOnly]
+    public static void CollisionEnter(nint handle, Collision* collision)
+    {
+        try
+        {
+            if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
+                behaviour.OnCollisionEnter(*collision);
+        }
+        catch (Exception e)
+        {
+            Native.Log($"[script] exception during collision enter: {e}");
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static void CollisionExit(nint handle, Collision* collision)
+    {
+        try
+        {
+            if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
+                behaviour.OnCollisionExit(*collision);
+        }
+        catch (Exception e)
+        {
+            Native.Log($"[script] exception during collision exit: {e}");
+        }
+    }
+
     /// Tears the behaviour down and frees its GCHandle. This is the single
     /// managed release point: Rust's `ScriptComponent::drop` lands here.
     [UnmanagedCallersOnly]

@@ -6,6 +6,7 @@ public enum ComponentKind : uint
 {
     Transform = 0,
     Tag = 1,
+    Collider = 2,
 }
 
 internal static class ComponentKinds

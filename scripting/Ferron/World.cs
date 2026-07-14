@@ -34,4 +34,26 @@ public static class World
     /// this tick like other structural changes, so a FindByTag in the same
     /// tick won't see it yet. Returns false if the handle was stale.
     public static bool SetTag(Entity entity, string tag) => Native.SetTag(entity, tag);
+
+    /// Queue attaching a collision shape to `entity`; it starts participating
+    /// in collision detection next frame. Returns false if the handle was
+    /// stale.
+    public static bool AddCollider(Entity entity, Collider collider) => collider switch
+    {
+        BoxCollider box => Native.AddBoxCollider(entity, box.HalfExtents, box.IsTrigger),
+        SphereCollider sphere => Native.AddSphereCollider(entity, sphere.Radius, sphere.IsTrigger),
+        _ => throw new ArgumentException($"unsupported collider type {collider.GetType().Name}"),
+    };
+
+    /// Queue a material swap (names come from the same registry as
+    /// SpawnRenderable). Logs and returns false if the name is unknown or the
+    /// handle was stale.
+    public static bool SetMaterial(Entity entity, string material) =>
+        Native.SetMaterial(entity, material);
+
+    /// Queue attaching a Behaviour of type T to `entity`. The instance is
+    /// created when this tick's commands apply; OnEnable/OnStart fire on the
+    /// next tick. Returns false if the handle was stale.
+    public static bool AddScript<T>(Entity entity) where T : Behaviour, new() =>
+        Native.AddScript(entity, typeof(T).AssemblyQualifiedName!);
 }

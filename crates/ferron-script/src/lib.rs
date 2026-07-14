@@ -54,6 +54,14 @@ pub struct FerronApi {
     pub has_component: extern "C" fn(CEntity, u32) -> bool,
     pub get_tag: extern "C" fn(CEntity, *mut c_char, i32) -> i32,
     pub set_tag: extern "C" fn(CEntity, *const c_char) -> bool,
+    // Collision + composition. All four are deferred structural changes (like
+    // `set_tag`): they validate eagerly and apply after the dispatch window.
+    // Box half extents are passed as three floats to keep the signature
+    // blittable-trivial; `bool` is one byte on both sides (C# `byte`).
+    pub add_box_collider: extern "C" fn(CEntity, f32, f32, f32, bool) -> bool,
+    pub add_sphere_collider: extern "C" fn(CEntity, f32, bool) -> bool,
+    pub set_material: extern "C" fn(CEntity, *const c_char) -> bool,
+    pub add_script: extern "C" fn(CEntity, *const c_char) -> bool,
 }
 
 /// A table with the generic functions wired and the rest stubbed; the engine
@@ -80,7 +88,33 @@ pub fn default_api() -> FerronApi {
         has_component: stub_has_component,
         get_tag: stub_get_tag,
         set_tag: stub_set_tag,
+        add_box_collider: stub_add_box_collider,
+        add_sphere_collider: stub_add_sphere_collider,
+        set_material: stub_set_material,
+        add_script: stub_add_script,
     }
+}
+
+extern "C" fn stub_add_box_collider(
+    _entity: CEntity,
+    _hx: f32,
+    _hy: f32,
+    _hz: f32,
+    _is_trigger: bool,
+) -> bool {
+    false
+}
+
+extern "C" fn stub_add_sphere_collider(_entity: CEntity, _radius: f32, _is_trigger: bool) -> bool {
+    false
+}
+
+extern "C" fn stub_set_material(_entity: CEntity, _material: *const c_char) -> bool {
+    false
+}
+
+extern "C" fn stub_add_script(_entity: CEntity, _type_name: *const c_char) -> bool {
+    false
 }
 
 extern "C" fn stub_find_by_tag(_tag: *const c_char, _out: *mut CEntity) -> bool {
@@ -258,6 +292,17 @@ pub struct CTransform {
     pub scale: [f32; 3],
 }
 
+/// C ABI collision event payload, as seen by one participant: the *other*
+/// entity, the world-space contact point, and the contact normal pointing from
+/// the receiving entity toward `other`. Matches the C# `Ferron.Collision`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CCollision {
+    pub other: CEntity,
+    pub point: [f32; 3],
+    pub normal: [f32; 3],
+}
+
 /// The booted .NET runtime plus the managed lifecycle entry points. Holding the
 /// `HostfxrContext` keeps the runtime resident for the host's lifetime.
 pub struct ScriptHost {
@@ -267,6 +312,8 @@ pub struct ScriptHost {
     update_fn: extern "system" fn(u64, f32),
     enable_fn: extern "system" fn(u64),
     disable_fn: extern "system" fn(u64),
+    collision_enter_fn: extern "system" fn(u64, *const CCollision),
+    collision_exit_fn: extern "system" fn(u64, *const CCollision),
 }
 
 impl ScriptHost {
@@ -290,7 +337,11 @@ impl ScriptHost {
 
         // Deref each `ManagedFunction` to its raw `extern "system"` fn pointer.
         // The loader is scoped so its borrow of `context` ends before the move.
-        let (init, create_fn, start_fn, update_fn, enable_fn, disable_fn, destroy) = {
+        #[rustfmt::skip]
+        let (
+            init, create_fn, start_fn, update_fn, enable_fn, disable_fn,
+            collision_enter_fn, collision_exit_fn, destroy,
+        ) = {
             let loader = context.get_delegate_loader_for_assembly(pdcstr!("Ferron.dll"))?;
             (
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const FerronApi) -> i32>(
@@ -317,6 +368,14 @@ impl ScriptHost {
                     pdcstr!("Ferron.Behaviours, Ferron"),
                     pdcstr!("Disable"),
                 )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision)>(
+                    pdcstr!("Ferron.Behaviours, Ferron"),
+                    pdcstr!("CollisionEnter"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision)>(
+                    pdcstr!("Ferron.Behaviours, Ferron"),
+                    pdcstr!("CollisionExit"),
+                )?,
                 // Teardown is a process-wide global, not a `ScriptHost` method:
                 // it must stay reachable from `ScriptComponent::drop`, which
                 // has no `&Scripting` in scope.
@@ -340,6 +399,8 @@ impl ScriptHost {
             update_fn,
             enable_fn,
             disable_fn,
+            collision_enter_fn,
+            collision_exit_fn,
         })
     }
 
@@ -363,5 +424,13 @@ impl ScriptHost {
 
     pub fn disable(&self, handle: u64) {
         (self.disable_fn)(handle)
+    }
+
+    pub fn collision_enter(&self, handle: u64, collision: &CCollision) {
+        (self.collision_enter_fn)(handle, collision)
+    }
+
+    pub fn collision_exit(&self, handle: u64, collision: &CCollision) {
+        (self.collision_exit_fn)(handle, collision)
     }
 }

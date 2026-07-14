@@ -12,11 +12,12 @@ use std::time::SystemTime;
 use glam::{Quat, Vec3};
 
 use ferron_ecs::{Entity, World};
-use ferron_script::{CEntity, CTransform, FerronApi, ScriptHost};
+use ferron_script::{CCollision, CEntity, CTransform, FerronApi, ScriptHost};
 
+use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::{
-    Assets, InputState, LocalTransform, MaterialHandle, MeshHandle, Name, ScriptComponent, Tag,
-    Time, Transform,
+    Assets, Collider, ColliderShape, InputState, LocalTransform, MaterialHandle, MeshHandle, Name,
+    ScriptComponent, Tag, Time, Transform,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -200,6 +201,7 @@ extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
         match kind {
             0 => world.has::<LocalTransform>(entity),
             1 => world.has::<Tag>(entity),
+            2 => world.has::<Collider>(entity),
             _ => false,
         }
     })
@@ -255,6 +257,93 @@ extern "C" fn set_tag(entity: CEntity, tag: *const c_char) -> bool {
     })
 }
 
+fn queue_add_collider(entity: CEntity, collider: Collider) -> bool {
+    ferron_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        if !world.is_alive(entity) {
+            return false;
+        }
+        COMMANDS.with(|commands| {
+            commands.borrow_mut().push(Command::AddCollider { entity, collider })
+        });
+        true
+    })
+}
+
+extern "C" fn add_box_collider(entity: CEntity, hx: f32, hy: f32, hz: f32, is_trigger: bool) -> bool {
+    queue_add_collider(
+        entity,
+        Collider {
+            shape: ColliderShape::Box { half_extents: Vec3::new(hx, hy, hz) },
+            is_trigger,
+        },
+    )
+}
+
+extern "C" fn add_sphere_collider(entity: CEntity, radius: f32, is_trigger: bool) -> bool {
+    queue_add_collider(
+        entity,
+        Collider {
+            shape: ColliderShape::Sphere { radius },
+            is_trigger,
+        },
+    )
+}
+
+extern "C" fn set_material(entity: CEntity, material: *const c_char) -> bool {
+    if material.is_null() {
+        return false;
+    }
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    let name = unsafe { CStr::from_ptr(material) }.to_string_lossy();
+    ferron_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        if !world.is_alive(entity) {
+            return false;
+        }
+        // Resolve now so a bad name fails loudly at the call site (same rule
+        // as spawn_renderable).
+        let Some(material) = world
+            .get_resource::<Assets>()
+            .and_then(|assets| assets.material(&name))
+        else {
+            eprintln!("[script] set_material: unknown material {name:?}");
+            return false;
+        };
+        COMMANDS.with(|commands| {
+            commands.borrow_mut().push(Command::SetMaterial { entity, material })
+        });
+        true
+    })
+}
+
+extern "C" fn add_script(entity: CEntity, type_name: *const c_char) -> bool {
+    if type_name.is_null() {
+        return false;
+    }
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    let type_name = unsafe { CStr::from_ptr(type_name) }.to_string_lossy().into_owned();
+    ferron_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        if !world.is_alive(entity) {
+            return false;
+        }
+        COMMANDS.with(|commands| {
+            commands.borrow_mut().push(Command::AttachScript { entity, type_name })
+        });
+        true
+    })
+}
+
 // --- deferred structural changes ---------------------------------------------
 // Structural edits requested from inside a script dispatch are queued and
 // applied by `apply_commands` once the dispatch window closes. Direct mutation
@@ -276,6 +365,11 @@ enum Command {
     // Adding a component changes which entities queries match, so it defers
     // like the other structural edits; a same-tick FindByTag won't see it.
     SetTag { entity: Entity, tag: String },
+    AddCollider { entity: Entity, collider: Collider },
+    SetMaterial { entity: Entity, material: MaterialHandle },
+    // Applied by `Scripting::apply_commands` (needs the host to create the
+    // managed instance); the new behaviour gets OnEnable/OnStart next tick.
+    AttachScript { entity: Entity, type_name: String },
 }
 
 thread_local! {
@@ -347,43 +441,6 @@ extern "C" fn despawn(entity: CEntity) -> bool {
     })
 }
 
-/// Apply the structural changes scripts queued during a dispatch. Runs with no
-/// other world borrows held, so a despawn can drop a `ScriptComponent` (and
-/// free its GCHandle) safely.
-fn apply_commands(world: &mut World) {
-    let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
-    for command in commands {
-        match command {
-            Command::SpawnRenderable {
-                entity,
-                mesh,
-                material,
-                transform,
-            } => {
-                world.insert(entity, Name::new(format!("Scripted {}", entity.index)));
-                world.insert(
-                    entity,
-                    LocalTransform::from(Transform {
-                        translation: Vec3::from_array(transform.position),
-                        rotation: Quat::from_array(transform.rotation),
-                        scale: Vec3::from_array(transform.scale),
-                    }),
-                );
-                world.insert(entity, mesh);
-                world.insert(entity, material);
-            }
-            Command::Despawn(entity) => {
-                world.despawn(entity);
-            }
-            Command::SetTag { entity, tag } => {
-                // `insert` is a stale-handle no-op, so a despawn queued earlier
-                // this tick wins — same rule as the other commands.
-                world.insert(entity, Tag::new(tag));
-            }
-        }
-    }
-}
-
 fn build_api() -> FerronApi {
     FerronApi {
         get_transform,
@@ -403,6 +460,10 @@ fn build_api() -> FerronApi {
         has_component,
         get_tag,
         set_tag,
+        add_box_collider,
+        add_sphere_collider,
+        set_material,
+        add_script,
         ..ferron_script::default_api()
     }
 }
@@ -492,6 +553,10 @@ impl Scripting {
 
     /// Tick every script. Collect handles first, drop the world borrow, then
     /// dispatch — so the ABI's `&mut World` reconstruction never aliases.
+    ///
+    /// Dispatch order inside the window mirrors Unity: activation transitions
+    /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks,
+    /// then OnUpdate.
     pub fn tick(&self, world: &mut World, delta_time: f32) {
         struct Pending {
             entity: Entity,
@@ -515,6 +580,14 @@ impl Scripting {
             return;
         }
 
+        // Take this frame's collision events before the dispatch window opens
+        // — the resource borrow must not be held while C# can re-enter the
+        // world. Leftovers on an early return are cleared by the next
+        // `collision::run`.
+        let events: Vec<CollisionEvent> = world
+            .get_resource_mut::<CollisionState>()
+            .map_or_else(Vec::new, |mut state| std::mem::take(&mut state.events));
+
         ferron_script::with_active_world(world, || {
             for script in &mut pending {
                 if script.enabled && !script.active {
@@ -527,9 +600,38 @@ impl Scripting {
                 } else if !script.enabled && script.active {
                     self.host.disable(script.handle);
                     script.active = false;
-                    continue; // Skip tick update
                 }
+            }
 
+            // Route each event to both participants' scripts (if any). The
+            // stored normal points a → b, so b's callback sees it negated —
+            // "from me toward the other", both sides.
+            for event in &events {
+                for (target, other, flip) in [(event.a, event.b, false), (event.b, event.a, true)] {
+                    let Some(script) = pending
+                        .iter()
+                        .find(|script| script.entity == target && script.active)
+                    else {
+                        continue;
+                    };
+                    let normal = if flip { -event.normal } else { event.normal };
+                    let collision = CCollision {
+                        other: CEntity { index: other.index, generation: other.generation },
+                        point: event.point.to_array(),
+                        normal: normal.to_array(),
+                    };
+                    match event.kind {
+                        CollisionEventKind::Enter => {
+                            self.host.collision_enter(script.handle, &collision)
+                        }
+                        CollisionEventKind::Exit => {
+                            self.host.collision_exit(script.handle, &collision)
+                        }
+                    }
+                }
+            }
+
+            for script in &pending {
                 if script.active {
                     self.host.update(script.handle, delta_time);
                 }
@@ -538,12 +640,60 @@ impl Scripting {
 
         // Structural changes the scripts queued land now, after every script
         // has run — so this frame's extraction already sees new renderables.
-        apply_commands(world);
+        self.apply_commands(world);
 
         for script in &pending {
             if let Some(mut component) = world.get_mut::<ScriptComponent>(script.entity) {
                 component.active = script.active;
                 component.started = script.started;
+            }
+        }
+    }
+
+    /// Apply the structural changes scripts queued during a dispatch. Runs
+    /// with no other world borrows held, so a despawn can drop a
+    /// `ScriptComponent` (and free its GCHandle) safely.
+    fn apply_commands(&self, world: &mut World) {
+        let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
+        for command in commands {
+            match command {
+                Command::SpawnRenderable {
+                    entity,
+                    mesh,
+                    material,
+                    transform,
+                } => {
+                    world.insert(entity, Name::new(format!("Scripted {}", entity.index)));
+                    world.insert(
+                        entity,
+                        LocalTransform::from(Transform {
+                            translation: Vec3::from_array(transform.position),
+                            rotation: Quat::from_array(transform.rotation),
+                            scale: Vec3::from_array(transform.scale),
+                        }),
+                    );
+                    world.insert(entity, mesh);
+                    world.insert(entity, material);
+                }
+                Command::Despawn(entity) => {
+                    world.despawn(entity);
+                }
+                Command::SetTag { entity, tag } => {
+                    // `insert` is a stale-handle no-op, so a despawn queued earlier
+                    // this tick wins — same rule as the other commands.
+                    world.insert(entity, Tag::new(tag));
+                }
+                Command::AddCollider { entity, collider } => {
+                    world.insert(entity, collider);
+                }
+                Command::SetMaterial { entity, material } => {
+                    world.insert(entity, material);
+                }
+                Command::AttachScript { entity, type_name } => {
+                    // Creates the managed instance now; the enable/start pair
+                    // dispatches on the next tick, outside any window.
+                    self.attach(world, entity, &type_name);
+                }
             }
         }
     }
