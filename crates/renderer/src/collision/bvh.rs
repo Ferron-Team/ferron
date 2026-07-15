@@ -7,6 +7,7 @@
 //! bodies exist. The seam is `build` + `query_pairs`; a persistent tree can
 //! replace the internals later without touching `collision::run`.
 
+use glam::Vec3;
 use super::Aabb;
 
 /// Index of a node inside [`Bvh::nodes`].
@@ -36,34 +37,83 @@ pub struct Bvh {
 impl Bvh {
     /// Build a tree over `bounds`; leaf `body` values are indices into it.
     pub fn build(bounds: &[Aabb]) -> Self {
-        // TODO(owner): top-down median split.
-        //   1. Start with the full list of body indices [0, n).
-        //   2. For a range of one index, emit a Leaf node.
-        //   3. Otherwise: pick the axis where the range's AABB *centers* are
-        //      most spread out (max extent of a bound over all centers),
-        //      sort (or `select_nth_unstable_by`) the range by center on that
-        //      axis, split at the middle, recurse into both halves, then emit
-        //      an Internal node whose aabb is left.union(right).
-        //   A recursive helper `fn build_range(&mut nodes, bounds, indices:
-        //   &mut [u32]) -> NodeIndex` keeps this tidy. Don't chase SAH yet —
-        //   median split is within ~15% of it for game scenes and far simpler.
-        todo!("Bvh::build")
+        let mut indices: Vec<usize> = (0..bounds.len()).collect();
+        let mut nodes = Vec::new();
+
+        let root = if indices.is_empty() {
+            None
+        } else {
+            Some(Self::build_ranges(&mut nodes, bounds, &mut indices))
+        };
+
+        Bvh { nodes, root }
+    }
+
+    fn build_ranges(nodes: &mut Vec<Node>, bounds: &[Aabb], indices: &mut [usize]) -> NodeIndex {
+        if indices.len() == 1 {
+            let index = nodes.len() as u32;
+            nodes.push(Node { aabb: bounds[indices[0]], kind: NodeKind::Leaf { body: indices[0] as u32 } });
+            return index
+        }
+
+        let mut min_c = Vec3::splat(f32::INFINITY);
+        let mut max_c = Vec3::splat(f32::NEG_INFINITY);
+
+        for i in indices.iter() {
+            let center = bounds[*i].center();
+            min_c = min_c.min(center);
+            max_c = max_c.max(center);
+        }
+
+        let span = max_c - min_c;
+        let axis: usize = if span.x >= span.y && span.x >= span.z { 0 }
+        else if span.y >= span.z { 1 }
+        else { 2 };
+
+        let mid = indices.len() / 2;
+        indices.select_nth_unstable_by(mid, |&i, &j|
+            bounds[i as usize].center()[axis]
+                .total_cmp(&bounds[j as usize].center()[axis]));
+
+        let (left_half, right_half) = indices.split_at_mut(mid);
+        let left = Self::build_ranges(nodes, bounds, left_half);
+        let right = Self::build_ranges(nodes, bounds, right_half);
+
+        let aabb = nodes[left as usize].aabb.union(&nodes[right as usize].aabb);
+
+        let index = nodes.len() as u32;
+        nodes.push(Node {  aabb, kind: NodeKind::Internal { left, right } });
+        index
     }
 
     /// Append every overlapping body pair `(i, j)` with `i < j` to `out`.
     pub fn query_pairs(&self, out: &mut Vec<(u32, u32)>) {
-        // TODO(owner): two workable strategies —
-        //   a) Leaf-vs-tree (recommended first): for each leaf, walk the tree
-        //      from the root, descending only into nodes whose aabb overlaps
-        //      the leaf's; on reaching another leaf, emit the pair. Emit only
-        //      when `self_body < other_body` so each pair appears once.
-        //      O(n log n)-ish and easy to get right.
-        //   b) Tree-vs-tree self-traversal: recurse on node pairs starting
-        //      with (root, root); skip non-overlapping node pairs, handle the
-        //      (node, same-node) case by recursing into (L,L), (R,R), (L,R).
-        //      Faster (each subtree pair visited once) but the base cases are
-        //      fiddly — a good second pass once (a) works and is tested.
-        todo!("Bvh::query_pairs")
+        for node in &self.nodes {
+            let NodeKind::Leaf { body } = node.kind else { continue };
+
+            let mut stack: Vec<NodeIndex> = Vec::new();
+            if let Some(root) = self.root {
+                stack.push(root);
+            }
+
+            while let Some(i) = stack.pop() {
+                let other = &self.nodes[i as usize];
+                if !other.aabb.overlaps(&node.aabb) {
+                    continue;
+                }
+                match other.kind {
+                    NodeKind::Leaf { body: other_body } => {
+                        if body < other_body {
+                            out.push((body, other_body));
+                        }
+                    }
+                    NodeKind::Internal { left, right } => {
+                        stack.push(left);
+                        stack.push(right);
+                    }
+                }
+            }
+        }
     }
 }
 
