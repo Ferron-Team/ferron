@@ -12,7 +12,8 @@ mod input;
 pub use assets::Assets;
 pub use camera::Camera;
 pub use components::{
-    AmbientLight, Light, LocalTransform, MaterialHandle, MeshHandle, Name, Spin, Tag,
+    AmbientLight, Collider, ColliderShape, Light, LocalTransform, MaterialHandle, MeshHandle,
+    Name, Spin, Tag,
 };
 #[cfg(feature = "scripting")]
 pub use components::ScriptComponent;

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod camera_controller;
+pub mod collision;
 pub mod editor;
 pub mod gfx;
 pub mod scene;

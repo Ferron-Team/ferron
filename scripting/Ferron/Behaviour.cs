@@ -19,6 +19,15 @@ public abstract class Behaviour
 
     public virtual void OnDestroy() { }
 
+    /// Fired the first frame this entity's collider overlaps another; the
+    /// engine dispatches collision callbacks before OnUpdate each tick.
+    public virtual void OnCollisionEnter(Collision other) { }
+
+    /// Fired the first frame a previously-overlapping pair separates. The
+    /// payload carries the *last known* contact — there is no contact this
+    /// frame by definition.
+    public virtual void OnCollisionExit(Collision other) { }
+
     protected Transform Transform
     {
         get => Native.GetTransform(Entity);

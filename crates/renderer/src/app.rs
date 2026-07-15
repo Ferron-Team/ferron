@@ -77,6 +77,7 @@ impl App {
         app.world.insert_resource(HdrSettings::default());
         app.world.insert_resource(FrameStats::new());
         app.world.insert_resource(InputState::new());
+        app.world.insert_resource(crate::collision::CollisionState::default());
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -193,6 +194,11 @@ impl ApplicationHandler for App {
                 // Simulation systems run, then we extract a draw list for the
                 // backend — which never sees the ECS world directly.
                 systems::spin(&self.world, delta);
+
+                // Collision runs after the transform-mutating systems and
+                // before the script tick, so the events scripts receive match
+                // the positions they'll read this frame.
+                crate::collision::run(&mut self.world);
 
                 // Tick C# scripts (their OnUpdate may edit components this frame).
                 #[cfg(feature = "scripting")]

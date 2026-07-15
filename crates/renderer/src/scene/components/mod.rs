@@ -3,6 +3,7 @@
 //! Each component is a plain data struct stored in a `ferron_ecs::World`.
 //! Systems query these to drive simulation and rendering.
 
+mod collider;
 mod light;
 mod local_transform;
 mod material_handle;
@@ -13,6 +14,7 @@ mod tag;
 #[cfg(feature = "scripting")]
 mod script;
 
+pub use collider::{Collider, ColliderShape};
 pub use light::{AmbientLight, Light};
 pub use local_transform::LocalTransform;
 pub use material_handle::MaterialHandle;

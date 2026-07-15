@@ -1,6 +1,8 @@
 using System.Runtime.InteropServices;
 using System.Text;
 
+using Ferron.Math;
+
 namespace Ferron;
 
 // Field order and types must match the Rust FerronApi struct.
@@ -26,6 +28,10 @@ public unsafe struct FerronApi
     public delegate* unmanaged<Entity, uint, byte> HasComponent;
     public delegate* unmanaged<Entity, byte*, int, int> GetTag;
     public delegate* unmanaged<Entity, byte*, byte> SetTag;
+    public delegate* unmanaged<Entity, float, float, float, byte, byte> AddBoxCollider;
+    public delegate* unmanaged<Entity, float, byte, byte> AddSphereCollider;
+    public delegate* unmanaged<Entity, byte*, byte> SetMaterial;
+    public delegate* unmanaged<Entity, byte*, byte> AddScript;
 }
 
 public static unsafe class Native
@@ -138,6 +144,27 @@ public static unsafe class Native
         var tagBytes = NulTerminated(tag);
         fixed (byte* tagPtr = tagBytes)
             return _api.SetTag(entity, tagPtr) != 0;
+    }
+
+    public static bool AddBoxCollider(Entity entity, Vector3 halfExtents, bool isTrigger) =>
+        _api.AddBoxCollider(entity, halfExtents.x, halfExtents.y, halfExtents.z,
+            (byte)(isTrigger ? 1 : 0)) != 0;
+
+    public static bool AddSphereCollider(Entity entity, float radius, bool isTrigger) =>
+        _api.AddSphereCollider(entity, radius, (byte)(isTrigger ? 1 : 0)) != 0;
+
+    public static bool SetMaterial(Entity entity, string material)
+    {
+        var materialBytes = NulTerminated(material);
+        fixed (byte* materialPtr = materialBytes)
+            return _api.SetMaterial(entity, materialPtr) != 0;
+    }
+
+    public static bool AddScript(Entity entity, string typeName)
+    {
+        var nameBytes = NulTerminated(typeName);
+        fixed (byte* namePtr = nameBytes)
+            return _api.AddScript(entity, namePtr) != 0;
     }
 
     private static byte[] NulTerminated(string value)
