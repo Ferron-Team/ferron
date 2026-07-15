@@ -53,14 +53,16 @@ impl Bvh {
         if indices.len() == 1 {
             let index = nodes.len() as u32;
             nodes.push(Node { aabb: bounds[indices[0]], kind: NodeKind::Leaf { body: indices[0] as u32 } });
-            return index
+            return index;
         }
 
+        // Split on the axis where the centers spread widest; centers (not box
+        // edges) keep the partition meaningful when bounds overlap heavily.
         let mut min_c = Vec3::splat(f32::INFINITY);
         let mut max_c = Vec3::splat(f32::NEG_INFINITY);
 
-        for i in indices.iter() {
-            let center = bounds[*i].center();
+        for &i in indices.iter() {
+            let center = bounds[i].center();
             min_c = min_c.min(center);
             max_c = max_c.max(center);
         }
@@ -70,10 +72,11 @@ impl Bvh {
         else if span.y >= span.z { 1 }
         else { 2 };
 
+        // Median by count, not by value: both halves stay non-empty even when
+        // every center coincides, so the recursion always terminates.
         let mid = indices.len() / 2;
         indices.select_nth_unstable_by(mid, |&i, &j|
-            bounds[i as usize].center()[axis]
-                .total_cmp(&bounds[j as usize].center()[axis]));
+            bounds[i].center()[axis].total_cmp(&bounds[j].center()[axis]));
 
         let (left_half, right_half) = indices.split_at_mut(mid);
         let left = Self::build_ranges(nodes, bounds, left_half);
@@ -82,7 +85,7 @@ impl Bvh {
         let aabb = nodes[left as usize].aabb.union(&nodes[right as usize].aabb);
 
         let index = nodes.len() as u32;
-        nodes.push(Node {  aabb, kind: NodeKind::Internal { left, right } });
+        nodes.push(Node { aabb, kind: NodeKind::Internal { left, right } });
         index
     }
 
@@ -103,6 +106,8 @@ impl Bvh {
                 }
                 match other.kind {
                     NodeKind::Leaf { body: other_body } => {
+                        // Every pair is discovered from both of its leaves;
+                        // `<` keeps exactly one and drops self-pairs.
                         if body < other_body {
                             out.push((body, other_body));
                         }
@@ -132,9 +137,6 @@ mod tests {
         pairs.sort_unstable();
         pairs
     }
-
-    // These run red until `build`/`query_pairs`/`Aabb::{overlaps,union}` are
-    // implemented: `cargo test -p renderer-prototype collision`.
 
     #[test]
     fn empty_and_single_produce_no_pairs() {

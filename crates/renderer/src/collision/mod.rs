@@ -17,7 +17,7 @@ mod narrowphase;
 
 use std::collections::HashMap;
 
-use glam::Vec3;
+use glam::{Mat3, Vec3};
 
 use ferron_ecs::{Entity, World};
 
@@ -74,10 +74,7 @@ pub struct Aabb {
 impl Aabb {
     /// True when the boxes overlap (touching counts as overlapping).
     pub fn overlaps(&self, other: &Aabb) -> bool {
-        if (self.min.cmple(other.max) & other.min.cmple(self.max)).all() == true {
-            return true
-        }
-        false
+        (self.min.cmple(other.max) & other.min.cmple(self.max)).all()
     }
 
     /// The smallest AABB containing both boxes (the BVH's node bound).
@@ -117,20 +114,27 @@ impl WorldShape {
 fn world_shape(transform: &LocalTransform, collider: &Collider) -> WorldShape {
     match collider.shape {
         ColliderShape::Sphere { radius } => {
-            // TODO(owner): center is the translation; the radius scales by the
-            // *largest* scale component (non-uniform scale can't shrink a
-            // sphere without turning it into an ellipsoid — be conservative).
-            todo!("world_shape: sphere")
+            // Non-uniform scale would make this an ellipsoid; the largest
+            // component keeps a true sphere that always contains it, so
+            // contacts can fire early but never go missing.
+            WorldShape::Sphere {
+                center: transform.translation,
+                radius: radius * transform.scale.max_element().abs(),
+            }
         }
         ColliderShape::Box { half_extents } => {
-            // TODO(owner): scale the half extents, then account for rotation.
-            // The classic trick for the AABB of a rotated box: world half
-            // extents = abs(R) * local_half_extents, where abs(R) is the
-            // rotation matrix with every element made non-negative
-            // (glam: Mat3::from_quat(rotation), then abs() each column or use
-            // Mat3::abs). Center is the translation. Identity rotation should
-            // give back exactly translation ± half_extents * scale.
-            todo!("world_shape: box")
+            // World AABB of the rotated box: abs(R) * half. Per world axis the
+            // farthest corner picks the sign of every term, which is exactly
+            // the element-wise abs; identity rotation reduces to ±half.
+            let half = half_extents * transform.scale;
+            let r = Mat3::from_quat(transform.rotation);
+            let abs_r = Mat3::from_cols(r.x_axis.abs(), r.y_axis.abs(), r.z_axis.abs());
+            let world_half = abs_r * half;
+
+            WorldShape::Box(Aabb {
+                min: transform.translation - world_half,
+                max: transform.translation + world_half,
+            })
         }
     }
 }
@@ -152,15 +156,31 @@ fn diff_pairs(
     current: &HashMap<(Entity, Entity), Contact>,
     events: &mut Vec<CollisionEvent>,
 ) {
-    // TODO(owner):
-    // - Enter: every key in `current` that is not in `previous`, with the
-    //   current contact's point/normal.
-    // - Exit: every key in `previous` that is not in `current`. There is no
-    //   contact this frame, so reuse the *previous* frame's contact — same
-    //   trade-off Unity makes for OnCollisionExit. (This also covers pairs
-    //   that vanished because an entity despawned; the script tick already
-    //   skips dead entities when routing.)
-    todo!("diff_pairs")
+    for (key, contact) in current {
+        if !previous.contains_key(key) {
+            events.push(CollisionEvent {
+                kind: CollisionEventKind::Enter,
+                a: key.0,
+                b: key.1,
+                point: contact.point,
+                normal: contact.normal,
+            });
+        }
+    }
+
+    // Exit pairs have no contact this frame, so the event reuses last frame's
+    // point/normal — the same trade-off Unity makes for OnCollisionExit.
+    for (key, contact) in previous {
+        if !current.contains_key(key) {
+            events.push(CollisionEvent {
+                kind: CollisionEventKind::Exit,
+                a: key.0,
+                b: key.1,
+                point: contact.point,
+                normal: contact.normal,
+            });
+        }
+    }
 }
 
 /// Detect collisions and produce this frame's events + positional corrections.

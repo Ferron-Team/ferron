@@ -33,6 +33,9 @@ fn aabb_aabb(a: &Aabb, b: &Aabb) -> Option<Contact> {
     let delta = b.center() - a.center();
 
     if extent.x <= 0.0 || extent.y <= 0.0 || extent.z <= 0.0 { return None }
+
+    // The smallest-overlap axis is what makes the MTV minimum: pushing out
+    // along any other axis moves further. `delta` only decides the sign.
     let (depth, normal) = if extent.x <= extent.y && extent.x <= extent.z {
         (
             extent.x,
@@ -68,6 +71,8 @@ fn sphere_sphere(ca: Vec3, ra: f32, cb: Vec3, rb: f32) -> Option<Contact> {
     let d = cb - ca;
     let dist = d.length();
     if dist < ra + rb {
+        // Concentric spheres have no separation direction; any unit vector
+        // is as good as any other, and NaN is not.
         let normal = d.normalize_or(Vec3::X);
 
         return Some(Contact {
@@ -85,8 +90,12 @@ fn aabb_sphere(a: &Aabb, center: Vec3, radius: f32) -> Option<Contact> {
     let dist = d.length();
 
     if dist >= radius { return None }
+
+    // Center inside the box: `d` is zero (exact — clamp returns the center
+    // unchanged), so there's no direction to normalize. Push out through the
+    // nearest face instead; depth must clear that face plus the radius.
     if dist == 0.0 {
-        let to_min = center -a.min;
+        let to_min = center - a.min;
         let to_max = a.max - center;
 
         let candidates = [
@@ -95,11 +104,11 @@ fn aabb_sphere(a: &Aabb, center: Vec3, radius: f32) -> Option<Contact> {
             (to_min.z, Vec3::NEG_Z), (to_max.z, Vec3::Z),
         ];
 
-        let (dist, normal) = candidates.iter().min_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+        let (face_dist, normal) = candidates.iter().min_by(|x, y| x.0.total_cmp(&y.0)).unwrap();
 
         return Some(Contact {
             normal: *normal,
-            depth: dist + radius,
+            depth: face_dist + radius,
             point: center
         })
     }
@@ -121,9 +130,6 @@ pub fn resolve_offsets(contact: &Contact) -> (Vec3, Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Red until the narrowphase functions are implemented:
-    // `cargo test -p renderer-prototype collision`.
 
     fn unit_box_at(center: Vec3) -> Aabb {
         Aabb { min: center - Vec3::splat(0.5), max: center + Vec3::splat(0.5) }
