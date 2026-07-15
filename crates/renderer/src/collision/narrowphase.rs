@@ -29,46 +29,93 @@ pub fn test(a: &WorldShape, b: &WorldShape) -> Option<Contact> {
 }
 
 fn aabb_aabb(a: &Aabb, b: &Aabb) -> Option<Contact> {
-    // TODO(owner): compute the overlap extent on each axis
-    // (min(a.max, b.max) - max(a.min, b.min)); any non-positive extent means
-    // no collision. Otherwise the *smallest* overlap axis is the separation
-    // axis: normal is ±that axis unit vector (sign chosen so it points from
-    // a's center toward b's), depth is that extent, and the contact point is
-    // the center of the overlap box. Picking the smallest axis is what makes
-    // the MTV "minimum" — pushing out along any other axis moves further.
-    todo!("narrowphase::aabb_aabb")
+    let extent = a.max.min(b.max) - a.min.max(b.min);
+    let delta = b.center() - a.center();
+
+    if extent.x <= 0.0 || extent.y <= 0.0 || extent.z <= 0.0 { return None }
+    let (depth, normal) = if extent.x <= extent.y && extent.x <= extent.z {
+        (
+            extent.x,
+            if delta.x >= 0.0 { Vec3::X } else { Vec3::NEG_X }
+        )
+    }
+    else if extent.y <= extent.z {
+        (
+            extent.y,
+            if delta.y >= 0.0 { Vec3::Y } else { Vec3::NEG_Y }
+        )
+    }
+    else {
+        (
+            extent.z,
+            if delta.z >= 0.0 { Vec3::Z } else { Vec3::NEG_Z }
+        )
+    };
+
+    let overlap_min = a.min.max(b.min);
+    let overlap_max = a.max.min(b.max);
+
+    let point = (overlap_min + overlap_max) * 0.5;
+
+    Some(Contact {
+        normal,
+        point,
+        depth
+    })
 }
 
 fn sphere_sphere(ca: Vec3, ra: f32, cb: Vec3, rb: f32) -> Option<Contact> {
-    // TODO(owner): let d = cb - ca. Colliding iff |d| < ra + rb. Normal is
-    // d.normalize_or(Vec3::X) — the fallback handles concentric spheres, where
-    // any direction is as good as any other but NaN is not. Depth is
-    // (ra + rb) - |d|; contact point sits on a's surface along the normal
-    // (ca + normal * ra), or the midpoint of the overlap if you prefer —
-    // just be consistent.
-    todo!("narrowphase::sphere_sphere")
+    let d = cb - ca;
+    let dist = d.length();
+    if dist < ra + rb {
+        let normal = d.normalize_or(Vec3::X);
+
+        return Some(Contact {
+            normal,
+            point: (ca + normal * ra),
+            depth: (ra + rb) - dist,
+        })
+    }
+    None
 }
 
 fn aabb_sphere(a: &Aabb, center: Vec3, radius: f32) -> Option<Contact> {
-    // TODO(owner): clamp the sphere center to the box (component-wise
-    // center.clamp(a.min, a.max)) to get the closest point on/in the box.
-    // Colliding iff distance(closest, center) < radius. Normal points from
-    // the closest point toward the sphere center; depth is
-    // radius - distance; contact point is the closest point. Watch the
-    // degenerate case where the center is *inside* the box (closest ==
-    // center, distance == 0): fall back to pushing out along the axis where
-    // the center is nearest a face, like the aabb_aabb smallest-axis rule.
-    todo!("narrowphase::aabb_sphere")
+    let closest = center.clamp(a.min, a.max);
+    let d = center - closest;
+    let dist = d.length();
+
+    if dist >= radius { return None }
+    if dist == 0.0 {
+        let to_min = center -a.min;
+        let to_max = a.max - center;
+
+        let candidates = [
+            (to_min.x, Vec3::NEG_X), (to_max.x, Vec3::X),
+            (to_min.y, Vec3::NEG_Y), (to_max.y, Vec3::Y),
+            (to_min.z, Vec3::NEG_Z), (to_max.z, Vec3::Z),
+        ];
+
+        let (dist, normal) = candidates.iter().min_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+
+        return Some(Contact {
+            normal: *normal,
+            depth: dist + radius,
+            point: center
+        })
+    }
+
+    Some(Contact {
+        normal: d / dist,
+        depth: radius - dist,
+        point: closest
+    })
 }
 
 /// Split a solid–solid penetration into per-body displacement offsets:
 /// returns `(offset_a, offset_b)` for the contact's `a` and `b` entities.
 pub fn resolve_offsets(contact: &Contact) -> (Vec3, Vec3) {
-    // TODO(owner): the minimum translation vector is normal * depth. With no
-    // mass or velocity yet, split it evenly: a moves -normal * depth * 0.5,
-    // b moves +normal * depth * 0.5. (When mass arrives, this becomes an
-    // inverse-mass-weighted split, and `0.5` is the equal-mass special case.)
-    todo!("narrowphase::resolve_offsets")
+    let mtv = contact.normal * contact.depth;
+    (-mtv * 0.5, mtv * 0.5)
 }
 
 #[cfg(test)]
@@ -116,6 +163,16 @@ mod tests {
         // Normal points box → sphere, i.e. -x.
         assert!((contact.normal - Vec3::NEG_X).length() < 1e-5);
         assert!((contact.depth - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn aabb_sphere_center_inside_pushes_through_nearest_face() {
+        // Sphere center inside the box, nearest the +x face (0.1 away): the
+        // fallback must push +x, and depth must clear face distance + radius.
+        let contact = aabb_sphere(&unit_box_at(Vec3::ZERO), Vec3::new(0.4, 0.0, 0.0), 0.5)
+            .expect("center inside the box always overlaps");
+        assert!((contact.normal - Vec3::X).length() < 1e-5);
+        assert!((contact.depth - 0.6).abs() < 1e-5);
     }
 
     #[test]
