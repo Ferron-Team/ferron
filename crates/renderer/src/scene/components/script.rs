@@ -13,12 +13,21 @@
 /// into one flag would make "flag changed" and "script was told" the same
 /// event, and they aren't (the change can happen mid-frame, after this tick's
 /// dispatch window closed).
+///
+/// `faulted` is fault isolation: set when a C# hook throws (the managed side
+/// contains and logs the exception, then reports it back through the lifecycle
+/// ABI). A faulted script is skipped by every future tick — no dispatch, no
+/// per-frame log spam — so one bad script can't take the engine down. It stays
+/// set until something clears it (the inspector's "Clear fault" button today; a
+/// hot-reload path when one lands), which re-arms the script from wherever its
+/// lifecycle left off.
 #[derive(Debug)]
 pub struct ScriptComponent {
     pub handle: u64,
     pub started: bool,
     pub enabled: bool,
     pub active: bool,
+    pub faulted: bool,
 }
 
 impl Drop for ScriptComponent {

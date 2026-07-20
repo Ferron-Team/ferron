@@ -1,5 +1,3 @@
-//! GPU texture uploads.
-
 use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
@@ -14,10 +12,8 @@ use vulkano::sync::{self, GpuFuture};
 
 use super::context::VkContext;
 
-/// Upload `pixels` (RGBA8, `extent[0] * extent[1] * 4` bytes) into a sampled
-/// device-local image and return a view of it. `format` chooses how the shader
-/// interprets the bytes (e.g. `R8G8B8A8_SRGB` for color, `R8G8B8A8_UNORM` for
-/// data maps).
+// `format` chooses how the shader interprets the bytes (e.g. `R8G8B8A8_SRGB`
+// for color, `R8G8B8A8_UNORM` for data maps).
 pub(super) fn upload_texture(
     ctx: &VkContext,
     pixels: &[u8],

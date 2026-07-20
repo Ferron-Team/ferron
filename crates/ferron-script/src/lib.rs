@@ -308,12 +308,17 @@ pub struct CCollision {
 pub struct ScriptHost {
     _context: HostfxrContext<InitializedForRuntimeConfig>,
     create_fn: extern "system" fn(CEntity, *const c_char) -> u64,
-    start_fn: extern "system" fn(u64),
-    update_fn: extern "system" fn(u64, f32),
-    enable_fn: extern "system" fn(u64),
-    disable_fn: extern "system" fn(u64),
-    collision_enter_fn: extern "system" fn(u64, *const CCollision),
-    collision_exit_fn: extern "system" fn(u64, *const CCollision),
+    // The lifecycle hooks return a fault byte (0 = clean, nonzero = the C# hook
+    // threw and was contained): the managed side never lets an exception cross
+    // into these native frames, and reports it here so the engine can disable
+    // the offending script. Signatures stay in lock-step with C#
+    // `Ferron.Behaviours` (which returns `byte`).
+    start_fn: extern "system" fn(u64) -> u8,
+    update_fn: extern "system" fn(u64, f32) -> u8,
+    enable_fn: extern "system" fn(u64) -> u8,
+    disable_fn: extern "system" fn(u64) -> u8,
+    collision_enter_fn: extern "system" fn(u64, *const CCollision) -> u8,
+    collision_exit_fn: extern "system" fn(u64, *const CCollision) -> u8,
 }
 
 impl ScriptHost {
@@ -352,27 +357,27 @@ impl ScriptHost {
                     pdcstr!("Ferron.Behaviours, Ferron"),
                     pdcstr!("Create"),
                 )?,
-                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64)>(
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64) -> u8>(
                     pdcstr!("Ferron.Behaviours, Ferron"),
                     pdcstr!("Start"),
                 )?,
-                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, f32)>(
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, f32) -> u8>(
                     pdcstr!("Ferron.Behaviours, Ferron"),
                     pdcstr!("Update"),
                 )?,
-                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64)>(
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64) -> u8>(
                     pdcstr!("Ferron.Behaviours, Ferron"),
                     pdcstr!("Enable"),
                 )?,
-                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64)>(
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64) -> u8>(
                     pdcstr!("Ferron.Behaviours, Ferron"),
                     pdcstr!("Disable"),
                 )?,
-                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision)>(
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
                     pdcstr!("Ferron.Behaviours, Ferron"),
                     pdcstr!("CollisionEnter"),
                 )?,
-                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision)>(
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
                     pdcstr!("Ferron.Behaviours, Ferron"),
                     pdcstr!("CollisionExit"),
                 )?,
@@ -410,27 +415,30 @@ impl ScriptHost {
         (self.create_fn)(entity, type_name.as_ptr())
     }
 
-    pub fn start(&self, handle: u64) {
-        (self.start_fn)(handle)
+    // Each hook returns `true` if the C# side caught an exception (the script is
+    // now faulted and should not be dispatched to again until the fault clears).
+
+    pub fn start(&self, handle: u64) -> bool {
+        (self.start_fn)(handle) != 0
     }
 
-    pub fn update(&self, handle: u64, delta_time: f32) {
-        (self.update_fn)(handle, delta_time)
+    pub fn update(&self, handle: u64, delta_time: f32) -> bool {
+        (self.update_fn)(handle, delta_time) != 0
     }
 
-    pub fn enable(&self, handle: u64) {
-        (self.enable_fn)(handle)
+    pub fn enable(&self, handle: u64) -> bool {
+        (self.enable_fn)(handle) != 0
     }
 
-    pub fn disable(&self, handle: u64) {
-        (self.disable_fn)(handle)
+    pub fn disable(&self, handle: u64) -> bool {
+        (self.disable_fn)(handle) != 0
     }
 
-    pub fn collision_enter(&self, handle: u64, collision: &CCollision) {
-        (self.collision_enter_fn)(handle, collision)
+    pub fn collision_enter(&self, handle: u64, collision: &CCollision) -> bool {
+        (self.collision_enter_fn)(handle, collision) != 0
     }
 
-    pub fn collision_exit(&self, handle: u64, collision: &CCollision) {
-        (self.collision_exit_fn)(handle, collision)
+    pub fn collision_exit(&self, handle: u64, collision: &CCollision) -> bool {
+        (self.collision_exit_fn)(handle, collision) != 0
     }
 }

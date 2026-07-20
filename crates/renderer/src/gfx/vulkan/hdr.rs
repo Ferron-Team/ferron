@@ -1,10 +1,3 @@
-//! HDR offscreen target + tonemap pass.
-//!
-//! The forward pass renders into a floating-point color target (so radiance can
-//! exceed 1.0), and this module's fullscreen tonemap pass maps that back into
-//! the displayable [0,1] range with exposure + an ACES filmic curve before
-//! writing to the sRGB swapchain image.
-
 use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
@@ -47,8 +40,6 @@ struct TonemapPush {
     exposure: f32,
 }
 
-/// Extent-sized images the forward pass renders into, plus the framebuffer that
-/// binds them to the forward render pass. Rebuilt on resize.
 struct HdrTargets {
     /// Resolved (1-sample) HDR color — what the tonemap pass samples.
     hdr_view: Arc<ImageView>,
@@ -132,7 +123,6 @@ pub struct HdrPass {
     tonemap_pipeline: Arc<GraphicsPipeline>,
     sampler: Arc<Sampler>,
     targets: HdrTargets,
-    /// Linear exposure multiplier applied before the ACES curve.
     pub exposure: f32,
 }
 

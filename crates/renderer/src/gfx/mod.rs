@@ -22,12 +22,6 @@ pub struct Vertex {
     pub tangent: [f32; 4],
 }
 
-/// One thing to draw this frame: a mesh and the model matrix to draw it with.
-///
-/// The app builds a slice of these from the ECS world each frame (see
-/// [`systems::extract_renderables`](crate::systems::extract_renderables)) and
-/// hands them to the backend. Keeping the hand-off a plain slice keeps the
-/// backend free of any ECS or scene types.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderItem {
     pub model: Mat4,
@@ -37,58 +31,40 @@ pub struct RenderItem {
 
 pub const MAX_POINT_LIGHTS: usize = 16;
 
-/// Size of the shader's bound texture array (set 2). Materials index into it by
-/// handle; unused slots are padded with a default texture. Keep at or below the
-/// device's `maxPerStageDescriptorSampledImages` (≥16 guaranteed; Apple/MoltenVK
+/// Size of the shader's bound texture array (set 2). Keep at or below the
+/// device's `maxPerStageDescriptorSampledImages` (≥16 guaranteed; MoltenVK
 /// allows far more).
 pub const MAX_TEXTURES: usize = 64;
 
-/// A lightweight reference to a texture uploaded to the render backend.
-///
-/// Obtain one from [`RenderBackend::load_texture`]; store it on a [`Material`]
-/// to drive shading. The `u32` is the texture's index in the shader's array.
+/// The `u32` is the texture's index in the shader's array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextureHandle(pub u32);
 
-/// A sun-like light: parallel rays with a single direction, no position.
 #[derive(Clone, Copy, Debug)]
 pub struct DirectionalLight {
     /// The direction the light *travels* (e.g. roughly downward for a sun).
     pub direction: Vec3,
-    /// Linear RGB color of the light.
     pub color: Vec3,
-    /// Brightness multiplier.
     pub intensity: f32,
 }
 
-/// A light that radiates from a point and falls off with distance.
 #[derive(Clone, Copy, Debug)]
 pub struct PointLight {
     pub position: Vec3,
-    /// Linear RGB color of the light.
     pub color: Vec3,
-    /// Brightness multiplier.
     pub intensity: f32,
-    /// Distance at which the light's contribution reaches zero.
     pub range: f32,
 }
 
-/// This frame's lighting environment, handed to the backend alongside the draw
-/// list. Like [`RenderItem`], it's plain data so the backend never touches ECS
-/// or scene types — the app builds it via
-/// [`systems::extract_lighting`](crate::systems::extract_lighting).
 #[derive(Clone, Debug)]
 pub struct SceneLighting {
-    /// Flat fill light applied everywhere, approximating bounced/sky light.
     pub ambient_color: Vec3,
     pub ambient_intensity: f32,
-    /// The primary directional light.
     pub sun: DirectionalLight,
-    /// Extra local lights. Anything past [`MAX_POINT_LIGHTS`] is ignored.
+    /// Anything past [`MAX_POINT_LIGHTS`] is ignored.
     pub point_lights: Vec<PointLight>,
     /// Blinn-Phong specular exponent. Higher = smaller, sharper highlight.
     pub shininess: f32,
-    /// Global multiplier on every light's specular contribution.
     pub specular_strength: f32,
 }
 
@@ -124,7 +100,6 @@ impl Default for Material {
 impl Default for SceneLighting {
     fn default() -> Self {
         Self {
-            // Cool, dim sky fill so shadowed faces aren't pure black.
             ambient_color: Vec3::new(0.6, 0.7, 1.0),
             ambient_intensity: 0.15,
             sun: DirectionalLight {
@@ -139,8 +114,8 @@ impl Default for SceneLighting {
     }
 }
 
-// The seam between the engine and a concrete graphics API. Implement this for
-// other backends (e.g. wgpu, D3D12) without touching scene/app code.
+// The seam between the engine and a concrete graphics API: implement for other
+// backends (wgpu, D3D12) without touching scene/app code.
 pub trait RenderBackend {
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle;
     fn load_material(&mut self, material: &Material) -> MaterialHandle;

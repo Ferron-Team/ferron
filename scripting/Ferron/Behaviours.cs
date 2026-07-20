@@ -18,6 +18,29 @@ namespace Ferron;
 /// the handle, so OnDestroy always precedes the free by construction.
 public static unsafe class Behaviours
 {
+    // The lifecycle entry points return a fault byte so the engine can disable a
+    // misbehaving script: 0 = the hook ran cleanly, 1 = it threw (already logged;
+    // Rust flips the ScriptComponent's `faulted` flag and stops dispatching to
+    // it). Keeping the exception on this side of the boundary is mandatory — a
+    // managed exception unwinding into native CoreCLR frames is undefined
+    // behaviour, i.e. exactly the engine crash this is preventing.
+    const byte Ok = 0;
+    const byte Faulted = 1;
+
+    static Behaviour? Resolve(nint handle) =>
+        handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour ? behaviour : null;
+
+    /// Log a contained script exception with the script's type, the hook that
+    /// threw, and the exception (type + message + stack trace), then report the
+    /// fault so the caller stops dispatching to this behaviour.
+    static byte Fault(Behaviour behaviour, string method, Exception e)
+    {
+        Native.Log(
+            $"[script] {behaviour.GetType().Name}.{method} threw {e.GetType().Name}: {e.Message} "
+            + $"— disabling this script until reload.\n{e.StackTrace}");
+        return Faulted;
+    }
+
     [UnmanagedCallersOnly]
     public static nint Create(Entity entity, byte* typeName)
     {
@@ -44,98 +67,106 @@ public static unsafe class Behaviours
     }
 
     [UnmanagedCallersOnly]
-    public static void Start(nint handle)
+    public static byte Start(nint handle)
     {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
         try
         {
-            if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
-                behaviour.OnStart();
+            behaviour.OnStart();
+            return Ok;
         }
         catch (Exception e)
         {
-            Native.Log($"[script] exception during start: {e}");
+            return Fault(behaviour, nameof(Behaviour.OnStart), e);
         }
     }
 
     [UnmanagedCallersOnly]
-    public static void Update(nint handle, float deltaTime)
+    public static byte Update(nint handle, float deltaTime)
     {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
         try
         {
-            if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
-                behaviour.OnUpdate(deltaTime);
+            behaviour.OnUpdate(deltaTime);
+            return Ok;
         }
         catch (Exception e)
         {
-            Native.Log($"[script] exception during update: {e}");
+            return Fault(behaviour, nameof(Behaviour.OnUpdate), e);
         }
     }
 
     [UnmanagedCallersOnly]
-    public static void Enable(nint handle)
+    public static byte Enable(nint handle)
     {
-        if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
-        {
-            try
-            {
-                if (!behaviour.Active)
-                {
-                    behaviour.Active = true;
-                    behaviour.OnEnable();
-                }
-            }
-            catch (Exception e)
-            {
-                Native.Log($"[script] exception during enable: {e}");
-            }
-        }
-    }
-
-    [UnmanagedCallersOnly]
-    public static void Disable(nint handle)
-    {
-        if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
-        {
-            try
-            {
-                if (behaviour.Active)
-                {
-                    behaviour.Active = false;
-                    behaviour.OnDisable();
-                }
-            }
-            catch (Exception e)
-            {
-                Native.Log($"[script] exception during disable: {e}");
-            }
-        }
-    }
-
-    [UnmanagedCallersOnly]
-    public static void CollisionEnter(nint handle, Collision* collision)
-    {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
         try
         {
-            if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
-                behaviour.OnCollisionEnter(*collision);
+            if (!behaviour.Active)
+            {
+                behaviour.Active = true;
+                behaviour.OnEnable();
+            }
+            return Ok;
         }
         catch (Exception e)
         {
-            Native.Log($"[script] exception during collision enter: {e}");
+            return Fault(behaviour, nameof(Behaviour.OnEnable), e);
         }
     }
 
     [UnmanagedCallersOnly]
-    public static void CollisionExit(nint handle, Collision* collision)
+    public static byte Disable(nint handle)
     {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
         try
         {
-            if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
-                behaviour.OnCollisionExit(*collision);
+            if (behaviour.Active)
+            {
+                behaviour.Active = false;
+                behaviour.OnDisable();
+            }
+            return Ok;
         }
         catch (Exception e)
         {
-            Native.Log($"[script] exception during collision exit: {e}");
+            return Fault(behaviour, nameof(Behaviour.OnDisable), e);
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static byte CollisionEnter(nint handle, Collision* collision)
+    {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
+        try
+        {
+            behaviour.OnCollisionEnter(*collision);
+            return Ok;
+        }
+        catch (Exception e)
+        {
+            return Fault(behaviour, nameof(Behaviour.OnCollisionEnter), e);
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static byte CollisionExit(nint handle, Collision* collision)
+    {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
+        try
+        {
+            behaviour.OnCollisionExit(*collision);
+            return Ok;
+        }
+        catch (Exception e)
+        {
+            return Fault(behaviour, nameof(Behaviour.OnCollisionExit), e);
         }
     }
 

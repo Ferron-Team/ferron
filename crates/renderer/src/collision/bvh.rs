@@ -10,27 +10,23 @@
 use glam::Vec3;
 use super::Aabb;
 
-/// Index of a node inside [`Bvh::nodes`].
 type NodeIndex = u32;
 
 enum NodeKind {
-    /// A single collider; `body` indexes the `bounds` slice passed to `build`
-    /// (which `collision::run` keeps parallel to its body list).
+    // `body` indexes the `bounds` slice passed to `build` (which
+    // `collision::run` keeps parallel to its body list).
     Leaf { body: u32 },
     Internal { left: NodeIndex, right: NodeIndex },
 }
 
 struct Node {
-    /// Bound of everything below this node: its own AABB for a leaf, the
-    /// union of both children for an internal node.
+    // Its own AABB for a leaf, the union of both children for an internal node.
     aabb: Aabb,
     kind: NodeKind,
 }
 
-/// A static BVH over one frame's collider bounds.
 pub struct Bvh {
     nodes: Vec<Node>,
-    /// `None` when built over an empty slice.
     root: Option<NodeIndex>,
 }
 

@@ -10,7 +10,6 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-
 //
 // Entities
 //
@@ -219,8 +218,6 @@ impl World {
         Self::default()
     }
 
-    // --- entity lifecycle -------------------------------------------------
-
     /// Create a new entity with no components and return its handle.
     pub fn spawn(&mut self) -> Entity {
         self.entities.allocate()
@@ -345,8 +342,6 @@ impl World {
             _marker: PhantomData,
         }
     }
-
-    // --- resources --------------------------------------------------------
 
     /// Store a unique, world-global value of type `R`, replacing any existing one.
     pub fn insert_resource<R: 'static>(&mut self, resource: R) {

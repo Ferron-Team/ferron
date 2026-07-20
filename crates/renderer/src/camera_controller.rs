@@ -1,11 +1,5 @@
-//! A fly-through editor camera, like a game engine's scene view: hold the right
-//! mouse button to look (WASD to move, Q/E down/up, Shift to go faster), and
-//! scroll to dolly forward/back.
-//!
-//! It drives the [`Camera`] resource. Movement is integrated per frame from held
-//! keys, so [`update`](CameraController::update) needs the frame delta. Input is
-//! gated on egui: events the editor wants (a click on a panel, typing in a field)
-//! are passed through with `egui_wants = true` and ignored here.
+//! Fly-through editor camera: hold right mouse to look (WASD move, Q/E down/up,
+//! Shift faster), scroll to dolly. Drives the [`Camera`] resource.
 
 use glam::Vec3;
 use winit::event::{DeviceEvent, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -13,7 +7,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 
 use crate::scene::Camera;
 
-/// Keep the camera from flipping over at the poles (just under 90°).
+// Just under 90°, so the camera can't flip over at the poles.
 const PITCH_LIMIT: f32 = 1.55;
 
 #[derive(Default)]
@@ -37,16 +31,12 @@ pub struct CameraController {
     yaw: f32,
     pitch: f32,
     move_speed: f32,
-    /// Multiplier applied while Shift is held.
     boost: f32,
-    /// Radians of rotation per pixel of mouse motion.
     sensitivity: f32,
-    /// World units dollied per scroll-wheel line.
     scroll_speed: f32,
 
     looking: bool,
     keys: Keys,
-    // Input accumulated since the last `update`, then cleared.
     look_delta: (f32, f32),
     scroll: f32,
 }
@@ -73,7 +63,6 @@ impl CameraController {
         Self::default()
     }
 
-    /// Seed yaw/pitch from a camera's current facing so control starts smoothly.
     pub fn sync_from(&mut self, camera: &Camera) {
         let dir = (camera.target - camera.position).normalize_or_zero();
         if dir.length_squared() > 1e-6 {
@@ -82,15 +71,12 @@ impl CameraController {
         }
     }
 
-    /// `true` while the right mouse button is held for look mode; the caller uses
-    /// this to hide/grab the cursor.
     pub fn looking(&self) -> bool {
         self.looking
     }
 
-    /// Feed a window event. `egui_wants` is the editor's "I want this event" flag:
-    /// presses it claims are ignored, but releases are always honored so keys and
-    /// look mode never get stuck.
+    /// `egui_wants` presses are ignored, but releases are always honored so keys
+    /// and look mode never get stuck.
     pub fn process_window_event(&mut self, event: &WindowEvent, egui_wants: bool) {
         match event {
             WindowEvent::MouseInput {
@@ -115,7 +101,7 @@ impl CameraController {
             } => {
                 let pressed = state.is_pressed();
                 if pressed && egui_wants {
-                    return; // typing in a text field, not driving the camera
+                    return;
                 }
                 match code {
                     KeyCode::KeyW => self.keys.forward = pressed,
@@ -141,7 +127,6 @@ impl CameraController {
         }
     }
 
-    /// Feed a device event. Only raw mouse motion is used, and only while looking.
     pub fn process_device_event(&mut self, event: &DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             if self.looking {
@@ -151,8 +136,8 @@ impl CameraController {
         }
     }
 
-    /// Apply this frame's input to `camera`. Does nothing when idle, so the
-    /// editor's manual camera edits are left untouched.
+    /// Does nothing when idle, so the editor's manual camera edits are left
+    /// untouched.
     pub fn update(&mut self, camera: &mut Camera, dt: f32) {
         let active = self.looking || self.keys.moving() || self.scroll != 0.0;
         if !active {
@@ -203,7 +188,7 @@ impl CameraController {
     }
 }
 
-/// Unit forward vector for a yaw/pitch pair (yaw 0 faces `-Z`).
+// Unit forward vector for a yaw/pitch pair (yaw 0 faces -Z).
 fn forward_dir(yaw: f32, pitch: f32) -> Vec3 {
     let (sy, cy) = yaw.sin_cos();
     let (sp, cp) = pitch.sin_cos();

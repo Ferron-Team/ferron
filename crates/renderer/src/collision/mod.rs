@@ -1,16 +1,10 @@
-//! Collision detection: BVH broadphase → shape narrowphase → enter/exit
-//! events, with positional (MTV) overlap resolution for solid pairs.
+//! Collision detection: BVH broadphase → shape narrowphase → enter/exit events,
+//! with positional (MTV) overlap resolution for solid pairs.
 //!
-//! [`run`] executes once per frame, after the transform-mutating systems and
-//! before the script tick (see `app.rs`), so scripts observe this frame's
-//! contacts. It only *writes* events into the [`CollisionState`] resource;
-//! delivering them to C# callbacks is the script tick's job — this module has
-//! no scripting dependency and compiles without the feature.
-//!
-//! Conventions (shared with the C# `Collision` struct):
-//! - A [`Contact`] normal is unit length and points **from `a` toward `b`**,
-//!   where `(a, b)` is the canonical pair order from [`pair_key`].
-//! - `depth` is the penetration distance along that normal, `>= 0`.
+//! Contact normals are unit length and point from `a` toward `b`, where `(a, b)`
+//! is the canonical order from `pair_key`, and `depth` is the penetration along
+//! that normal (`>= 0`). `run` only writes events into `CollisionState`;
+//! delivering them to C# is the script tick's job.
 
 mod bvh;
 mod narrowphase;
@@ -25,14 +19,10 @@ use crate::scene::{Collider, ColliderShape, LocalTransform};
 
 pub use bvh::Bvh;
 
-/// A single overlapping contact between two shapes.
 #[derive(Clone, Copy, Debug)]
 pub struct Contact {
-    /// World-space point of contact (center of the overlap region).
     pub point: Vec3,
-    /// Unit normal pointing from shape `a` toward shape `b`.
     pub normal: Vec3,
-    /// Penetration depth along `normal`, `>= 0`.
     pub depth: f32,
 }
 
@@ -42,8 +32,6 @@ pub enum CollisionEventKind {
     Exit,
 }
 
-/// One enter/exit transition for the pair `(a, b)`; `point`/`normal` follow
-/// the [`Contact`] convention (exit events carry the last known contact).
 #[derive(Clone, Copy, Debug)]
 pub struct CollisionEvent {
     pub kind: CollisionEventKind,
@@ -53,18 +41,12 @@ pub struct CollisionEvent {
     pub normal: Vec3,
 }
 
-/// World resource: which pairs touched last frame, and this frame's events.
-///
-/// `events` is refilled by [`run`] each frame and drained by the script tick;
-/// without scripting they're simply overwritten next frame.
 #[derive(Default)]
 pub struct CollisionState {
     touching: HashMap<(Entity, Entity), Contact>,
     pub events: Vec<CollisionEvent>,
 }
 
-/// A world-axis-aligned bounding box. The broadphase currency: every collider
-/// reduces to one of these, whatever its shape.
 #[derive(Clone, Copy, Debug)]
 pub struct Aabb {
     pub min: Vec3,
@@ -72,12 +54,10 @@ pub struct Aabb {
 }
 
 impl Aabb {
-    /// True when the boxes overlap (touching counts as overlapping).
     pub fn overlaps(&self, other: &Aabb) -> bool {
         (self.min.cmple(other.max) & other.min.cmple(self.max)).all()
     }
 
-    /// The smallest AABB containing both boxes (the BVH's node bound).
     pub fn union(&self, other: &Aabb) -> Aabb {
         Aabb {
             min: self.min.min(other.min),
@@ -90,7 +70,6 @@ impl Aabb {
     }
 }
 
-/// A collider brought into world space, ready for narrowphase.
 #[derive(Clone, Copy, Debug)]
 pub enum WorldShape {
     Box(Aabb),
@@ -98,7 +77,6 @@ pub enum WorldShape {
 }
 
 impl WorldShape {
-    /// Conservative world AABB, the broadphase view of this shape.
     pub fn bounds(&self) -> Aabb {
         match *self {
             WorldShape::Box(aabb) => aabb,
@@ -110,22 +88,21 @@ impl WorldShape {
     }
 }
 
-/// Bring a collider into world space using its entity's transform.
 fn world_shape(transform: &LocalTransform, collider: &Collider) -> WorldShape {
     match collider.shape {
         ColliderShape::Sphere { radius } => {
-            // Non-uniform scale would make this an ellipsoid; the largest
-            // component keeps a true sphere that always contains it, so
-            // contacts can fire early but never go missing.
+            // Non-uniform scale would make this an ellipsoid; the largest scale
+            // component keeps a true sphere that still contains it, so contacts
+            // can fire early but never go missing.
             WorldShape::Sphere {
                 center: transform.translation,
                 radius: radius * transform.scale.max_element().abs(),
             }
         }
         ColliderShape::Box { half_extents } => {
-            // World AABB of the rotated box: abs(R) * half. Per world axis the
-            // farthest corner picks the sign of every term, which is exactly
-            // the element-wise abs; identity rotation reduces to ±half.
+            // World AABB of the rotated box is abs(R) * half: per world axis the
+            // farthest corner picks the sign of every term, which is the
+            // element-wise abs.
             let half = half_extents * transform.scale;
             let r = Mat3::from_quat(transform.rotation);
             let abs_r = Mat3::from_cols(r.x_axis.abs(), r.y_axis.abs(), r.z_axis.abs());
@@ -140,7 +117,7 @@ fn world_shape(transform: &LocalTransform, collider: &Collider) -> WorldShape {
 }
 
 /// Canonical ordering for an unordered entity pair, so `(a, b)` and `(b, a)`
-/// hash to the same key. All stored contacts are oriented a → b in this order.
+/// hash to the same key. Stored contacts are oriented a → b in this order.
 fn pair_key(a: Entity, b: Entity) -> (Entity, Entity) {
     if (a.index, a.generation) <= (b.index, b.generation) {
         (a, b)
@@ -149,8 +126,6 @@ fn pair_key(a: Entity, b: Entity) -> (Entity, Entity) {
     }
 }
 
-/// Diff last frame's touching pairs against this frame's, appending Enter
-/// events for new pairs and Exit events for vanished ones.
 fn diff_pairs(
     previous: &HashMap<(Entity, Entity), Contact>,
     current: &HashMap<(Entity, Entity), Contact>,
@@ -183,12 +158,10 @@ fn diff_pairs(
     }
 }
 
-/// Detect collisions and produce this frame's events + positional corrections.
-///
-/// Call order per frame: transforms settle → `run` → script tick (which drains
-/// `CollisionState::events`). Solid–solid pairs are pushed apart immediately;
-/// the pair still counts as touching this frame, so a clean separation shows
-/// up as an Exit event next frame — matching how impulse engines report it.
+/// Detect collisions and produce this frame's events plus positional
+/// corrections. Solid–solid pairs are pushed apart immediately but still count
+/// as touching this frame, so a clean separation surfaces as an Exit event next
+/// frame — matching how impulse engines report it.
 pub fn run(world: &mut World) {
     world.resource_mut::<CollisionState>().events.clear();
 
@@ -209,16 +182,14 @@ pub fn run(world: &mut World) {
             });
         });
 
-    // Broadphase: candidate index pairs whose AABBs overlap.
     let mut candidates: Vec<(u32, u32)> = Vec::new();
     if bodies.len() >= 2 {
         let bounds: Vec<Aabb> = bodies.iter().map(|body| body.shape.bounds()).collect();
         Bvh::build(&bounds).query_pairs(&mut candidates);
     }
 
-    // Narrowphase: exact shape tests on the survivors. Contacts are stored
-    // re-oriented to the canonical pair order so the diff and the resolver
-    // never have to guess which way the normal points.
+    // Contacts are stored re-oriented to the canonical pair order, so the diff
+    // and the resolver never have to guess which way the normal points.
     let mut current: HashMap<(Entity, Entity), Contact> = HashMap::new();
     let mut corrections: Vec<(Entity, Vec3)> = Vec::new();
     for &(i, j) in &candidates {
@@ -242,8 +213,8 @@ pub fn run(world: &mut World) {
         }
     }
 
-    // Apply MTV corrections one entity at a time: `get_mut` borrows the whole
-    // LocalTransform storage, so holding two at once would panic the RefCell.
+    // One entity at a time: `get_mut` borrows the whole LocalTransform storage,
+    // so holding two at once would panic the RefCell.
     for (entity, offset) in corrections {
         if let Some(mut transform) = world.get_mut::<LocalTransform>(entity) {
             transform.translation += offset;

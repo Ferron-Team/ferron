@@ -154,9 +154,7 @@ struct GpuLighting {
 pub struct ForwardPass {
     pub render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
-    /// Pool we sub-allocate the per-frame lighting UBO from.
     uniform_buffer_allocator: SubbufferAllocator,
-    /// Shared sampler used for every texture in the set-2 array.
     sampler: Arc<Sampler>,
     ao_sampler: Arc<Sampler>,
 }
@@ -303,8 +301,6 @@ impl ForwardPass {
         let aspect = extent[0] as f32 / extent[1] as f32;
         let view_proj = camera.view_projection(aspect);
 
-        // Upload this frame's lighting into a fresh sub-buffer and bind it as the
-        // pipeline's set 0. The same descriptor stays bound for every draw.
         let lighting_buffer = self
             .uniform_buffer_allocator
             .allocate_sized::<GpuLighting>()

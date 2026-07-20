@@ -1,15 +1,9 @@
-//! An entity's transform relative to its parent (or the world, if unparented).
-
 use std::ops::{Deref, DerefMut};
 
 use crate::scene::Transform;
 
-/// Position, rotation, and scale of an entity in its local space.
-///
-/// This is the ECS component form of [`Transform`]. It derefs to the inner
-/// `Transform`, so all of its helpers (`matrix`, `translation`, ...) are
-/// available directly on a `LocalTransform`. A companion `GlobalTransform`
-/// component can be added later once a parent/child hierarchy exists.
+/// The ECS component form of [`Transform`]; derefs to it, so all its helpers
+/// are available directly on a `LocalTransform`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalTransform(pub Transform);
 
