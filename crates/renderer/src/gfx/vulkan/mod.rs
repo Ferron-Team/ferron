@@ -1,6 +1,7 @@
 mod context;
 mod forward;
 mod hdr;
+mod line;
 mod swapchain;
 mod texture;
 mod ssao;
@@ -28,10 +29,12 @@ use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, Ssa
 
 use self::context::VkContext;
 use self::forward::{ForwardPass, GpuMesh, GpuMaterial};
+use self::line::LinePass;
 use self::swapchain::SwapchainState;
 use self::ssao::SsaoPass;
 use self::hdr::{HdrPass, HDR_FORMAT};
 
+use crate::scene::DebugLine;
 use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
 
 type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
@@ -142,6 +145,9 @@ pub struct VulkanRenderer {
     forward: ForwardPass,
     hdr: HdrPass,
     ssao: SsaoPass,
+    /// Debug-line overlay, recorded into the forward pass. Editor-only in
+    /// practice: fed lines only through `render_with_overlay`.
+    line: LinePass,
     pub(crate) meshes: Vec<GpuMesh>,
     pub(crate) materials: Vec<GpuMaterial>,
     /// Texture views indexed by `TextureHandle`. Index 0 is a 1x1 white texture
@@ -165,6 +171,7 @@ impl VulkanRenderer {
         let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, HDR_FORMAT);
         let hdr = HdrPass::new(&ctx, &forward.render_pass, format, extent);
         let ssao = SsaoPass::new(&ctx, extent);
+        let line = LinePass::new(&ctx.device, &ctx.memory_allocator, &forward.render_pass);
         let swapchain = SwapchainState::new(&ctx, &surface, &hdr.tonemap_rp, format, extent);
         let timer = GpuTimer::new(&ctx);
 
@@ -181,6 +188,7 @@ impl VulkanRenderer {
             forward,
             hdr,
             ssao,
+            line,
             meshes: Vec::new(),
             materials: vec![forward::to_gpu_material(&Material::default())],
             textures,
@@ -243,7 +251,8 @@ impl RenderBackend for VulkanRenderer {
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
     ) {
-        self.render_frame(items, lighting, camera, ssao, hdr, None);
+        // No overlay path (e.g. export/headless) draws no debug lines.
+        self.render_frame(items, lighting, camera, ssao, hdr, &[], None);
     }
 }
 
@@ -277,9 +286,10 @@ impl VulkanRenderer {
         camera: &Camera,
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
+        debug_lines: &[DebugLine],
         overlay: Overlay<'_>,
     ) {
-        self.render_frame(items, lighting, camera, ssao, hdr, Some(overlay));
+        self.render_frame(items, lighting, camera, ssao, hdr, debug_lines, Some(overlay));
     }
 
     fn render_frame(
@@ -289,6 +299,7 @@ impl VulkanRenderer {
         camera: &Camera,
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
+        debug_lines: &[DebugLine],
         overlay: Option<Overlay<'_>>,
     ) {
         if self.pending_extent[0] == 0 || self.pending_extent[1] == 0 {
@@ -406,6 +417,11 @@ impl VulkanRenderer {
             material_set,
             texture_set,
         );
+
+        // Debug lines share the forward subpass: depth-tested against the scene,
+        // drawn on top of it, before the pass ends.
+        self.line
+            .record(&mut builder, debug_lines, camera, self.swapchain.extent);
 
         builder.end_render_pass(Default::default()).unwrap();
 

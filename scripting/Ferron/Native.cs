@@ -32,6 +32,13 @@ public unsafe struct FerronApi
     public delegate* unmanaged<Entity, float, byte, byte> AddSphereCollider;
     public delegate* unmanaged<Entity, byte*, byte> SetMaterial;
     public delegate* unmanaged<Entity, byte*, byte> AddScript;
+    public delegate* unmanaged<byte*, void> LogWarn;
+    public delegate* unmanaged<byte*, void> LogError;
+    // from(x,y,z), to(x,y,z), color(r,g,b,a), duration — loose floats to match
+    // the Rust `debug_draw_line` signature.
+    public delegate* unmanaged<
+        float, float, float, float, float, float, float, float, float, float, float, void>
+        DebugDrawLine;
 }
 
 public static unsafe class Native
@@ -40,14 +47,26 @@ public static unsafe class Native
 
     internal static void Initialize(FerronApi* api) => _api = *api;
 
-    public static void Log(string message)
+    public static void Log(string message) => Emit(_api.Log, message);
+
+    public static void LogWarn(string message) => Emit(_api.LogWarn, message);
+
+    public static void LogError(string message) => Emit(_api.LogError, message);
+
+    public static void DebugDrawLine(Vector3 from, Vector3 to, Color color, float duration) =>
+        _api.DebugDrawLine(
+            from.x, from.y, from.z, to.x, to.y, to.z, color.r, color.g, color.b, color.a, duration);
+
+    // Marshal `message` as a nul-terminated UTF-8 buffer and hand it to a native
+    // string sink (Log/LogWarn/LogError share this).
+    private static void Emit(delegate* unmanaged<byte*, void> sink, string message)
     {
         var bytes = Encoding.UTF8.GetBytes(message);
         Span<byte> buffer = stackalloc byte[bytes.Length + 1];
         bytes.CopyTo(buffer);
         buffer[bytes.Length] = 0;
         fixed (byte* p = buffer)
-            _api.Log(p);
+            sink(p);
     }
 
     public static Entity Spawn() => _api.Spawn();

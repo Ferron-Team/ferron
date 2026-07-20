@@ -1,6 +1,7 @@
 mod assets;
 mod camera;
 mod components;
+mod debug;
 pub mod entities;
 mod hdr;
 mod mesh;
@@ -11,6 +12,7 @@ mod input;
 
 pub use assets::Assets;
 pub use camera::Camera;
+pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
 pub use components::{
     AmbientLight, Collider, ColliderShape, Light, LocalTransform, MaterialHandle, MeshHandle,
     Name, Spin, Tag,
