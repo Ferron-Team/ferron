@@ -23,8 +23,6 @@ public readonly struct Color : IEquatable<Color>
         this.a = a;
     }
 
-    // --- presets ------------------------------------------------------------
-
     public static Color white => new(1f, 1f, 1f);
     public static Color black => new(0f, 0f, 0f);
     public static Color red => new(1f, 0f, 0f);
@@ -36,8 +34,6 @@ public readonly struct Color : IEquatable<Color>
     public static Color gray => new(0.5f, 0.5f, 0.5f);
     /// <summary>Fully transparent black.</summary>
     public static Color clear => new(0f, 0f, 0f, 0f);
-
-    // --- construction ----------------------------------------------------------
 
     /// <summary>
     /// Parse a hex color: "RGB", "RRGGBB", or "RRGGBBAA", with or without a
@@ -78,8 +74,6 @@ public readonly struct Color : IEquatable<Color>
             : rgb;
     }
 
-    // --- operations --------------------------------------------------------------
-
     /// <summary>Linear interpolation; <paramref name="t"/> is clamped to [0, 1].</summary>
     public static Color Lerp(Color a, Color b, float t) => LerpUnclamped(a, b, Mathf.Clamp01(t));
 
@@ -91,8 +85,6 @@ public readonly struct Color : IEquatable<Color>
 
     /// <summary>This color with a different alpha.</summary>
     public Color WithAlpha(float alpha) => new(r, g, b, alpha);
-
-    // --- operators ------------------------------------------------------------
 
     public static Color operator +(Color a, Color b) => new(a.r + b.r, a.g + b.g, a.b + b.b, a.a + b.a);
     public static Color operator -(Color a, Color b) => new(a.r - b.r, a.g - b.g, a.b - b.b, a.a - b.a);
@@ -106,12 +98,8 @@ public readonly struct Color : IEquatable<Color>
 
     public static bool operator !=(Color a, Color b) => !(a == b);
 
-    // --- conversions ------------------------------------------------------------
-
     public static explicit operator Vector4(Color c) => new(c.r, c.g, c.b, c.a);
     public static explicit operator Color(Vector4 v) => new(v.x, v.y, v.z, v.w);
-
-    // --- equality and formatting ------------------------------------------------
 
     public bool Equals(Color other) => this == other;
     public override bool Equals(object? obj) => obj is Color other && this == other;

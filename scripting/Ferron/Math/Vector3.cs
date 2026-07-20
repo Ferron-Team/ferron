@@ -29,8 +29,6 @@ public readonly struct Vector3 : IEquatable<Vector3>
 
     public Vector3(float x, float y) : this(x, y, 0f) { }
 
-    // --- presets ------------------------------------------------------------
-
     public static Vector3 zero => new(0f, 0f, 0f);
     public static Vector3 one => new(1f, 1f, 1f);
     public static Vector3 up => new(0f, 1f, 0f);
@@ -40,8 +38,6 @@ public readonly struct Vector3 : IEquatable<Vector3>
     /// <summary>(0, 0, -1): Ferron is right-handed, -Z forward.</summary>
     public static Vector3 forward => new(0f, 0f, -1f);
     public static Vector3 back => new(0f, 0f, 1f);
-
-    // --- properties ----------------------------------------------------------
 
     public float magnitude => MathF.Sqrt(x * x + y * y + z * z);
 
@@ -56,8 +52,6 @@ public readonly struct Vector3 : IEquatable<Vector3>
             return m > Mathf.Epsilon ? this / m : zero;
         }
     }
-
-    // --- static operations ----------------------------------------------------
 
     public static float Dot(Vector3 a, Vector3 b) => a.x * b.x + a.y * b.y + a.z * b.z;
 
@@ -139,8 +133,6 @@ public readonly struct Vector3 : IEquatable<Vector3>
         return vector / MathF.Sqrt(sqr) * maxLength;
     }
 
-    // --- operators ------------------------------------------------------------
-
     public static Vector3 operator +(Vector3 a, Vector3 b) => new(a.x + b.x, a.y + b.y, a.z + b.z);
     public static Vector3 operator -(Vector3 a, Vector3 b) => new(a.x - b.x, a.y - b.y, a.z - b.z);
     public static Vector3 operator -(Vector3 v) => new(-v.x, -v.y, -v.z);
@@ -150,8 +142,6 @@ public readonly struct Vector3 : IEquatable<Vector3>
 
     public static bool operator ==(Vector3 a, Vector3 b) => a.x == b.x && a.y == b.y && a.z == b.z;
     public static bool operator !=(Vector3 a, Vector3 b) => !(a == b);
-
-    // --- equality and formatting ------------------------------------------------
 
     public bool Equals(Vector3 other) => this == other;
     public override bool Equals(object? obj) => obj is Vector3 other && this == other;

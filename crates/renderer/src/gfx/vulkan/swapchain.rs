@@ -43,7 +43,6 @@ impl SwapchainState {
 
         let composite_alpha = caps.supported_composite_alpha.into_iter().next().unwrap();
 
-        // Use the requested present mode if the surface supports it, else vsync.
         let present_mode = device
             .physical_device()
             .surface_present_modes(surface, Default::default())

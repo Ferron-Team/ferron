@@ -131,4 +131,23 @@ fn behaviour_lifecycle() {
         logs.iter().any(|l| l.contains("exception during destroy")),
         "expected contained destroy exception, got {logs:?}"
     );
+
+    // The fault channel. A clean OnUpdate reports no fault; a throwing one is
+    // contained, reports the fault back (so the engine can disable the script),
+    // and logs naming the offending type and hook.
+    let handle = create(&host, probe);
+    host.enable(handle);
+    assert!(!host.update(handle, 0.016), "a clean OnUpdate must not report a fault");
+    ferron_script::destroy_handle(handle);
+    take_logs(); // discard the probe's own hook chatter
+
+    let handle = create(&host, "Ferron.Tests.ThrowingUpdate, Ferron");
+    assert_ne!(handle, 0);
+    assert!(host.update(handle, 0.016), "a throwing OnUpdate must report a fault");
+    let logs = take_logs();
+    assert!(
+        logs.iter().any(|l| l.contains("ThrowingUpdate") && l.contains("OnUpdate")),
+        "expected a fault log naming the script type and hook, got {logs:?}"
+    );
+    ferron_script::destroy_handle(handle);
 }

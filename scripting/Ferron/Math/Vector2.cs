@@ -16,16 +16,12 @@ public readonly struct Vector2 : IEquatable<Vector2>
         this.y = y;
     }
 
-    // --- presets ------------------------------------------------------------
-
     public static Vector2 zero => new(0f, 0f);
     public static Vector2 one => new(1f, 1f);
     public static Vector2 up => new(0f, 1f);
     public static Vector2 down => new(0f, -1f);
     public static Vector2 left => new(-1f, 0f);
     public static Vector2 right => new(1f, 0f);
-
-    // --- properties ----------------------------------------------------------
 
     public float magnitude => MathF.Sqrt(x * x + y * y);
 
@@ -40,8 +36,6 @@ public readonly struct Vector2 : IEquatable<Vector2>
             return m > Mathf.Epsilon ? this / m : zero;
         }
     }
-
-    // --- static operations ----------------------------------------------------
 
     public static float Dot(Vector2 a, Vector2 b) => a.x * b.x + a.y * b.y;
 
@@ -99,8 +93,6 @@ public readonly struct Vector2 : IEquatable<Vector2>
         return vector / MathF.Sqrt(sqr) * maxLength;
     }
 
-    // --- operators ------------------------------------------------------------
-
     public static Vector2 operator +(Vector2 a, Vector2 b) => new(a.x + b.x, a.y + b.y);
     public static Vector2 operator -(Vector2 a, Vector2 b) => new(a.x - b.x, a.y - b.y);
     public static Vector2 operator -(Vector2 v) => new(-v.x, -v.y);
@@ -110,8 +102,6 @@ public readonly struct Vector2 : IEquatable<Vector2>
 
     public static bool operator ==(Vector2 a, Vector2 b) => a.x == b.x && a.y == b.y;
     public static bool operator !=(Vector2 a, Vector2 b) => !(a == b);
-
-    // --- equality and formatting ------------------------------------------------
 
     public bool Equals(Vector2 other) => this == other;
     public override bool Equals(object? obj) => obj is Vector2 other && this == other;

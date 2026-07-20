@@ -15,8 +15,6 @@ public static class Mathf
     public const float Infinity = float.PositiveInfinity;
     public const float NegativeInfinity = float.NegativeInfinity;
 
-    // --- passthroughs ------------------------------------------------------
-
     public static float Abs(float value) => MathF.Abs(value);
     public static float Min(float a, float b) => MathF.Min(a, b);
     public static float Max(float a, float b) => MathF.Max(a, b);
@@ -42,8 +40,6 @@ public static class Mathf
 
     /// <summary>1 for zero or positive values, -1 for negative (Unity convention).</summary>
     public static float Sign(float value) => value >= 0f ? 1f : -1f;
-
-    // --- clamping and interpolation ----------------------------------------
 
     public static float Clamp(float value, float min, float max) =>
         value < min ? min : value > max ? max : value;
@@ -73,8 +69,6 @@ public static class Mathf
         t = t * t * (3f - 2f * t);
         return from + (to - from) * t;
     }
-
-    // --- cyclic helpers ------------------------------------------------------
 
     /// <summary>Wrap <paramref name="t"/> into [0, length) (like mod, but never negative).</summary>
     public static float Repeat(float t, float length) =>

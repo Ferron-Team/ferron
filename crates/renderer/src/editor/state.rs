@@ -1,5 +1,3 @@
-//! Editor selection and the queue of structural edits to apply each frame.
-
 use glam::Vec3;
 
 use ferron_ecs::{Entity, World};
@@ -15,9 +13,9 @@ pub enum SpawnKind {
     DirectionalLight,
 }
 
-/// Spawn/despawn are *requested* by the panels during UI building and applied by
-/// [`apply`](EditorState::apply) afterwards, so we never mutate the entity set
-/// while a panel is iterating it.
+/// Spawn/despawn are *requested* by the panels during UI building and applied
+/// by `apply` afterwards, so we never mutate the entity set while a panel is
+/// iterating it.
 #[derive(Default)]
 pub struct EditorState {
     pub selected: Option<Entity>,
@@ -34,7 +32,6 @@ impl EditorState {
         self.despawn_request = Some(entity);
     }
 
-    /// Apply queued structural edits. Call once, after the UI is built.
     pub fn apply(&mut self, world: &mut World) {
         if let Some(kind) = self.spawn_request.take() {
             if let Some(entity) = spawn(world, kind) {

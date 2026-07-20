@@ -1,6 +1,3 @@
-//! The editor's panels. Each is a self-contained module; add a new one by
-//! writing a `show(...)` fn and calling it from [`draw`].
-
 mod environment;
 mod hierarchy;
 mod inspector;
@@ -12,8 +9,8 @@ use ferron_ecs::World;
 
 use super::state::EditorState;
 
-/// Side/bottom panels only — no `CentralPanel`, so the center stays transparent
-/// and the 3D scene shows through behind the editor.
+// Side/bottom panels only — no `CentralPanel`, so the center stays transparent
+// and the 3D scene shows through behind the editor.
 pub fn draw(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
     hierarchy::show(ctx, world, state);
     inspector::show(ctx, world, state);
@@ -30,7 +27,6 @@ pub(super) fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut Vec3, speed: f32)
     });
 }
 
-/// Edits an RGB `Vec3`; the picker clamps each channel to `[0, 1]`.
 pub(super) fn color_row(ui: &mut egui::Ui, label: &str, c: &mut Vec3) {
     let mut rgb = [c.x, c.y, c.z];
     ui.horizontal(|ui| {

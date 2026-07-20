@@ -1,10 +1,4 @@
-//! In-window editor UI (egui overlay).
-//!
-//! Rendering is decoupled from the renderer: [`Editor::run`] builds the UI
-//! against the [`World`], and [`Editor::draw`] composites it onto the final
-//! swapchain image via the renderer's overlay hook
-//! (`VulkanRenderer::render_with_overlay`). New tools are added as `panels`
-//! modules.
+//! In-window editor UI (egui overlay). New tools are added as `panels` modules.
 
 mod panels;
 mod state;
@@ -31,8 +25,6 @@ pub struct Editor {
 }
 
 impl Editor {
-    /// `format` is the swapchain color format the UI composites onto
-    /// (`VulkanRenderer::color_format`).
     pub fn new(
         event_loop: &ActiveEventLoop,
         surface: Arc<Surface>,
@@ -45,8 +37,7 @@ impl Editor {
             queue,
             format,
             GuiConfig {
-                // Load (don't clear) so the UI draws over the rendered scene; the
-                // swapchain target is sRGB.
+                // Load (don't clear) so the UI draws over the rendered scene.
                 is_overlay: true,
                 allow_srgb_render_target: true,
                 ..Default::default()
@@ -59,14 +50,12 @@ impl Editor {
         }
     }
 
-    /// Returns `true` if egui wants the event (e.g. the pointer is over a panel),
-    /// so the caller can withhold it from game/camera input.
+    /// Returns `true` if egui wants the event, so the caller can withhold it
+    /// from game/camera input.
     pub fn on_window_event(&mut self, event: &WindowEvent) -> bool {
         self.gui.update(event)
     }
 
-    /// Build this frame's UI, then apply any spawn/despawn it requested. Call once
-    /// per frame before [`draw`](Self::draw).
     pub fn run(&mut self, world: &mut World) {
         // Destructure for disjoint borrows: `gui` drives egui while the closure
         // edits `state`/`world`.
@@ -78,8 +67,6 @@ impl Editor {
         state.apply(world);
     }
 
-    /// Renderer overlay hook: composite the built UI onto `image`, waiting on
-    /// `before` (the rendered scene), and return the future to present.
     pub fn draw(
         &mut self,
         before: Box<dyn GpuFuture>,

@@ -22,12 +22,8 @@ public readonly struct Vector4 : IEquatable<Vector4>
 
     public Vector4(Vector3 xyz, float w) : this(xyz.x, xyz.y, xyz.z, w) { }
 
-    // --- presets ------------------------------------------------------------
-
     public static Vector4 zero => new(0f, 0f, 0f, 0f);
     public static Vector4 one => new(1f, 1f, 1f, 1f);
-
-    // --- properties ----------------------------------------------------------
 
     public float magnitude => MathF.Sqrt(x * x + y * y + z * z + w * w);
 
@@ -42,8 +38,6 @@ public readonly struct Vector4 : IEquatable<Vector4>
             return m > Mathf.Epsilon ? this / m : zero;
         }
     }
-
-    // --- static operations ----------------------------------------------------
 
     public static float Dot(Vector4 a, Vector4 b) =>
         a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
@@ -70,8 +64,6 @@ public readonly struct Vector4 : IEquatable<Vector4>
     public static Vector4 Max(Vector4 a, Vector4 b) => new(
         MathF.Max(a.x, b.x), MathF.Max(a.y, b.y), MathF.Max(a.z, b.z), MathF.Max(a.w, b.w));
 
-    // --- operators ------------------------------------------------------------
-
     public static Vector4 operator +(Vector4 a, Vector4 b) =>
         new(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
 
@@ -88,11 +80,7 @@ public readonly struct Vector4 : IEquatable<Vector4>
 
     public static bool operator !=(Vector4 a, Vector4 b) => !(a == b);
 
-    // --- conversions ------------------------------------------------------------
-
     public static explicit operator Vector3(Vector4 v) => new(v.x, v.y, v.z);
-
-    // --- equality and formatting ------------------------------------------------
 
     public bool Equals(Vector4 other) => this == other;
     public override bool Equals(object? obj) => obj is Vector4 other && this == other;

@@ -1,5 +1,3 @@
-//! Performance overlay: FPS, a frame-time graph, and process memory.
-
 use ferron_ecs::World;
 
 use crate::stats::FrameStats;
@@ -32,7 +30,6 @@ pub fn show(ctx: &egui::Context, world: &World) {
                 ui.label(format!("CPU min {min:.2} · max {max:.2} ms"));
             }
 
-            // Process memory, then GPU VRAM (used / total when the driver reports it).
             let rss_mb = stats.memory_bytes() as f64 / (1024.0 * 1024.0);
             ui.label(format!("Memory (RSS): {rss_mb:.1} MB"));
             let total_gb = stats.vram_total() as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -51,9 +48,7 @@ pub fn show(ctx: &egui::Context, world: &World) {
         });
 }
 
-/// Frame-time sparkline drawn directly with the painter (no plot dep): CPU and
-/// GPU lines share one scale. Reference lines mark 60 fps (16.7 ms) and 30 fps
-/// (33.3 ms).
+// Reference lines mark 60 fps (16.7 ms) and 30 fps (33.3 ms).
 fn graph(ui: &mut egui::Ui, stats: &FrameStats, cpu_color: egui::Color32, gpu_color: egui::Color32) {
     let cpu = stats.history();
     let gpu = stats.gpu_history();

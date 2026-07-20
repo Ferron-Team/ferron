@@ -65,7 +65,6 @@ extern "C" fn set_transform(entity: CEntity, value: *const CTransform) -> bool {
     })
 }
 
-// --- input ------------------------------------------------------------------
 // The `InputState` resource is engine-side, so these live here (like the
 // transform functions) and read it through the active-world seam. Outside a
 // dispatch window, or before the resource exists, they report "nothing held".
@@ -110,7 +109,6 @@ extern "C" fn cursor_pos(x: *mut f32, y: *mut f32) {
     }
 }
 
-// --- time ---------------------------------------------------------------------
 // The `Time` resource is engine-side, so these live here (like the input
 // functions) and read it through the active-world seam. Outside a dispatch
 // window, or before the resource exists, they report zero.
@@ -135,7 +133,6 @@ extern "C" fn time_frame_count() -> u64 {
     with_time(|time| time.frame_count())
 }
 
-// --- entity querying -----------------------------------------------------------
 // Read-only world inspection for scripts. These are leaf calls: any RefCell
 // borrow a query takes lives only inside the `with_world` closure and is
 // released before control returns to C#, so no storage borrow is ever held
@@ -344,7 +341,6 @@ extern "C" fn add_script(entity: CEntity, type_name: *const c_char) -> bool {
     })
 }
 
-// --- deferred structural changes ---------------------------------------------
 // Structural edits requested from inside a script dispatch are queued and
 // applied by `apply_commands` once the dispatch window closes. Direct mutation
 // happens to be safe today (the tick holds no borrows while dispatching), but
@@ -538,6 +534,7 @@ impl Scripting {
                     // first tick actually dispatches OnEnable.
                     enabled: true,
                     active: false,
+                    faulted: false,
                 },
             );
         }
@@ -564,16 +561,25 @@ impl Scripting {
             started: bool,
             enabled: bool,
             active: bool,
+            // Set the moment a hook throws this tick, so the later phases
+            // (collision, update) skip a script that faulted during activation.
+            faulted: bool,
         }
 
         let mut pending: Vec<Pending> = Vec::new();
         world.query::<&ScriptComponent>().for_each(|entity, script| {
+            // Already-faulted scripts are inert: never collected, never
+            // dispatched to, until something clears the flag.
+            if script.faulted {
+                return;
+            }
             pending.push(Pending {
                 entity,
                 handle: script.handle,
                 started: script.started,
                 enabled: script.enabled,
                 active: script.active,
+                faulted: false,
             })
         });
         if pending.is_empty() {
@@ -591,15 +597,25 @@ impl Scripting {
         ferron_script::with_active_world(world, || {
             for script in &mut pending {
                 if script.enabled && !script.active {
-                    self.host.enable(script.handle);
+                    // Mirror the managed side, which flips its own `Active`
+                    // before invoking the hook: if OnEnable/OnStart throws, the
+                    // state still advances and we just stop dispatching.
                     script.active = true;
+                    if self.host.enable(script.handle) {
+                        script.faulted = true;
+                        continue;
+                    }
                     if !script.started {
-                        self.host.start(script.handle);
                         script.started = true;
+                        if self.host.start(script.handle) {
+                            script.faulted = true;
+                        }
                     }
                 } else if !script.enabled && script.active {
-                    self.host.disable(script.handle);
                     script.active = false;
+                    if self.host.disable(script.handle) {
+                        script.faulted = true;
+                    }
                 }
             }
 
@@ -609,8 +625,8 @@ impl Scripting {
             for event in &events {
                 for (target, other, flip) in [(event.a, event.b, false), (event.b, event.a, true)] {
                     let Some(script) = pending
-                        .iter()
-                        .find(|script| script.entity == target && script.active)
+                        .iter_mut()
+                        .find(|script| script.entity == target && script.active && !script.faulted)
                     else {
                         continue;
                     };
@@ -620,20 +636,23 @@ impl Scripting {
                         point: event.point.to_array(),
                         normal: normal.to_array(),
                     };
-                    match event.kind {
+                    let faulted = match event.kind {
                         CollisionEventKind::Enter => {
                             self.host.collision_enter(script.handle, &collision)
                         }
                         CollisionEventKind::Exit => {
                             self.host.collision_exit(script.handle, &collision)
                         }
+                    };
+                    if faulted {
+                        script.faulted = true;
                     }
                 }
             }
 
-            for script in &pending {
-                if script.active {
-                    self.host.update(script.handle, delta_time);
+            for script in &mut pending {
+                if script.active && !script.faulted && self.host.update(script.handle, delta_time) {
+                    script.faulted = true;
                 }
             }
         });
@@ -646,6 +665,9 @@ impl Scripting {
             if let Some(mut component) = world.get_mut::<ScriptComponent>(script.entity) {
                 component.active = script.active;
                 component.started = script.started;
+                // Persist a fault raised this tick so every future tick skips
+                // it; a script that threw during OnUpdate does not run again.
+                component.faulted = script.faulted;
             }
         }
     }

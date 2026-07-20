@@ -1,8 +1,3 @@
-//! ECS component types attached to scene entities.
-//!
-//! Each component is a plain data struct stored in a `ferron_ecs::World`.
-//! Systems query these to drive simulation and rendering.
-
 mod collider;
 mod light;
 mod local_transform;

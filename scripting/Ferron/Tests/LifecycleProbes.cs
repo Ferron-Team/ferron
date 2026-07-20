@@ -30,3 +30,12 @@ class ThrowingDestroy : Behaviour
 {
     public override void OnDestroy() => throw new InvalidOperationException("destroy boom");
 }
+
+/// Exercises the fault channel: a throwing OnUpdate must be caught, logged, and
+/// reported back (Update returns a nonzero fault byte) so the engine disables
+/// the script — never an abort, never silent spamming every frame.
+class ThrowingUpdate : Behaviour
+{
+    public override void OnUpdate(float deltaTime) =>
+        throw new InvalidOperationException("update boom");
+}

@@ -1,9 +1,6 @@
-//! A queryable gameplay label attached to an entity.
-
-/// A string label scripts look up via `World.FindByTag` / `FindAllByTag`.
-/// Distinct from [`Name`](super::Name): a `Name` is an editor-facing display
-/// label (unique-ish, human-readable), a `Tag` is gameplay-facing identity —
-/// many entities may share one tag, and lookups match on exact equality.
+/// A gameplay label scripts look up via `World.FindByTag` / `FindAllByTag`.
+/// Unlike [`Name`](super::Name) (an editor display label), many entities may
+/// share one tag, and lookups match on exact equality.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tag(pub String);
 

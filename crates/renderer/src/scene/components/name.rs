@@ -1,7 +1,4 @@
-//! A human-readable label attached to an entity.
-
-/// An optional display name for an entity. Purely for tooling — it doesn't
-/// affect simulation or rendering, so entities without one are unaffected.
+/// A display name for tooling; doesn't affect simulation or rendering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Name(pub String);
 

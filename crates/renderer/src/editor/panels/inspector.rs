@@ -165,11 +165,21 @@ fn script_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
             // Only the desired state is written here; the script tick sees the
             // change next frame and dispatches OnEnable/OnDisable itself.
             ui.checkbox(&mut script.enabled, "Enabled");
-            ui.weak(match (script.active, script.started) {
-                (true, _) => "active",
-                (false, true) => "inactive",
-                (false, false) => "not started",
-            });
+            if script.faulted {
+                // A hook threw and the engine disabled the script (see the log
+                // for the exception). Clearing re-arms it from next tick — the
+                // manual counterpart to "re-enable on hot reload".
+                ui.colored_label(egui::Color32::from_rgb(0xE0, 0x5A, 0x4A), "⚠ faulted");
+                if ui.button("Clear fault").clicked() {
+                    script.faulted = false;
+                }
+            } else {
+                ui.weak(match (script.active, script.started) {
+                    (true, _) => "active",
+                    (false, true) => "inactive",
+                    (false, false) => "not started",
+                });
+            }
         });
 }
 

@@ -1,23 +1,12 @@
-//! Screen-space ambient occlusion settings, stored as a world resource.
-
-/// Tunables for the SSAO passes.
-///
-/// Like [`AmbientLight`](crate::scene::AmbientLight), this is a world-global
-/// stored as a resource rather than on an entity. Insert one with
-/// [`World::insert_resource`](ferron_ecs::World::insert_resource); if absent, the
-/// renderer falls back to these defaults.
 #[derive(Clone, Copy, Debug)]
 pub struct SsaoSettings {
-    /// When false the SSAO passes are skipped entirely and ambient occlusion is
-    /// 1.0 (no darkening) everywhere — the scene renders as if SSAO were absent.
+    /// When false the SSAO passes are skipped and occlusion is 1.0 everywhere.
     pub enabled: bool,
-    /// Hemisphere sample radius in world units. Larger reaches further between
-    /// surfaces, spreading the contact darkening.
+    /// Hemisphere sample radius in world units.
     pub radius: f32,
     /// Depth bias that fights self-occlusion acne on flat surfaces.
     pub bias: f32,
-    /// Contrast applied to the result (`ao = pow(ao, power)`). Higher = darker,
-    /// punchier contact shadows.
+    /// Contrast applied to the result (`ao = pow(ao, power)`).
     pub power: f32,
 }
 

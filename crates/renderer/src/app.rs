@@ -32,7 +32,6 @@ pub struct App {
     camera_controller: CameraController,
     start: Instant,
     last_frame: f32,
-    // Reused each frame so a steady scene does no per-frame allocation.
     render_items: Vec<RenderItem>,
     lighting: SceneLighting,
     #[cfg(feature = "scripting")]
@@ -69,7 +68,6 @@ impl App {
             scripting: None,
         };
 
-        // World-global state lives in resources, not on `App`.
         app.world.insert_resource(Camera::default());
         app.world.insert_resource(Time::new());
         app.world.insert_resource(AmbientLight::default());
@@ -103,10 +101,9 @@ impl ApplicationHandler for App {
         self.camera_controller
             .sync_from(&self.world.resource::<Camera>());
 
-        // Boot C# scripting and attach one entry Behaviour to a fresh entity;
-        // the entry script finds or spawns everything else itself through the
-        // script API. Both the assembly location and the entry type are
-        // overridable (FERRON_SCRIPT_DIR / FERRON_ENTRY).
+        // Attach one entry Behaviour; it finds or spawns everything else itself
+        // through the script API. Assembly and entry type are overridable
+        // (FERRON_SCRIPT_DIR / FERRON_ENTRY).
         #[cfg(feature = "scripting")]
         {
             let scripting = match crate::scripting::Scripting::find_assembly_dir() {
@@ -152,10 +149,9 @@ impl ApplicationHandler for App {
         };
 
         // The editor sees events first; when it doesn't want one, the camera
-        // controller may. Toggling look mode grabs/hides the cursor.
+        // controller and the script-facing InputState may. All three apply the
+        // same egui gate.
         let egui_wants = active.editor.on_window_event(&event);
-        // Scripts poll this resource through the scripting ABI; it applies the
-        // same egui gate as the camera controller.
         self.world
             .resource_mut::<InputState>()
             .on_window_event(&event, egui_wants);
@@ -191,27 +187,23 @@ impl ApplicationHandler for App {
                 self.world.resource_mut::<Time>().update(delta);
                 self.world.resource_mut::<FrameStats>().record(delta);
 
-                // Simulation systems run, then we extract a draw list for the
-                // backend — which never sees the ECS world directly.
                 systems::spin(&self.world, delta);
 
-                // Collision runs after the transform-mutating systems and
-                // before the script tick, so the events scripts receive match
-                // the positions they'll read this frame.
+                // After the transform-mutating systems and before the script
+                // tick, so the events scripts receive match the positions
+                // they'll read this frame.
                 crate::collision::run(&mut self.world);
 
-                // Tick C# scripts (their OnUpdate may edit components this frame).
                 #[cfg(feature = "scripting")]
                 if let Some(scripting) = &self.scripting {
                     scripting.tick(&mut self.world, delta);
                 }
 
-                // Build the editor UI; it may spawn/despawn/edit entities, so it
-                // runs before we extract this frame's draw data.
+                // Before extraction: the UI may spawn/despawn/edit entities.
                 active.editor.run(&mut self.world);
 
-                // Apply this frame's camera input (after the UI, so the editor's
-                // own camera edits are the baseline the controller builds on).
+                // After the UI, so the editor's own camera edits are the
+                // baseline the controller builds on.
                 self.camera_controller
                     .update(&mut self.world.resource_mut::<Camera>(), delta);
 
@@ -221,8 +213,6 @@ impl ApplicationHandler for App {
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
 
-                // Render the scene, then composite the editor onto the final
-                // image before present.
                 let Active {
                     renderer, editor, ..
                 } = active;
@@ -236,16 +226,14 @@ impl ApplicationHandler for App {
                     &mut overlay,
                 );
 
-                // Pull this frame's GPU timing and VRAM from the backend into the
-                // stats resource the overlay reads (one frame of latency is fine).
                 let gpu_ms = renderer.gpu_frame_ms();
                 let (vram_used, vram_total) = renderer.gpu_memory();
                 self.world
                     .resource_mut::<FrameStats>()
                     .set_gpu_stats(gpu_ms, vram_used, vram_total);
 
-                // The frame is over: clear the one-frame pressed/released edges
-                // (scripts have already observed them during the tick above).
+                // Clear the one-frame pressed/released edges now that scripts
+                // have observed them during the tick above.
                 self.world.resource_mut::<InputState>().end_frame();
             }
             _ => {}
@@ -258,8 +246,6 @@ impl ApplicationHandler for App {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        // Raw mouse motion drives look mode; the controller ignores it unless the
-        // right button is held.
         self.camera_controller.process_device_event(&event);
         self.world.resource_mut::<InputState>().on_device_event(&event);
     }

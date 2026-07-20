@@ -1,11 +1,5 @@
-//! A clean, flat dark theme for the editor UI.
-//!
-//! Applied once to the egui [`Context`](egui::Context) at startup. Tweak the
-//! palette constants here to restyle the whole editor.
-
 use egui::{Color32, CornerRadius, Stroke, Visuals};
 
-// Palette — a calm, low-contrast dark grey with a single blue accent.
 const TEXT: Color32 = Color32::from_rgb(214, 218, 224);
 const PANEL: Color32 = Color32::from_rgb(24, 25, 28);
 const WINDOW: Color32 = Color32::from_rgb(30, 31, 35);
@@ -16,8 +10,7 @@ const WIDGET_HOVER: Color32 = Color32::from_rgb(56, 59, 66);
 const OUTLINE: Color32 = Color32::from_rgb(48, 50, 56);
 const ACCENT: Color32 = Color32::from_rgb(80, 140, 255);
 
-/// Apply the dark theme to `ctx`. Set on every theme variant so it sticks
-/// regardless of the OS light/dark preference.
+// Set on every theme variant so it sticks regardless of the OS preference.
 pub fn apply(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         style.visuals = visuals();

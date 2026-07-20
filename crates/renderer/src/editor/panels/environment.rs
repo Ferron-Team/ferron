@@ -1,6 +1,3 @@
-//! Bottom panel: world-global render settings stored as resources (SSAO, HDR,
-//! ambient light, camera).
-
 use ferron_ecs::World;
 
 use super::{color_row, vec3_row};

@@ -92,7 +92,6 @@ impl GpuTimer {
         })
     }
 
-    /// The pool to record this frame's timestamps into.
     fn pool(&self) -> Arc<QueryPool> {
         self.pools[self.write_index].clone()
     }
@@ -124,7 +123,6 @@ impl GpuTimer {
         }
     }
 
-    /// Mark the just-written pool readable and switch pools for next frame.
     fn advance(&mut self) {
         self.written[self.write_index] = true;
         self.write_index ^= 1;
@@ -411,7 +409,6 @@ impl VulkanRenderer {
 
         builder.end_render_pass(Default::default()).unwrap();
 
-        // Tonemap the resolved HDR target into the acquired swapchain image.
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {

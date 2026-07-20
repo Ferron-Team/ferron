@@ -30,8 +30,6 @@ public readonly struct Quaternion : IEquatable<Quaternion>
 
     public static Quaternion identity => new(0f, 0f, 0f, 1f);
 
-    // --- properties ----------------------------------------------------------
-
     public Quaternion normalized
     {
         get
@@ -79,8 +77,6 @@ public readonly struct Quaternion : IEquatable<Quaternion>
                 Mathf.Repeat(roll * Mathf.Rad2Deg, 360f));
         }
     }
-
-    // --- construction ----------------------------------------------------------
 
     /// <summary>Rotation of <paramref name="angleDegrees"/> around <paramref name="axis"/>.</summary>
     public static Quaternion AngleAxis(float angleDegrees, Vector3 axis)
@@ -163,8 +159,6 @@ public readonly struct Quaternion : IEquatable<Quaternion>
         return new Quaternion(cross.x, cross.y, cross.z, 1f + dot).normalized;
     }
 
-    // --- operations --------------------------------------------------------------
-
     public static float Dot(Quaternion a, Quaternion b) =>
         a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 
@@ -242,8 +236,6 @@ public readonly struct Quaternion : IEquatable<Quaternion>
         return SlerpUnclamped(from, to, MathF.Min(1f, maxDegreesDelta / angle));
     }
 
-    // --- operators ------------------------------------------------------------
-
     /// <summary>Compose rotations: the result applies <paramref name="rhs"/> first, then <paramref name="lhs"/>.</summary>
     public static Quaternion operator *(Quaternion lhs, Quaternion rhs) => new(
         lhs.w * rhs.x + lhs.x * rhs.w + lhs.y * rhs.z - lhs.z * rhs.y,
@@ -264,8 +256,6 @@ public readonly struct Quaternion : IEquatable<Quaternion>
         a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
 
     public static bool operator !=(Quaternion a, Quaternion b) => !(a == b);
-
-    // --- helpers ------------------------------------------------------------
 
     /// <summary>Quaternion from an orthonormal right-handed basis (matrix columns).</summary>
     private static Quaternion FromBasis(Vector3 xAxis, Vector3 yAxis, Vector3 zAxis)
@@ -297,8 +287,6 @@ public readonly struct Quaternion : IEquatable<Quaternion>
             return new Quaternion((m02 + m20) / s, (m12 + m21) / s, 0.25f * s, (m10 - m01) / s);
         }
     }
-
-    // --- equality and formatting ------------------------------------------------
 
     public bool Equals(Quaternion other) => this == other;
     public override bool Equals(object? obj) => obj is Quaternion other && this == other;

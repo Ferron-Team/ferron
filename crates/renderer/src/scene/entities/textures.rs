@@ -1,12 +1,5 @@
-//! Texture sources for scene setup: decode encoded image files and synthesize
-//! procedural maps. These produce raw RGBA8 bytes; uploading them to the GPU is
-//! the backend's job (`RenderBackend::load_texture`).
-
 use glam::Vec3;
 
-/// Decode an encoded image (PNG/JPG/…) into row-major RGBA8 + its dimensions,
-/// the form [`RenderBackend::load_texture`](crate::gfx::RenderBackend::load_texture)
-/// expects.
 pub fn load_rgba(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
     let img = image::load_from_memory(bytes)
         .expect("failed to decode texture")
@@ -15,7 +8,6 @@ pub fn load_rgba(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
     (img.into_raw(), width, height)
 }
 
-/// Two-color checkerboard with `checks` cells per axis (a color/albedo map).
 pub fn checkerboard(size: u32, checks: u32, a: [u8; 3], b: [u8; 3]) -> Vec<u8> {
     let cell = (size / checks).max(1);
     let mut data = Vec::with_capacity((size * size * 4) as usize);
@@ -28,7 +20,6 @@ pub fn checkerboard(size: u32, checks: u32, a: [u8; 3], b: [u8; 3]) -> Vec<u8> {
     data
 }
 
-/// Tangent-space normal map of a grid of rounded bumps, encoded as (n*0.5+0.5).
 pub fn bump_normals(size: u32, freq: f32, strength: f32) -> Vec<u8> {
     let mut data = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
@@ -46,8 +37,7 @@ pub fn bump_normals(size: u32, freq: f32, strength: f32) -> Vec<u8> {
     data
 }
 
-/// Metallic-roughness map (glTF convention: G = roughness, B = metallic).
-/// Roughness ramps left→right; metallic alternates in vertical bands.
+// glTF convention: G = roughness, B = metallic.
 pub fn metallic_roughness(size: u32) -> Vec<u8> {
     let band = (size / 8).max(1);
     let mut data = Vec::with_capacity((size * size * 4) as usize);

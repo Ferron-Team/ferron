@@ -32,7 +32,7 @@ use vulkano::shader::EntryPoint;
 use crate::gfx::{RenderItem, Vertex};
 use crate::scene::Camera;
 use super::context::VkContext;
-use super::swapchain::DEPTH_FORMAT; // D32_SFLOAT, reused
+use super::swapchain::DEPTH_FORMAT;
 use super::VulkanRenderer;
 
 const NORMAL_FORMAT: Format = Format::R8G8B8A8_UNORM;
@@ -108,8 +108,6 @@ fn build_noise(ctx: &VkContext) -> Arc<ImageView> {
     super::texture::upload_texture(ctx, &pixels, [NOISE_SIZE, NOISE_SIZE], NORMAL_FORMAT)
 }
 
-// Render Passes
-
 fn prepass_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
     vulkano::single_pass_renderpass!(
         device.clone(),
@@ -130,8 +128,6 @@ fn ao_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
         pass: { color: [ao], depth_stencil: {} },
     ).unwrap()
 }
-
-// Pipelines
 
 fn build_prepass_pipeline(
     device: &Arc<Device>,
@@ -217,8 +213,6 @@ fn build_fullscreen_pipeline(
     ).unwrap()
 }
 
-// Extent-dependant targets
-
 struct SsaoTargets {
     _extent: [u32; 2],
     depth_view: Arc<ImageView>,
@@ -281,8 +275,6 @@ impl SsaoTargets {
     }
 }
 
-// Pass
-
 pub struct SsaoPass {
     prepass_rp: Arc<RenderPass>,
     ssao_rp: Arc<RenderPass>,
@@ -299,7 +291,6 @@ pub struct SsaoPass {
     white_view: Arc<ImageView>,
     kernel: [[f32; 4]; KERNEL_MAX],
     targets: SsaoTargets,
-    // tweakables, driven by the `SsaoSettings` resource each frame.
     pub radius: f32,
     pub bias: f32,
     pub power: f32,
@@ -431,7 +422,6 @@ impl SsaoPass {
             b.set_viewport(0, [viewport.clone()].into_iter().collect()).unwrap();
         };
 
-        // Geometry Prepass
         let frame_set_prepass = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.prepass_pipeline.layout().set_layouts()[0].clone(),
@@ -481,7 +471,6 @@ impl SsaoPass {
         }
         builder.end_render_pass(Default::default()).unwrap();
 
-        // SSAO
         let ssao_uniforms = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.ssao_pipeline.layout().set_layouts()[0].clone(),
@@ -527,7 +516,6 @@ impl SsaoPass {
         unsafe { builder.draw(3, 1, 0, 0).unwrap() };
         builder.end_render_pass(Default::default()).unwrap();
 
-        // Blur
         let blur_input = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.blur_pipeline.layout().set_layouts()[0].clone(),

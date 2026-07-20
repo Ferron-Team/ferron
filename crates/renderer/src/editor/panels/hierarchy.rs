@@ -1,5 +1,3 @@
-//! Left panel: the list of entities, plus the Add/Delete controls.
-
 use ferron_ecs::World;
 
 use crate::editor::state::{EditorState, SpawnKind};
@@ -53,8 +51,6 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
 
             // Snapshot the entity set so we only read the world while listing it.
             let entities: Vec<_> = world.entities().collect();
-            // `auto_shrink(false)` + a justified layout make the list fill the
-            // panel's remaining height and width instead of hugging its content.
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .show(ui, |ui| {
