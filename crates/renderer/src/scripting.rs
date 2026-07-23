@@ -16,8 +16,8 @@ use ferron_script::{CCollision, CEntity, CTransform, FerronApi, ScriptHost};
 
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::{
-    Assets, Collider, ColliderShape, InputState, LocalTransform, MaterialHandle, MeshHandle, Name,
-    ScriptComponent, Tag, Time, Transform,
+    Assets, Collider, ColliderShape, DebugLines, InputState, LocalTransform, LogBuffer, LogLevel,
+    MaterialHandle, MeshHandle, Name, ScriptComponent, Tag, Time, Transform,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -437,6 +437,62 @@ extern "C" fn despawn(entity: CEntity) -> bool {
     })
 }
 
+// Debug logging routes into the engine's `LogBuffer` resource (surfaced by the
+// editor console), stamped with the current frame. Like input/time, the sink is
+// an engine-side resource, so the real impls live here and reach it through the
+// active-world seam. Outside a dispatch window (no active world) the message is
+// dropped — a script can only log while it is ticking.
+fn log_at(level: LogLevel, message: *const c_char) {
+    if message.is_null() {
+        return;
+    }
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    let text = unsafe { CStr::from_ptr(message) }.to_string_lossy().into_owned();
+    ferron_script::with_world((), |world| {
+        let frame = world.get_resource::<Time>().map_or(0, |time| time.frame_count());
+        if let Some(mut log) = world.get_resource_mut::<LogBuffer>() {
+            log.push(level, text, frame);
+        }
+    });
+}
+
+extern "C" fn log_info(message: *const c_char) {
+    log_at(LogLevel::Info, message);
+}
+
+extern "C" fn log_warn(message: *const c_char) {
+    log_at(LogLevel::Warning, message);
+}
+
+extern "C" fn log_error(message: *const c_char) {
+    log_at(LogLevel::Error, message);
+}
+
+// Debug lines are collected into the engine's per-frame `DebugLines` resource;
+// the line pass reads them, and they expire by `duration` (<= 0 = one frame).
+// Editor-only: in export builds C# strips the call and this resource simply
+// isn't fed.
+extern "C" fn debug_draw_line(
+    fx: f32,
+    fy: f32,
+    fz: f32,
+    tx: f32,
+    ty: f32,
+    tz: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+    duration: f32,
+) {
+    ferron_script::with_world((), |world| {
+        let now = world.get_resource::<Time>().map_or(0.0, |time| time.elapsed_time());
+        if let Some(mut lines) = world.get_resource_mut::<DebugLines>() {
+            lines.push(Vec3::new(fx, fy, fz), Vec3::new(tx, ty, tz), [r, g, b, a], now, duration);
+        }
+    });
+}
+
 fn build_api() -> FerronApi {
     FerronApi {
         get_transform,
@@ -460,6 +516,10 @@ fn build_api() -> FerronApi {
         add_sphere_collider,
         set_material,
         add_script,
+        log: log_info,
+        log_warn,
+        log_error,
+        debug_draw_line,
         ..ferron_script::default_api()
     }
 }

@@ -1,3 +1,4 @@
+mod console;
 mod environment;
 mod hierarchy;
 mod inspector;
@@ -16,6 +17,7 @@ pub fn draw(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
     inspector::show(ctx, world, state);
     environment::show(ctx, world);
     performance::show(ctx, world);
+    console::show(ctx, world);
 }
 
 pub(super) fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut Vec3, speed: f32) {

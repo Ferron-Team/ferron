@@ -14,7 +14,10 @@ use crate::editor::Editor;
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::{RenderBackend, RenderItem, SceneLighting};
 use crate::scene::entities::build_default_scene;
-use crate::scene::{AmbientLight, Camera, HdrSettings, InputState, SsaoSettings, Time};
+use crate::scene::{
+    AmbientLight, Camera, DebugLine, DebugLines, HdrSettings, InputState, LogBuffer, SsaoSettings,
+    Time,
+};
 use crate::stats::FrameStats;
 use crate::systems;
 use ferron_ecs::World;
@@ -34,6 +37,9 @@ pub struct App {
     last_frame: f32,
     render_items: Vec<RenderItem>,
     lighting: SceneLighting,
+    /// This frame's debug lines, copied out of the `DebugLines` resource so the
+    /// renderer borrow doesn't overlap the world borrow.
+    debug_lines: Vec<DebugLine>,
     #[cfg(feature = "scripting")]
     scripting: Option<crate::scripting::Scripting>,
 }
@@ -64,6 +70,7 @@ impl App {
             last_frame: 0.0,
             render_items: Vec::new(),
             lighting: SceneLighting::default(),
+            debug_lines: Vec::new(),
             #[cfg(feature = "scripting")]
             scripting: None,
         };
@@ -76,6 +83,8 @@ impl App {
         app.world.insert_resource(FrameStats::new());
         app.world.insert_resource(InputState::new());
         app.world.insert_resource(crate::collision::CollisionState::default());
+        app.world.insert_resource(LogBuffer::default());
+        app.world.insert_resource(DebugLines::default());
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -209,6 +218,11 @@ impl ApplicationHandler for App {
 
                 systems::extract_renderables(&self.world, &mut self.render_items);
                 systems::extract_lighting(&self.world, &mut self.lighting);
+                // Copy this frame's debug lines out (they're Copy) so the render
+                // borrow below doesn't overlap the world borrow.
+                self.debug_lines.clear();
+                self.debug_lines
+                    .extend_from_slice(self.world.resource::<DebugLines>().lines());
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
@@ -223,6 +237,7 @@ impl ApplicationHandler for App {
                     &camera,
                     &ssao,
                     &hdr,
+                    &self.debug_lines,
                     &mut overlay,
                 );
 
@@ -231,6 +246,12 @@ impl ApplicationHandler for App {
                 self.world
                     .resource_mut::<FrameStats>()
                     .set_gpu_stats(gpu_ms, vram_used, vram_total);
+
+                // Expire debug lines now that this frame has drawn them: a
+                // one-frame line (expiry == its spawn time) is dropped, a timed
+                // one survives until its lifetime elapses.
+                let now = self.world.resource::<Time>().elapsed_time();
+                self.world.resource_mut::<DebugLines>().sweep(now);
 
                 // Clear the one-frame pressed/released edges now that scripts
                 // have observed them during the tick above.

@@ -62,6 +62,17 @@ pub struct FerronApi {
     pub add_sphere_collider: extern "C" fn(CEntity, f32, bool) -> bool,
     pub set_material: extern "C" fn(CEntity, *const c_char) -> bool,
     pub add_script: extern "C" fn(CEntity, *const c_char) -> bool,
+    // Developer debug utilities. `log_warn`/`log_error` mirror `log` at higher
+    // severity; the engine routes all three into its editor console. Logging is
+    // always live. `debug_draw_line` records one world-space line into the
+    // engine's per-frame overlay buffer: endpoints, RGBA, then a lifetime in
+    // seconds (<= 0 = a single frame). Editor-only — no-op in export builds.
+    // The line is passed as loose floats to stay blittable-trivial, the same
+    // choice as the collider extents.
+    pub log_warn: extern "C" fn(*const c_char),
+    pub log_error: extern "C" fn(*const c_char),
+    pub debug_draw_line:
+        extern "C" fn(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32),
 }
 
 /// A table with the generic functions wired and the rest stubbed; the engine
@@ -92,7 +103,25 @@ pub fn default_api() -> FerronApi {
         add_sphere_collider: stub_add_sphere_collider,
         set_material: stub_set_material,
         add_script: stub_add_script,
+        log_warn: ferron_log_warn,
+        log_error: ferron_log_error,
+        debug_draw_line: stub_debug_draw_line,
     }
+}
+
+extern "C" fn stub_debug_draw_line(
+    _fx: f32,
+    _fy: f32,
+    _fz: f32,
+    _tx: f32,
+    _ty: f32,
+    _tz: f32,
+    _r: f32,
+    _g: f32,
+    _b: f32,
+    _a: f32,
+    _duration: f32,
+) {
 }
 
 extern "C" fn stub_add_box_collider(
@@ -188,6 +217,28 @@ pub extern "C" fn ferron_log(message: *const c_char) {
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
     let text = unsafe { CStr::from_ptr(message) }.to_string_lossy();
     println!("[c#] {text}");
+}
+
+/// Default warning sink (the engine overrides it to route into the editor
+/// console). Prints to stderr so a script's diagnostics are still visible when
+/// no console is present.
+pub extern "C" fn ferron_log_warn(message: *const c_char) {
+    if message.is_null() {
+        return;
+    }
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    let text = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+    eprintln!("[c# WARN] {text}");
+}
+
+/// Default error sink; see [`ferron_log_warn`].
+pub extern "C" fn ferron_log_error(message: *const c_char) {
+    if message.is_null() {
+        return;
+    }
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    let text = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+    eprintln!("[c# ERROR] {text}");
 }
 
 /// Spawn a new, empty entity and return its handle.

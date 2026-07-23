@@ -12,4 +12,11 @@
     <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
   </PropertyGroup>
 
+  <!-- Debug.DrawLine/DrawRay are [Conditional("FERRON_DEBUG")]. Define the symbol
+       in Debug builds so the calls compile in; leave it undefined in Release
+       (export) builds so the compiler strips the call sites. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <DefineConstants>$(DefineConstants);FERRON_DEBUG</DefineConstants>
+  </PropertyGroup>
+
 </Project>
