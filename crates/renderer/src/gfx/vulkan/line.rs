@@ -1,4 +1,4 @@
-//! Debug-line overlay pass — **scaffold; GPU plumbing left to the owner.**
+//! Debug-line overlay pass.
 //!
 //! Draws the engine's per-frame [`DebugLine`] buffer as GPU line primitives into
 //! the forward (HDR) render pass, right after the scene geometry. Sharing that
@@ -8,20 +8,25 @@
 //! and tonemapped downstream, so a line's on-screen colour drifts from the exact
 //! RGBA the script requested. Drawing post-tonemap would fix the colour but lose
 //! depth occlusion — see the design notes on the issue.
-//!
-//! This module gives the rest of the engine a stable shape to call. The two
-//! methods below compile and run as no-ops today; the `TODO(owner)` steps are
-//! the renderer internals to fill in.
 
 use std::sync::Arc;
 
-use vulkano::buffer::BufferContents;
+use vulkano::buffer::{BufferContents, BufferUsage};
+use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::device::Device;
-use vulkano::memory::allocator::StandardMemoryAllocator;
-use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
-use vulkano::render_pass::RenderPass;
-
+use vulkano::memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::pipeline::graphics::vertex_input::{Vertex as VertexTrait, VertexDefinition};
+use vulkano::pipeline::{DynamicState, GraphicsPipeline, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
+use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
+use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
+use vulkano::pipeline::graphics::multisample::MultisampleState;
+use vulkano::pipeline::graphics::rasterization::RasterizationState;
+use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
+use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+use vulkano::render_pass::{RenderPass, Subpass};
 use crate::scene::{Camera, DebugLine};
 
 /// One endpoint of a debug line: world-space position + RGBA colour. Two of
@@ -36,50 +41,108 @@ pub struct LineVertex {
 }
 
 pub struct LinePass {
-    // TODO(owner): hold the `GraphicsPipeline` here, plus a way to stream this
-    // frame's vertices — either a growable host-visible `Subbuffer<[LineVertex]>`
-    // or a `SubbufferAllocator` (like `ForwardPass`'s uniform allocator).
+    pipeline: Arc<GraphicsPipeline>,
+    subbuffer_allocator: SubbufferAllocator,
 }
 
 impl LinePass {
     /// Build the line pipeline against the forward render pass's subpass 0.
     pub fn new(
-        _device: &Arc<Device>,
-        _memory_allocator: &Arc<StandardMemoryAllocator>,
-        _render_pass: &Arc<RenderPass>,
+        device: &Arc<Device>,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        render_pass: &Arc<RenderPass>,
     ) -> Self {
-        // TODO(owner): build the pipeline, mirroring `forward::build_pipeline`
-        // but with these differences:
-        //   - InputAssemblyState { topology: PrimitiveTopology::LineList, .. }
-        //   - RasterizationState::default() (no back-face cull for lines)
-        //   - DepthStencilState with DepthState { write_enable: false, compare_op:
-        //     CompareOp::Less, .. } — occluded by geometry, but writes no depth
-        //   - MultisampleState with Sample4 (must match the forward subpass)
-        //   - vertex_input_state from `LineVertex::per_vertex().definition(&vs)`
-        //   - a push constant holding the camera view-projection (a `mat4`)
-        //   - subpass 0 of `render_pass`
-        //   - shaders `shaders/line.vert` / `shaders/line.frag` via the
-        //     `vulkano_shaders::shader!` macro (see `forward`'s `vs`/`fs` mods)
-        Self {}
+        let vs = vs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let fs = fs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+
+        let vertex_input_state = LineVertex::per_vertex().definition(&vs).unwrap();
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ];
+
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap(),
+        )
+            .unwrap();
+
+        let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
+
+        let subbuffer_allocator = SubbufferAllocator::new(
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::VERTEX_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
+
+        let pipeline = GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState  {
+                    topology: PrimitiveTopology::LineList,
+                    ..Default::default()
+                }),
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState {
+                    rasterization_samples: vulkano::image::SampleCount::Sample4,
+                    ..Default::default()
+                }),
+                depth_stencil_state: Some(DepthStencilState {
+                    depth: Some(DepthState {
+                        write_enable: false,
+                        compare_op: CompareOp::Less,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    subpass.num_color_attachments(),
+                    ColorBlendAttachmentState::default(),
+                )),
+                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                subpass: Some(subpass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )
+            .unwrap();
+
+        Self {
+            pipeline,
+            subbuffer_allocator,
+        }
     }
 
     /// Record this frame's lines into `builder`. Must be called *inside* the
-    /// forward render pass, after the scene geometry. No-op until the pipeline is
-    /// implemented.
+    /// forward render pass, after the scene geometry.
     pub fn record(
         &mut self,
-        _builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         lines: &[DebugLine],
-        _camera: &Camera,
-        _extent: [u32; 2],
+        camera: &Camera,
+        extent: [u32; 2],
     ) {
         if lines.is_empty() {
             return;
         }
 
-        // Flatten each segment into its two endpoints. This CPU-side massaging is
-        // the non-renderer half of the work, so it's done here; the GPU upload
-        // and draw are the parts to implement.
+        // Flatten each segment into its two endpoints for `LineList` topology.
         let mut vertices: Vec<LineVertex> = Vec::with_capacity(lines.len() * 2);
         for line in lines {
             vertices.push(LineVertex {
@@ -92,15 +155,54 @@ impl LinePass {
             });
         }
 
-        let _ = vertices; // TODO(owner): remove once the buffer below consumes it.
+        let buffer = self
+            .subbuffer_allocator
+            .allocate_slice::<LineVertex>(vertices.len() as u64)
+            .unwrap();
+        buffer.write().unwrap().copy_from_slice(&vertices);
 
-        // TODO(owner):
-        //   1. Upload `vertices` into a host-visible vertex buffer (reuse/grow it
-        //      across frames rather than allocating each frame).
-        //   2. `set_viewport` for `extent`, `bind_pipeline_graphics`, and
-        //      `push_constants` with `camera.view_projection(aspect)` where
-        //      `aspect = extent[0] as f32 / extent[1] as f32`.
-        //   3. `bind_vertex_buffers(0, buffer)` then
-        //      `draw(vertices.len() as u32, 1, 0, 0)`.
+        let aspect = extent[0] as f32 / extent[1] as f32;
+        let view_proj = camera.view_projection(aspect).to_cols_array_2d();
+
+        builder
+            .set_viewport(
+                0,
+                [Viewport {
+                    offset: [0.0, 0.0],
+                    extent: [extent[0] as f32, extent[1] as f32],
+                    depth_range: 0.0..=1.0,
+                }]
+                    .into_iter()
+                    .collect(),
+            )
+            .unwrap()
+            .bind_pipeline_graphics(self.pipeline.clone())
+            .unwrap()
+            .push_constants(self.pipeline.layout().clone(), 0, view_proj)
+            .unwrap()
+            .bind_vertex_buffers(0, buffer)
+            .unwrap();
+
+        let vertex_count = vertices.len() as u32;
+
+        // SAFETY: the bound pipeline and vertex buffer cover [0, vertex_count); no
+        // index buffer or instancing is used.
+        unsafe {
+            builder.draw(vertex_count, 1, 0, 0).unwrap();
+        }
+    }
+}
+
+mod vs {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        path: "shaders/line.vert",
+    }
+}
+
+mod fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "shaders/line.frag",
     }
 }
