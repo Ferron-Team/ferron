@@ -38,17 +38,29 @@ pub struct GpuMesh {
     pub index_count: u32,
 }
 
-/// Per-draw data. Stays in push constants because it changes for every object.
+/// Per-draw push constants. Only the small, per-draw-varying values live here;
+/// the fat per-object matrices moved to the set-4 storage buffer so this range
+/// stays under the 128-byte guaranteed `maxPushConstantsSize` (it was 196).
 #[derive(vulkano::buffer::BufferContents, Clone, Copy)]
 #[repr(C)]
 struct PushConstants {
     mvp: [[f32; 4]; 4],
+    material_index: u32,
+    /// Row into the set-4 object buffer holding this draw's model/normal matrix.
+    object_index: u32,
+}
+
+/// Per-object transforms, indexed by [`PushConstants::object_index`] from a
+/// storage buffer (set 4). std430 matches this `#[repr(C)]` layout exactly
+/// because every field is a 64-byte `mat4` (a multiple of 16).
+#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[repr(C)]
+struct GpuObject {
     model: [[f32; 4]; 4],
     /// Inverse-transpose of `model`'s rotation/scale, for transforming normals
     /// correctly under non-uniform scaling. Stored as a mat4; only the upper-left
     /// 3x3 is used in the shader.
     normal_matrix: [[f32; 4]; 4],
-    material_index: u32,
 }
 
 /// Default texture indices, matching the order `VulkanRenderer::new` seeds them.
@@ -155,6 +167,8 @@ pub struct ForwardPass {
     pub render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
     uniform_buffer_allocator: SubbufferAllocator,
+    /// Per-frame streaming allocator for the set-4 per-object transform buffer.
+    object_buffer_allocator: SubbufferAllocator,
     sampler: Arc<Sampler>,
     ao_sampler: Arc<Sampler>,
 }
@@ -207,7 +221,17 @@ impl ForwardPass {
                 ..Default::default()
             },
         );
-        
+
+        let object_buffer_allocator = SubbufferAllocator::new(
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::STORAGE_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
+
         let sampler = Sampler::new(
             device.clone(),
             SamplerCreateInfo::simple_repeat_linear_no_mipmap(),
@@ -226,6 +250,7 @@ impl ForwardPass {
             render_pass,
             pipeline,
             uniform_buffer_allocator,
+            object_buffer_allocator,
             sampler,
             ao_sampler
         }
@@ -321,7 +346,40 @@ impl ForwardPass {
             [WriteDescriptorSet::image_view_sampler(0, ao_view, self.ao_sampler.clone())],
             [],
         ).unwrap();
-        
+
+        // Per-object transforms for this frame, one entry per item so the loop's
+        // `object_index` is just the `items` index. Built for every item, even
+        // ones whose mesh is missing and get skipped below, to keep that mapping
+        // trivial.
+        let objects: Vec<GpuObject> = items
+            .iter()
+            .map(|item| {
+                let model = item.model;
+                // Inverse-transpose so normals stay perpendicular under non-uniform scale.
+                let normal_matrix =
+                    Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose());
+                GpuObject {
+                    model: model.to_cols_array_2d(),
+                    normal_matrix: normal_matrix.to_cols_array_2d(),
+                }
+            })
+            .collect();
+        // allocate_slice rejects length 0; an empty scene still needs a bindable
+        // buffer, so round up to one (unwritten, unread) slot.
+        let object_buffer = self
+            .object_buffer_allocator
+            .allocate_slice::<GpuObject>(objects.len().max(1) as u64)
+            .unwrap();
+        object_buffer.write().unwrap()[..objects.len()].copy_from_slice(&objects);
+
+        let object_set = DescriptorSet::new(
+            renderer.ctx.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[4].clone(),
+            [WriteDescriptorSet::buffer(0, object_buffer)],
+            [],
+        )
+        .unwrap();
+
         builder
             .set_viewport(
                 0,
@@ -340,24 +398,18 @@ impl ForwardPass {
                 PipelineBindPoint::Graphics,
                 self.pipeline.layout().clone(),
                 0,
-                vec![lighting_set, material_set, texture_set, ao_set],
+                vec![lighting_set, material_set, texture_set, ao_set, object_set],
             )
             .unwrap();
 
-        for item in items {
+        for (object_index, item) in items.iter().enumerate() {
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
-            let model = item.model;
-            let material_index = item.material.0;
-            // Normals transform by the inverse-transpose so they stay perpendicular
-            // to surfaces under non-uniform scaling.
-            let normal_matrix = Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose());
             let push = PushConstants {
-                mvp: (view_proj * model).to_cols_array_2d(),
-                model: model.to_cols_array_2d(),
-                normal_matrix: normal_matrix.to_cols_array_2d(),
-                material_index,
+                mvp: (view_proj * item.model).to_cols_array_2d(),
+                material_index: item.material.0,
+                object_index: object_index as u32,
             };
 
             builder
