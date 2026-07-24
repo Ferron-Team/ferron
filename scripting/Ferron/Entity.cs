@@ -4,7 +4,7 @@ namespace Ferron;
 
 // Layout must match Rust CEntity.
 [StructLayout(LayoutKind.Sequential)]
-public readonly struct Entity
+public readonly struct Entity : IEquatable<Entity>
 {
     public readonly uint Index;
     public readonly uint Generation;
@@ -46,6 +46,21 @@ public readonly struct Entity
             return Native.GetTag(this) is { } tag ? (T)(object)new Tag(tag) : null;
         throw new ArgumentException($"{typeof(T).Name} is not a script-visible engine component");
     }
+
+    /// Handle equality: same index and generation. Two handles being equal means
+    /// they name the same spawn of the same entity — a despawn-and-respawn at the
+    /// same index bumps the generation, so a stale handle won't compare equal to
+    /// the new occupant.
+    public static bool operator ==(Entity a, Entity b) =>
+        a.Index == b.Index && a.Generation == b.Generation;
+
+    public static bool operator !=(Entity a, Entity b) => !(a == b);
+
+    public bool Equals(Entity other) => this == other;
+
+    public override bool Equals(object? obj) => obj is Entity other && this == other;
+
+    public override int GetHashCode() => HashCode.Combine(Index, Generation);
 
     public override string ToString() => $"Entity({Index}v{Generation})";
 }
