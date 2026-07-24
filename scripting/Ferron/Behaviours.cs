@@ -27,8 +27,13 @@ public static unsafe class Behaviours
     const byte Ok = 0;
     const byte Faulted = 1;
 
-    static Behaviour? Resolve(nint handle) =>
-        handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour ? behaviour : null;
+    // The handle is a GCHandle passed across the ABI as a fixed-width ulong, to
+    // match Rust's `u64` fn-pointer signatures exactly. Using `nint` here would
+    // silently disagree with Rust by 4 bytes on any 32-bit target; ulong is the
+    // same 8 bytes on every platform. It's converted back to `nint` only at the
+    // GCHandle calls, which take a pointer-sized value.
+    static Behaviour? Resolve(ulong handle) =>
+        handle != 0 && GCHandle.FromIntPtr((nint)handle).Target is Behaviour behaviour ? behaviour : null;
 
     /// Log a contained script exception with the script's type, the hook that
     /// threw, and the exception (type + message + stack trace), then report the
@@ -42,7 +47,7 @@ public static unsafe class Behaviours
     }
 
     [UnmanagedCallersOnly]
-    public static nint Create(Entity entity, byte* typeName)
+    public static ulong Create(Entity entity, byte* typeName)
     {
         var name = Marshal.PtrToStringUTF8((nint)typeName);
         if (name is null)
@@ -55,7 +60,7 @@ public static unsafe class Behaviours
                 return 0;
 
             behaviour.Entity = entity;
-            return GCHandle.ToIntPtr(GCHandle.Alloc(behaviour));
+            return (ulong)GCHandle.ToIntPtr(GCHandle.Alloc(behaviour));
         }
         catch (Exception e)
         {
@@ -67,7 +72,7 @@ public static unsafe class Behaviours
     }
 
     [UnmanagedCallersOnly]
-    public static byte Start(nint handle)
+    public static byte Start(ulong handle)
     {
         if (Resolve(handle) is not { } behaviour)
             return Ok;
@@ -83,7 +88,7 @@ public static unsafe class Behaviours
     }
 
     [UnmanagedCallersOnly]
-    public static byte Update(nint handle, float deltaTime)
+    public static byte Update(ulong handle, float deltaTime)
     {
         if (Resolve(handle) is not { } behaviour)
             return Ok;
@@ -99,7 +104,7 @@ public static unsafe class Behaviours
     }
 
     [UnmanagedCallersOnly]
-    public static byte Enable(nint handle)
+    public static byte Enable(ulong handle)
     {
         if (Resolve(handle) is not { } behaviour)
             return Ok;
@@ -119,7 +124,7 @@ public static unsafe class Behaviours
     }
 
     [UnmanagedCallersOnly]
-    public static byte Disable(nint handle)
+    public static byte Disable(ulong handle)
     {
         if (Resolve(handle) is not { } behaviour)
             return Ok;
@@ -139,7 +144,7 @@ public static unsafe class Behaviours
     }
 
     [UnmanagedCallersOnly]
-    public static byte CollisionEnter(nint handle, Collision* collision)
+    public static byte CollisionEnter(ulong handle, Collision* collision)
     {
         if (Resolve(handle) is not { } behaviour)
             return Ok;
@@ -155,7 +160,7 @@ public static unsafe class Behaviours
     }
 
     [UnmanagedCallersOnly]
-    public static byte CollisionExit(nint handle, Collision* collision)
+    public static byte CollisionExit(ulong handle, Collision* collision)
     {
         if (Resolve(handle) is not { } behaviour)
             return Ok;
@@ -173,9 +178,9 @@ public static unsafe class Behaviours
     /// Tears the behaviour down and frees its GCHandle. This is the single
     /// managed release point: Rust's `ScriptComponent::drop` lands here.
     [UnmanagedCallersOnly]
-    public static void Destroy(nint handle)
+    public static void Destroy(ulong handle)
     {
-        if (handle != 0 && GCHandle.FromIntPtr(handle).Target is Behaviour behaviour)
+        if (handle != 0 && GCHandle.FromIntPtr((nint)handle).Target is Behaviour behaviour)
         {
             try
             {
@@ -192,7 +197,7 @@ public static unsafe class Behaviours
             }
             finally
             {
-                GCHandle.FromIntPtr(handle).Free();
+                GCHandle.FromIntPtr((nint)handle).Free();
             }
         }
     }
