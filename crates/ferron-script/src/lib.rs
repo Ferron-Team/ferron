@@ -406,7 +406,7 @@ impl ScriptHost {
         ) = {
             let loader = context.get_delegate_loader_for_assembly(pdcstr!("Ferron.dll"))?;
             (
-                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const FerronApi) -> i32>(
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const FerronApi, i32) -> i32>(
                     pdcstr!("Ferron.Bootstrap, Ferron"),
                     pdcstr!("Init"),
                 )?,
@@ -448,9 +448,17 @@ impl ScriptHost {
             )
         };
 
-        let status = init(api);
+        // Hand C# the byte size of our FerronApi as an ABI handshake: it refuses
+        // to initialize if its own struct is a different size (a stale-rebuild
+        // mismatch), turning silent UB into a clean startup error.
+        let status = init(api, std::mem::size_of::<FerronApi>() as i32);
         if status != 0 {
-            return Err(format!("Ferron.Bootstrap.Init returned {status}").into());
+            return Err(format!(
+                "Ferron.Bootstrap.Init rejected initialization (status {status}); the \
+                 Ferron assembly is out of sync with the engine ABI — rebuild \
+                 scripting/Ferron"
+            )
+            .into());
         }
         set_destroy_handle(destroy);
 
