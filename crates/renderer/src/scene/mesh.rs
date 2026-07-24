@@ -123,8 +123,8 @@ impl CpuMesh {
         let mut indices = Vec::with_capacity((sectors * stacks * 6) as usize);
         for i in 0..stacks {
             for j in 0..sectors {
-                let k1 = i * stride + j; // current stack, this sector
-                let k2 = k1 + stride; // next stack down
+                let k1 = i * stride + j;
+                let k2 = k1 + stride;
                 // Skip the degenerate triangle that collapses onto each pole.
                 if i != 0 {
                     indices.extend_from_slice(&[k1, k1 + 1, k2 + 1]);

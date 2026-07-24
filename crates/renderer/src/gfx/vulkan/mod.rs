@@ -213,7 +213,7 @@ impl RenderBackend for VulkanRenderer {
     fn load_material(&mut self, material: &Material) -> MaterialHandle {
         let handle = MaterialHandle(self.materials.len() as u32);
         self.materials.push(forward::to_gpu_material(material));
-        self.material_set = None; // invalidate cache
+        self.material_set = None;
         handle
     }
 
@@ -234,7 +234,7 @@ impl RenderBackend for VulkanRenderer {
         let view = texture::upload_texture(&self.ctx, pixels, [width, height], format);
         let handle = TextureHandle(self.textures.len() as u32);
         self.textures.push(view);
-        self.texture_set = None; // invalidate cache
+        self.texture_set = None;
         handle
     }
 

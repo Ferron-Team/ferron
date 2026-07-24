@@ -158,7 +158,7 @@ fn build_prepass_pipeline(
                 cull_mode: CullMode::Back,
                 ..Default::default()
             }),
-            multisample_state: Some(MultisampleState::default()), // 1 sample
+            multisample_state: Some(MultisampleState::default()),
             depth_stencil_state: Some(DepthStencilState {
                 depth: Some(DepthState::simple()),
                 ..Default::default()
@@ -196,7 +196,7 @@ fn build_fullscreen_pipeline(
         None,
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
-            vertex_input_state: Some(VertexInputState::default()), // empty
+            vertex_input_state: Some(VertexInputState::default()),
             input_assembly_state: Some(InputAssemblyState::default()),
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState::default()),

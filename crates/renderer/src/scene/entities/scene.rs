@@ -151,8 +151,8 @@ fn load_assets(backend: &mut impl RenderBackend) -> Assets {
         "textured",
         backend.load_material(&Material {
             base_color: Vec3::ONE,
-            metallic: 1.0,  // scaled by the metallic-roughness map
-            roughness: 1.0, // scaled by the metallic-roughness map
+            metallic: 1.0,
+            roughness: 1.0, // both scaled by the metallic-roughness map
             albedo_texture: Some(albedo),
             normal_texture: Some(normal),
             metallic_roughness_texture: Some(metal_rough),
