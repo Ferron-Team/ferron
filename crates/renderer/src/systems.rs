@@ -14,18 +14,12 @@ pub fn spin(world: &World, dt: f32) {
 pub fn extract_renderables(world: &World, out: &mut Vec<RenderItem>) {
     out.clear();
     world
-        .query::<(&LocalTransform, &MeshHandle)>()
-        .for_each(|entity, (transform, mesh)| {
-            // Distinct component type → distinct storage, so this borrow doesn't
-            // clash with the query's borrows.
-            let material = world
-                .get::<MaterialHandle>(entity)
-                .map(|m| *m)
-                .unwrap_or(MaterialHandle(0));
+        .query::<(&LocalTransform, &MeshHandle, Option<&MaterialHandle>)>()
+        .for_each(|_entity, (transform, mesh, material)| {
             out.push(RenderItem {
                 model: transform.matrix(),
                 mesh: *mesh,
-                material,
+                material: material.copied().unwrap_or(MaterialHandle(0)),
             });
         });
 }

@@ -331,11 +331,13 @@ impl World {
             .ok()
     }
 
-    /// Iterate over every entity that has all the components in `Q`.
+    /// Iterate over every entity that has all the required components in `Q`.
     ///
     /// `Q` is a reference or a tuple of references, e.g. `&Position` or
-    /// `(&mut Position, &Velocity)`. Call [`for_each`](QueryRunner::for_each) on
-    /// the returned runner.
+    /// `(&mut Position, &Velocity)`. Wrapping a parameter in `Option` makes it
+    /// optional: `(&Position, Option<&Health>)` matches every entity with a
+    /// `Position` and yields `None` where `Health` is absent. Call
+    /// [`for_each`](QueryRunner::for_each) on the returned runner.
     pub fn query<Q: QueryParam>(&self) -> QueryRunner<'_, Q> {
         QueryRunner {
             world: self,
@@ -427,24 +429,35 @@ impl<'w> EntityBuilder<'w> {
 
 /// A component access pattern that a [`World::query`] can iterate.
 ///
-/// Implemented for `&T` (read), `&mut T` (write), and tuples of those, so a
-/// query like `(&mut Position, &Velocity)` matches entities that have both.
+/// Implemented for `&T` (read), `&mut T` (write), `Option<&T>` /
+/// `Option<&mut T>` (optional access that never filters the entity out), and
+/// tuples of those. `(&mut Position, &Velocity, Option<&Frozen>)` matches
+/// entities that have `Position` and `Velocity`, yielding `Some(&Frozen)` only
+/// where it is present.
 pub trait QueryParam {
     /// Borrowed handle(s) to the backing storage for the duration of one query.
     type Fetch<'w>;
     /// What a single matched entity yields, e.g. `&T` or `(&mut A, &B)`.
     type Item<'a>;
 
-    /// Borrow the storage this query needs, or `None` if it isn't present.
+    /// Borrow the storage this query needs, or `None` if the query can never
+    /// match (a required component whose storage doesn't exist). Optional
+    /// parameters always succeed and carry an absent storage as `None` inside
+    /// their `Fetch`.
     fn init(world: &World) -> Option<Self::Fetch<'_>>;
 
-    /// Number of candidate entities to scan (driven by the first parameter).
-    fn len(fetch: &Self::Fetch<'_>) -> usize;
+    /// Number of candidate entities to scan, or `None` if this parameter
+    /// cannot drive iteration. Optional parameters match every entity, so they
+    /// have no candidate list of their own; tuples delegate to the first
+    /// parameter that can drive.
+    fn driver_len(fetch: &Self::Fetch<'_>) -> Option<usize>;
 
-    /// The entity at candidate position `i`.
-    fn entity_at(fetch: &Self::Fetch<'_>, i: usize) -> Entity;
+    /// The entity at candidate position `i`, resolved by the same parameter
+    /// that answered [`driver_len`](QueryParam::driver_len).
+    fn driver_entity_at(fetch: &Self::Fetch<'_>, i: usize) -> Option<Entity>;
 
-    /// Fetch the item for `entity`, or `None` if it lacks one of the components.
+    /// Fetch the item for `entity`, or `None` if it lacks one of the required
+    /// components.
     fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>>;
 }
 
@@ -461,16 +474,58 @@ impl<T: 'static> QueryParam for &T {
         }))
     }
 
-    fn len(fetch: &Self::Fetch<'_>) -> usize {
-        fetch.dense_entities.len()
+    fn driver_len(fetch: &Self::Fetch<'_>) -> Option<usize> {
+        Some(fetch.dense_entities.len())
     }
 
-    fn entity_at(fetch: &Self::Fetch<'_>, i: usize) -> Entity {
-        fetch.dense_entities[i]
+    fn driver_entity_at(fetch: &Self::Fetch<'_>, i: usize) -> Option<Entity> {
+        Some(fetch.dense_entities[i])
     }
 
     fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>> {
         fetch.get(entity)
+    }
+}
+
+impl<T: 'static> QueryParam for Option<&T> {
+    type Fetch<'w> = Option<Ref<'w, SparseSet<T>>>;
+    type Item<'a> = Option<&'a T>;
+
+    fn init(world: &World) -> Option<Self::Fetch<'_>> {
+        Some(<&T as QueryParam>::init(world))
+    }
+
+    fn driver_len(_fetch: &Self::Fetch<'_>) -> Option<usize> {
+        None
+    }
+
+    fn driver_entity_at(_fetch: &Self::Fetch<'_>, _i: usize) -> Option<Entity> {
+        None
+    }
+
+    fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>> {
+        Some(fetch.as_ref().and_then(|set| set.get(entity)))
+    }
+}
+
+impl<T: 'static> QueryParam for Option<&mut T> {
+    type Fetch<'w> = Option<RefMut<'w, SparseSet<T>>>;
+    type Item<'a> = Option<&'a mut T>;
+
+    fn init(world: &World) -> Option<Self::Fetch<'_>> {
+        Some(<&mut T as QueryParam>::init(world))
+    }
+
+    fn driver_len(_fetch: &Self::Fetch<'_>) -> Option<usize> {
+        None
+    }
+
+    fn driver_entity_at(_fetch: &Self::Fetch<'_>, _i: usize) -> Option<Entity> {
+        None
+    }
+
+    fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>> {
+        Some(fetch.as_mut().and_then(|set| set.get_mut(entity)))
     }
 }
 
@@ -487,12 +542,12 @@ impl<T: 'static> QueryParam for &mut T {
         }))
     }
 
-    fn len(fetch: &Self::Fetch<'_>) -> usize {
-        fetch.dense_entities.len()
+    fn driver_len(fetch: &Self::Fetch<'_>) -> Option<usize> {
+        Some(fetch.dense_entities.len())
     }
 
-    fn entity_at(fetch: &Self::Fetch<'_>, i: usize) -> Entity {
-        fetch.dense_entities[i]
+    fn driver_entity_at(fetch: &Self::Fetch<'_>, i: usize) -> Option<Entity> {
+        Some(fetch.dense_entities[i])
     }
 
     fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>> {
@@ -510,12 +565,17 @@ macro_rules! impl_query_for_tuple {
                 Some(($first::init(world)?, $($name::init(world)?,)*))
             }
 
-            fn len(fetch: &Self::Fetch<'_>) -> usize {
-                $first::len(&fetch.$first_idx)
+            // The first parameter able to drive wins. Both chains must probe
+            // in the same order so `driver_entity_at` answers from the same
+            // parameter as `driver_len`.
+            fn driver_len(fetch: &Self::Fetch<'_>) -> Option<usize> {
+                $first::driver_len(&fetch.$first_idx)
+                    $(.or_else(|| $name::driver_len(&fetch.$idx)))*
             }
 
-            fn entity_at(fetch: &Self::Fetch<'_>, i: usize) -> Entity {
-                $first::entity_at(&fetch.$first_idx, i)
+            fn driver_entity_at(fetch: &Self::Fetch<'_>, i: usize) -> Option<Entity> {
+                $first::driver_entity_at(&fetch.$first_idx, i)
+                    $(.or_else(|| $name::driver_entity_at(&fetch.$idx, i)))*
             }
 
             fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>> {
@@ -541,36 +601,60 @@ pub struct QueryRunner<'w, Q> {
 }
 
 impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
+    /// Visit every match in order; stops early and returns the entity for
+    /// which `visit` returns `true`.
+    ///
+    /// A query with a driving parameter scans that parameter's dense list. A
+    /// query of only optional parameters has no driver and matches every live
+    /// entity, so it falls back to walking the allocator.
+    fn visit<F>(&self, mut visit: F) -> Option<Entity>
+    where
+        F: FnMut(Entity, Q::Item<'_>) -> bool,
+    {
+        let mut fetch = Q::init(self.world)?;
+        match Q::driver_len(&fetch) {
+            Some(count) => {
+                for i in 0..count {
+                    let entity = Q::driver_entity_at(&fetch, i)
+                        .expect("query driver lost between driver_len and driver_entity_at");
+                    if let Some(item) = Q::get(&mut fetch, entity) {
+                        if visit(entity, item) {
+                            return Some(entity);
+                        }
+                    }
+                }
+            }
+            None => {
+                for entity in self.world.entities.iter_alive() {
+                    if let Some(item) = Q::get(&mut fetch, entity) {
+                        if visit(entity, item) {
+                            return Some(entity);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Call `f` once for every entity that matches the query `Q`.
     pub fn for_each<F>(&self, mut f: F)
     where
         F: FnMut(Entity, Q::Item<'_>),
     {
-        let Some(mut fetch) = Q::init(self.world) else {
-            return;
-        };
-        let count = Q::len(&fetch);
-        for i in 0..count {
-            let entity = Q::entity_at(&fetch, i);
-            if let Some(item) = Q::get(&mut fetch, entity) {
-                f(entity, item);
-            }
-        }
+        self.visit(|entity, item| {
+            f(entity, item);
+            false
+        });
     }
 
     /// Count how many entities match the query, without invoking a callback.
     pub fn count(&self) -> usize {
-        let Some(mut fetch) = Q::init(self.world) else {
-            return 0;
-        };
-        let total = Q::len(&fetch);
         let mut matched = 0;
-        for i in 0..total {
-            let entity = Q::entity_at(&fetch, i);
-            if Q::get(&mut fetch, entity).is_some() {
-                matched += 1;
-            }
-        }
+        self.visit(|_, _| {
+            matched += 1;
+            false
+        });
         matched
     }
 
@@ -579,17 +663,7 @@ impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
     where
         F: FnMut(Entity, Q::Item<'_>) -> bool,
     {
-        let mut fetch = Q::init(self.world)?;
-        let total = Q::len(&fetch);
-        for i in 0..total {
-            let entity = Q::entity_at(&fetch, i);
-            if let Some(item) = Q::get(&mut fetch, entity) {
-                if pred(entity, item) {
-                    return Some(entity);
-                }
-            }
-        }
-        None
+        self.visit(&mut pred)
     }
 }
 
@@ -717,6 +791,99 @@ mod tests {
         });
         assert!(found.is_some());
         assert_eq!(visited, 1);
+    }
+
+    #[test]
+    fn optional_param_does_not_filter() {
+        let mut world = World::new();
+        let armored = world.spawn();
+        world.insert(armored, Position { x: 1.0, y: 0.0 });
+        world.insert(armored, Health(50));
+        let bare = world.spawn();
+        world.insert(bare, Position { x: 2.0, y: 0.0 });
+
+        // Both entities match; only `armored` yields Some for the optional part.
+        let mut seen = Vec::new();
+        world
+            .query::<(&Position, Option<&Health>)>()
+            .for_each(|e, (_pos, health)| seen.push((e, health.map(|h| h.0))));
+        seen.sort_by_key(|(e, _)| e.index());
+        assert_eq!(seen, vec![(armored, Some(50)), (bare, None)]);
+        assert_eq!(world.query::<(&Position, Option<&Health>)>().count(), 2);
+    }
+
+    #[test]
+    fn optional_param_with_absent_storage() {
+        let mut world = World::new();
+        let e = world.spawn();
+        world.insert(e, Position { x: 0.0, y: 0.0 });
+
+        // No Velocity storage exists at all; the optional param must not kill
+        // the query the way a required param would.
+        let mut visited = Vec::new();
+        world
+            .query::<(&Position, Option<&Velocity>)>()
+            .for_each(|entity, (_pos, vel)| {
+                assert!(vel.is_none());
+                visited.push(entity);
+            });
+        assert_eq!(visited, vec![e]);
+    }
+
+    #[test]
+    fn optional_param_can_lead_a_tuple() {
+        let mut world = World::new();
+        let a = world.spawn();
+        world.insert(a, Health(1));
+        let b = world.spawn();
+        world.insert(b, Health(2));
+        world.insert(b, Position { x: 0.0, y: 0.0 });
+
+        // Iteration must be driven by the required Health, not the optional
+        // Position, even though Position comes first.
+        let mut seen = Vec::new();
+        world
+            .query::<(Option<&Position>, &Health)>()
+            .for_each(|e, (pos, health)| seen.push((e, pos.is_some(), health.0)));
+        seen.sort_by_key(|(e, _, _)| e.index());
+        assert_eq!(seen, vec![(a, false, 1), (b, true, 2)]);
+    }
+
+    #[test]
+    fn optional_mut_param_allows_mutation() {
+        let mut world = World::new();
+        let hurt = world.spawn();
+        world.insert(hurt, Position { x: 0.0, y: 0.0 });
+        world.insert(hurt, Health(10));
+        let unhurt = world.spawn();
+        world.insert(unhurt, Position { x: 0.0, y: 0.0 });
+
+        world
+            .query::<(&Position, Option<&mut Health>)>()
+            .for_each(|_e, (_pos, health)| {
+                if let Some(health) = health {
+                    health.0 += 5;
+                }
+            });
+        assert_eq!(world.get::<Health>(hurt).unwrap().0, 15);
+        assert!(!world.has::<Health>(unhurt));
+    }
+
+    #[test]
+    fn all_optional_query_visits_every_live_entity() {
+        let mut world = World::new();
+        let a = world.spawn();
+        world.insert(a, Health(3));
+        let empty = world.spawn(); // no components at all
+        let dead = world.spawn();
+        assert!(world.despawn(dead));
+
+        let mut seen = Vec::new();
+        world
+            .query::<Option<&Health>>()
+            .for_each(|e, health| seen.push((e, health.map(|h| h.0))));
+        seen.sort_by_key(|(e, _)| e.index());
+        assert_eq!(seen, vec![(a, Some(3)), (empty, None)]);
     }
 
     #[test]
