@@ -58,9 +58,14 @@ fn transform_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
         .show(ui, |ui| {
             vec3_row(ui, "Position", &mut t.translation, 0.05);
 
-            // Rotation is edited as XYZ Euler degrees, rebuilt into the quat.
-            let (rx, ry, rz) = t.rotation.to_euler(EulerRot::XYZ);
-            let mut euler = [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()];
+            // Edited as Euler degrees in the same convention as the C# scripting API
+            // (`Quaternion.Euler` / `eulerAngles`): Z-X-Y application, i.e. glam's
+            // intrinsic `EulerRot::YXZ`. Matching it means the numbers shown here equal
+            // a script's `eulerAngles` for the same rotation. Mind the reordering: YXZ
+            // takes/yields angles as (yaw=Y, pitch=X, roll=Z), but the three fields are
+            // laid out X, Y, Z (pitch, yaw, roll).
+            let (yaw, pitch, roll) = t.rotation.to_euler(EulerRot::YXZ);
+            let mut euler = [pitch.to_degrees(), yaw.to_degrees(), roll.to_degrees()];
             let mut changed = false;
             ui.horizontal(|ui| {
                 ui.label("Rotation");
@@ -72,10 +77,10 @@ fn transform_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
             });
             if changed {
                 t.rotation = Quat::from_euler(
-                    EulerRot::XYZ,
-                    euler[0].to_radians(),
-                    euler[1].to_radians(),
-                    euler[2].to_radians(),
+                    EulerRot::YXZ,
+                    euler[1].to_radians(), // yaw   (Y)
+                    euler[0].to_radians(), // pitch (X)
+                    euler[2].to_radians(), // roll  (Z)
                 );
             }
 
