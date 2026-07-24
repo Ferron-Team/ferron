@@ -326,10 +326,16 @@ pub struct CEntity {
 }
 
 impl CEntity {
-    /// Returned when an ABI call can't produce a real entity.
+    /// Returned when an ABI call can't produce a real entity. `u32::MAX` is
+    /// never handed out by the ECS allocator (it would require that many live
+    /// slots), so this can't collide with a real handle the way `{0, 0}` did —
+    /// `{0, 0}` is the first entity ever spawned. The `SparseSet` already treats
+    /// a `u32::MAX` index as its empty `SENTINEL`, so every lookup rejects this
+    /// handle as "not found" rather than aliasing a live entity. C# mirrors it
+    /// as `Ferron.Entity.Null`; keep the two in sync.
     pub const NULL: Self = Self {
-        index: 0,
-        generation: 0,
+        index: u32::MAX,
+        generation: u32::MAX,
     };
 }
 
@@ -400,7 +406,7 @@ impl ScriptHost {
         ) = {
             let loader = context.get_delegate_loader_for_assembly(pdcstr!("Ferron.dll"))?;
             (
-                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const FerronApi) -> i32>(
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const FerronApi, i32) -> i32>(
                     pdcstr!("Ferron.Bootstrap, Ferron"),
                     pdcstr!("Init"),
                 )?,
@@ -442,9 +448,17 @@ impl ScriptHost {
             )
         };
 
-        let status = init(api);
+        // Hand C# the byte size of our FerronApi as an ABI handshake: it refuses
+        // to initialize if its own struct is a different size (a stale-rebuild
+        // mismatch), turning silent UB into a clean startup error.
+        let status = init(api, std::mem::size_of::<FerronApi>() as i32);
         if status != 0 {
-            return Err(format!("Ferron.Bootstrap.Init returned {status}").into());
+            return Err(format!(
+                "Ferron.Bootstrap.Init rejected initialization (status {status}); the \
+                 Ferron assembly is out of sync with the engine ABI — rebuild \
+                 scripting/Ferron"
+            )
+            .into());
         }
         set_destroy_handle(destroy);
 

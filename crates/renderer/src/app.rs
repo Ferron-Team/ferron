@@ -33,8 +33,10 @@ pub struct App {
     active: Option<Active>,
     world: World,
     camera_controller: CameraController,
-    start: Instant,
-    last_frame: f32,
+    /// Timestamp of the previous rendered frame; `None` until the first frame
+    /// establishes a baseline. Delta is `now - last_instant`, never a
+    /// difference of two large "seconds since start" floats (which quantizes).
+    last_instant: Option<Instant>,
     render_items: Vec<RenderItem>,
     lighting: SceneLighting,
     /// This frame's debug lines, copied out of the `DebugLines` resource so the
@@ -66,8 +68,7 @@ impl App {
             active: None,
             world: World::default(),
             camera_controller: CameraController::new(),
-            start: Instant::now(),
-            last_frame: 0.0,
+            last_instant: None,
             render_items: Vec::new(),
             lighting: SceneLighting::default(),
             debug_lines: Vec::new(),
@@ -190,9 +191,17 @@ impl ApplicationHandler for App {
                 active.renderer.resize([size.width, size.height]);
             }
             WindowEvent::RedrawRequested => {
-                let elapsed = self.start.elapsed().as_secs_f32();
-                let delta = elapsed - self.last_frame;
-                self.last_frame = elapsed;
+                // First frame gets a zero delta — its "interval" would otherwise
+                // be the whole startup (Vulkan init + scene build + CoreCLR boot,
+                // 1–3 s with scripting), spiking every Spin and the first script
+                // OnUpdate. Later deltas are clamped so a hitch (breakpoint,
+                // window drag) can't teleport the sim on the frame after.
+                const MAX_DELTA: f32 = 0.25;
+                let now = Instant::now();
+                let delta = match self.last_instant.replace(now) {
+                    Some(prev) => (now - prev).as_secs_f32().min(MAX_DELTA),
+                    None => 0.0,
+                };
                 self.world.resource_mut::<Time>().update(delta);
                 self.world.resource_mut::<FrameStats>().record(delta);
 

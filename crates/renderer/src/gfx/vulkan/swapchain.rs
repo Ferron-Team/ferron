@@ -15,7 +15,7 @@ pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
 /// - `Immediate`: uncapped, may tear (not always supported).
 ///
 /// Falls back to `Fifo` automatically if the surface doesn't support the choice.
-pub const PRESENT_MODE: PresentMode = PresentMode::Immediate;
+pub const PRESENT_MODE: PresentMode = PresentMode::Fifo;
 
 pub struct SwapchainState {
     pub swapchain: Arc<Swapchain>,
@@ -56,11 +56,20 @@ impl SwapchainState {
             .unwrap_or(PresentMode::Fifo);
         println!("Present mode: {present_mode:?}");
 
+        // Prefer double-buffering, but stay within the surface's advertised range:
+        // never below its minimum, and never above its maximum when it sets one
+        // (max_image_count == None means unlimited). A surface whose max is 1
+        // would otherwise fail creation against the unconditional `.max(2)`.
+        let mut min_image_count = caps.min_image_count.max(2);
+        if let Some(max) = caps.max_image_count {
+            min_image_count = min_image_count.min(max);
+        }
+
         let (swapchain, images) = Swapchain::new(
             device.clone(),
             surface.clone(),
             SwapchainCreateInfo {
-                min_image_count: caps.min_image_count.max(2),
+                min_image_count,
                 image_format: format,
                 image_extent: extent,
                 image_usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST,

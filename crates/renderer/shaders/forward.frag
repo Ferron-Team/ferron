@@ -64,9 +64,8 @@ vec4 sample_tex(uint index, vec2 uv) {
 // push-constant range; only material_index is read here.
 layout(push_constant) uniform Push {
     mat4 mvp;
-    mat4 model;
-    mat4 normal_matrix;
     uint material_index;
+    uint object_index;
 } push;
 
 // --- Cook-Torrance terms (metallic-roughness workflow) ---

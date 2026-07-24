@@ -10,7 +10,8 @@ public static class World
     /// Spawn an entity rendered with a mesh and material registered in the
     /// engine's asset registry (meshes: "cube", "sphere", "plane"; materials:
     /// "gold", "copper", "glossy", "clay", "neon", "textured", "rock",
-    /// "ground"). Logs and returns Entity(0v0) if a name is unknown.
+    /// "ground"). Logs and returns Entity.Null if a name is unknown (check
+    /// IsValid).
     public static Entity SpawnRenderable(string mesh, string material, Transform transform) =>
         Native.SpawnRenderable(mesh, material, transform);
 

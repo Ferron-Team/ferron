@@ -17,18 +17,30 @@ layout(location = 5) out vec3 v_color;
 // share one push-constant range. `material_index` is unused here.
 layout(push_constant) uniform Push {
     mat4 mvp;
-    mat4 model;
-    mat4 normal_matrix;
     uint material_index;
+    uint object_index;
 } push;
 
+// Per-object transforms, indexed by push.object_index. Mirrors GpuObject in
+// forward.rs; std430 packs it exactly like the Rust struct (all mat4 fields).
+struct Object {
+    mat4 model;
+    mat4 normal_matrix;
+};
+layout(set = 4, binding = 0, std430) readonly buffer Objects {
+    Object objects[];
+};
+
 void main() {
-    vec4 world = push.model * vec4(position, 1.0);
+    mat4 model = objects[push.object_index].model;
+    mat4 normal_matrix = objects[push.object_index].normal_matrix;
+
+    vec4 world = model * vec4(position, 1.0);
     v_world_pos = world.xyz;
 
     // World-space TBN basis for tangent-space normal mapping.
-    vec3 N = normalize(mat3(push.normal_matrix) * normal);
-    vec3 T = normalize(mat3(push.model) * tangent.xyz);
+    vec3 N = normalize(mat3(normal_matrix) * normal);
+    vec3 T = normalize(mat3(model) * tangent.xyz);
     T = normalize(T - dot(T, N) * N);          // Gram-Schmidt
     vec3 B = cross(N, T) * tangent.w;          // handedness from w
 

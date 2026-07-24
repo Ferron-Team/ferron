@@ -29,7 +29,10 @@ impl Camera {
         Mat4::look_at_rh(self.position, self.target, self.up)
     }
 
-    // Reverse-Z friendly perspective with Vulkan's [0,1] depth range.
+    // Right-handed perspective for Vulkan's [0,1] depth range, with Y flipped for
+    // its +Y-down clip space. Standard forward-Z: near maps to 0, far to 1, paired
+    // with a LESS depth test and a depth clear of 1.0. (Not reverse-Z — that would
+    // mean swapping near/far here and flipping the compare op + clear renderer-wide.)
     #[inline]
     pub fn projection(&self, aspect: f32) -> Mat4 {
         let mut proj = Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far);
