@@ -11,11 +11,4 @@ public static unsafe class Bootstrap
         Native.Log("hello from C#");
         return 0;
     }
-
-    [UnmanagedCallersOnly]
-    public static void Free(nint handle)
-    {
-        if (handle != 0)
-            GCHandle.FromIntPtr(handle).Free();
-    }
 }
