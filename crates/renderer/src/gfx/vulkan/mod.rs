@@ -35,7 +35,7 @@ use self::ssao::SsaoPass;
 use self::hdr::{HdrPass, HDR_FORMAT};
 
 use crate::scene::DebugLine;
-use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
+use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle, MAX_TEXTURES};
 
 type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
 
@@ -224,6 +224,18 @@ impl RenderBackend for VulkanRenderer {
         height: u32,
         srgb: bool,
     ) -> TextureHandle {
+        // The shader's sampler array and `build_texture_set` only bind the first
+        // MAX_TEXTURES views, so a handle past that would index out of range.
+        // Clamp to the white default (handle 0) instead of handing back a slot
+        // the GPU can't sample.
+        if self.textures.len() >= MAX_TEXTURES {
+            eprintln!(
+                "texture cap reached ({MAX_TEXTURES}); ignoring load and using the \
+                 white default — material will render untextured"
+            );
+            return TextureHandle(0);
+        }
+
         // Color maps are authored in sRGB so the GPU decodes them to linear on
         // sample; data maps (normal, metallic-roughness) are already linear.
         let format = if srgb {
