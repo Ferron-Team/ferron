@@ -8,8 +8,8 @@ pub use headless::HeadlessBackend;
 
 use crate::geom::Aabb;
 use crate::scene::{
-    BloomSettings, Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle,
-    SsaoSettings, TaaSettings,
+    BloomSettings, Camera, CpuMesh, DofSettings, EnvironmentSettings, HdrSettings, MaterialHandle,
+    MeshHandle, MotionBlurSettings, SsaoSettings, TaaSettings,
 };
 use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
@@ -241,6 +241,7 @@ pub trait RenderBackend {
     /// `dt` is the seconds elapsed since the last frame — what any temporal
     /// effect a backend runs needs, exposure adaptation being the first of them.
     /// Zero means "converge immediately", which is what a one-shot render wants.
+    #[allow(clippy::too_many_arguments)]
     fn render(
         &mut self,
         draws: DrawList<'_>,
@@ -248,6 +249,8 @@ pub trait RenderBackend {
         camera: &Camera,
         ssao: &SsaoSettings,
         taa: &TaaSettings,
+        motion_blur: &MotionBlurSettings,
+        dof: &DofSettings,
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,

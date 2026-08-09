@@ -50,6 +50,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 taa: true,
                 auto_exposure: true,
+                motion_blur: false,
+                dof: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -69,6 +71,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 taa: false,
                 auto_exposure: true,
+                motion_blur: false,
+                dof: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 4,
@@ -87,6 +91,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 taa: false,
                 auto_exposure: true,
+                motion_blur: false,
+                dof: false,
                 bloom_mips: 0,
                 overlay: true,
                 shadow_cascades: 0,
@@ -103,6 +109,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 taa: true,
                 auto_exposure: true,
+                motion_blur: false,
+                dof: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -121,6 +129,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 taa: false,
                 auto_exposure: false,
+                motion_blur: false,
+                dof: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -138,7 +148,49 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 taa: false,
                 auto_exposure: true,
+                motion_blur: false,
+                dof: false,
                 bloom_mips: 1,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+            },
+        ),
+        // The whole optical chain at once: lens, then shutter, then sensor.
+        // Worth baselining as one shape rather than two because the passes are
+        // chained through `scene_color` — each rebinds it for the next — so the
+        // barriers between them are the thing that would break if the order
+        // were ever rearranged.
+        (
+            "editor frame, depth of field and motion blur",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: true,
+                dof: true,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+            },
+        ),
+        // The other shape that proves the prepass belongs to the frame rather
+        // than to any one consumer: SSAO and TAA are both off here, and it still
+        // runs, because motion blur needs the velocities and depth of field
+        // needs the depth. It is also the only configuration where the chain
+        // reads the forward pass's resolve directly instead of a TAA output.
+        (
+            "editor frame, depth of field and motion blur without TAA",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: false,
+                taa: false,
+                auto_exposure: true,
+                motion_blur: true,
+                dof: true,
+                bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -151,6 +203,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 taa: false,
                 auto_exposure: true,
+                motion_blur: false,
+                dof: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: false,
                 shadow_cascades: 2,
@@ -245,6 +299,8 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             ssao: true,
             taa: false,
             auto_exposure: true,
+            motion_blur: false,
+            dof: false,
             bloom_mips: BLOOM_MIPS,
             overlay: true,
             shadow_cascades: count,
@@ -282,6 +338,8 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         ssao: true,
         taa: true,
         auto_exposure: true,
+        motion_blur: false,
+        dof: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
         shadow_cascades: 0,
@@ -308,6 +366,111 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         })
         .collect();
     assert!(closing.is_empty(), "{closing:?}");
+}
+
+/// Light meets a lens, then a shutter, then a sensor, and the frame has to run
+/// them in that order — it is what Unity and Unreal both settled on, and it is
+/// not arbitrary: defocus before the shutter means the streak smears an image
+/// the lens already formed, and both before the sensor means a defocused
+/// highlight blooms as the wide soft thing it has become rather than as the
+/// point it was.
+///
+/// Nothing in `compile` knows any of that. The order is a consequence of how
+/// `declare` chains `scene_color` from one stage to the next, so reordering
+/// those blocks would silently reorder the optics — which is why it is asserted
+/// against the derived schedule rather than against the source.
+#[test]
+fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        ssao: true,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: true,
+        dof: true,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+    })
+    .unwrap();
+
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&id| frame.graph.pass_name(id))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} is not in the frame: {order:?}"))
+    };
+
+    assert!(at("taa_resolve") < at("dof_prefilter"), "{order:?}");
+    assert!(at("dof_composite") < at("motion_blur_gather"), "{order:?}");
+    assert!(
+        at("motion_blur_gather") < at("bloom_prefilter"),
+        "{order:?}"
+    );
+    assert!(
+        at("motion_blur_gather") < at("luminance_histogram"),
+        "{order:?}"
+    );
+    assert!(at("motion_blur_gather") < at("tonemap"), "{order:?}");
+
+    // The dilation has to sit between the tiles and the gather that reads them,
+    // or a fast object's blur stops at the tile boundary it started in.
+    assert!(
+        at("motion_blur_tile_max") < at("motion_blur_neighbour_max"),
+        "{order:?}"
+    );
+    assert!(
+        at("motion_blur_neighbour_max") < at("motion_blur_gather"),
+        "{order:?}"
+    );
+}
+
+/// The geometry prepass exists for whoever needs what it writes, and after this
+/// change that is four separate consumers. Each has to be able to keep it alive
+/// on its own — a prepass gated on any subset of them would leave motion blur
+/// gathering along velocities nobody rasterised, or depth of field focusing on
+/// a depth buffer that was never allocated.
+#[test]
+fn any_single_consumer_keeps_the_geometry_prepass() {
+    let base = FrameConfig {
+        color_format: COLOR_FORMAT,
+        ssao: false,
+        taa: false,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+    };
+
+    let consumers: [(&str, fn(&mut FrameConfig)); 4] = [
+        ("ssao", |c| c.ssao = true),
+        ("taa", |c| c.taa = true),
+        ("motion blur", |c| c.motion_blur = true),
+        ("depth of field", |c| c.dof = true),
+    ];
+    for (label, enable) in consumers {
+        let mut config = base;
+        enable(&mut config);
+        let frame = declare(config).unwrap();
+        assert!(
+            frame.ids.prepass.is_some(),
+            "{label} alone left the frame with no geometry prepass",
+        );
+    }
+
+    // And nothing wants it when none of them do, so it is genuinely gated
+    // rather than always present.
+    assert!(declare(base).unwrap().ids.prepass.is_none());
 }
 
 /// The swapchain image is acquired undefined and handed back to the presentation

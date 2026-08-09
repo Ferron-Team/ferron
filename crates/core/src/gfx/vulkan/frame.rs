@@ -21,7 +21,9 @@ use crate::gfx::shadows::MAX_CASCADES;
 
 use super::MSAA_SAMPLES;
 use super::bloom::MAX_BLOOM_MIPS;
+use super::dof::COC_TILE_SHIFT;
 use super::hdr::HDR_FORMAT;
+use super::motion_blur::TILE_SHIFT;
 use super::prepass::{NORMAL_FORMAT, VELOCITY_FORMAT};
 use super::ssao::AO_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
@@ -42,6 +44,15 @@ pub struct FrameConfig {
     /// a flag read at record time: the two compute passes are never registered
     /// and the tonemap pass falls back to the manual exposure it is pushed.
     pub auto_exposure: bool,
+    /// Whether the frame reconstructs the shutter's exposure from the motion
+    /// vectors. Structural for the same reason TAA is, and with the same
+    /// consequence: it is one of the things that makes the geometry prepass
+    /// exist in a frame with SSAO switched off.
+    pub motion_blur: bool,
+    /// Whether the frame defocuses what the lens is not focused on. Structural,
+    /// and the other consumer that can keep the prepass alive on its own —
+    /// depth is all it needs from it.
+    pub dof: bool,
     /// Levels in the bloom chain, zero for none. Derived from the frame's extent
     /// rather than set, so the number of passes registered cannot disagree with
     /// the number of levels there is room for — the same reason
@@ -67,6 +78,21 @@ pub enum PassBody {
     Forward,
     /// Reprojects the history onto this frame and accumulates into it.
     TaaResolve,
+    /// Half the frame, carrying its own circle of confusion.
+    DofPrefilter,
+    /// The widest near and far circle per tile, which sizes the gather's kernel.
+    DofTileMax,
+    /// Spreads each half-resolution texel over its circle, into a near and a far
+    /// field.
+    DofGather,
+    /// Puts both fields back over the sharp frame at full resolution.
+    DofComposite,
+    /// The longest blur vector in each tile.
+    MotionBlurTileMax,
+    /// Dilates that by one ring, so every pixel a blur can reach knows about it.
+    MotionBlurNeighbourMax,
+    /// Reconstructs the exposure by walking the dominant blur vector.
+    MotionBlurGather,
     LuminanceHistogram,
     LuminanceAverage,
     /// Half the frame, exposed and firefly-weighted: the chain's first level.
@@ -87,9 +113,12 @@ pub struct FrameIds {
     pub object_transforms: ResourceId,
     pub swapchain_color: ResourceId,
     pub hdr_color: ResourceId,
-    /// What the tonemap, metering and bloom passes read: the TAA output when the
-    /// frame has one, and `hdr_color` when it does not. Named once here so
-    /// nothing downstream has to ask which frame it is in.
+    /// What the tonemap, metering and bloom passes read: whichever image the
+    /// optical chain left the frame's colour in — `hdr_color` in the barest
+    /// frame, and otherwise the last of the TAA resolve, the lens and the
+    /// shutter that ran. Named once here so nothing downstream has to ask which
+    /// frame it is in, which is what makes inserting a stage a change to one
+    /// binding rather than to every consumer.
     pub scene_color: ResourceId,
     pub msaa_hdr: ResourceId,
     pub msaa_depth: ResourceId,
@@ -102,10 +131,12 @@ pub struct FrameIds {
     pub histogram: Option<ResourceId>,
     pub bloom: Option<BloomIds>,
     /// Present whenever anything downstream needs depth, normals or motion —
-    /// SSAO, TAA, or both.
+    /// SSAO, TAA, motion blur, depth of field, or any combination of them.
     pub prepass: Option<PrepassIds>,
     pub ssao: Option<SsaoIds>,
     pub taa: Option<TaaIds>,
+    pub dof: Option<DofIds>,
+    pub motion_blur: Option<MotionBlurIds>,
     pub shadows: Option<ResourceId>,
 }
 
@@ -145,7 +176,8 @@ impl BloomIds {
 
 /// What the one geometry pass in front of shading leaves behind. Written
 /// together because they come off the same rasterisation, and read apart: SSAO
-/// wants depth and normals, TAA wants depth and motion.
+/// wants depth and normals, TAA and motion blur want depth and motion, depth of
+/// field wants depth alone.
 #[derive(Clone, Copy, Debug)]
 pub struct PrepassIds {
     pub normal: ResourceId,
@@ -170,6 +202,38 @@ pub struct SsaoIds {
 #[derive(Clone, Copy, Debug)]
 pub struct TaaIds {
     pub history: ResourceId,
+    pub output: ResourceId,
+}
+
+/// Depth of field's three images, and what it was handed.
+///
+/// `source` is recorded rather than re-derived because this pass sits in a
+/// chain: it reads the TAA resolve's output in a frame that has one and the
+/// forward pass's in a frame that does not, and the executor must bind exactly
+/// what `declare` said it would read. The same reason the bloom upsample's
+/// coarse level is looked up the same way in both places.
+#[derive(Clone, Copy, Debug)]
+pub struct DofIds {
+    pub source: ResourceId,
+    /// Half the frame: colour, with the signed circle of confusion in alpha.
+    pub prefiltered: ResourceId,
+    /// The widest near and far circle per tile. What the gather sizes its kernel
+    /// from, so a fixed tap budget lands inside the blur rather than around it.
+    pub tile: ResourceId,
+    /// The two fields, kept apart because they composite differently — a near
+    /// one spills over what it occludes and a far one does not.
+    pub near: ResourceId,
+    pub far: ResourceId,
+    pub output: ResourceId,
+}
+
+/// Motion blur's velocity pyramid, and what it was handed.
+#[derive(Clone, Copy, Debug)]
+pub struct MotionBlurIds {
+    pub source: ResourceId,
+    /// The longest blur vector per tile, and that dilated by one ring.
+    pub tile: ResourceId,
+    pub neighbour: ResourceId,
     pub output: ResourceId,
 }
 
@@ -253,17 +317,21 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         }
     }
 
-    // One prepass serves both consumers rather than one each: they need the same
-    // rasterisation, and running it twice to hand each half of the result to a
+    // One prepass serves every consumer rather than one each: they need the same
+    // rasterisation, and running it twice to hand each part of the result to a
     // different reader is the cost the shared node exists to avoid. It writes
     // all three targets whichever consumer asked for it — a second pipeline that
     // dropped the normal attachment for a TAA-without-SSAO frame would buy a
     // target's bandwidth at the price of a second render pass to keep in step.
-    let prepass = (config.ssao || config.taa).then(|| PrepassIds {
-        normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
-        velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
-        depth: builder.create_image("prepass_depth", ImageDesc::new(DEPTH_FORMAT)),
-    });
+    // Four readers now want different parts of it: SSAO takes depth and normals,
+    // TAA and motion blur take depth and motion, depth of field takes depth
+    // alone.
+    let prepass =
+        (config.ssao || config.taa || config.motion_blur || config.dof).then(|| PrepassIds {
+            normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
+            velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
+            depth: builder.create_image("prepass_depth", ImageDesc::new(DEPTH_FORMAT)),
+        });
 
     let ssao = config.ssao.then(|| SsaoIds {
         raw_ao: builder.create_image("ssao_raw_ao", ImageDesc::new(AO_FORMAT)),
@@ -360,7 +428,167 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
     // Everything past shading reads this rather than `hdr_color`, so inserting
     // the resolve is a change to one binding rather than to every consumer.
-    let scene_color = taa.map_or(hdr_color, |taa| taa.output);
+    // Each optical stage below rebinds it in turn, which is what makes the
+    // chain's order a property of this function alone.
+    let mut scene_color = taa.map_or(hdr_color, |taa| taa.output);
+
+    // Lens before shutter before sensor, which is the order light actually
+    // meets them and the order Unity and Unreal both settled on. Defocus first,
+    // so what the shutter smears is already a lens image; both before bloom and
+    // metering, so a defocused highlight blooms as the wide soft thing it has
+    // become rather than as the point it was.
+    let dof = config.dof.then(|| {
+        let prepass = prepass.expect("depth of field reads the geometry prepass");
+        let source = scene_color;
+
+        // Half the frame for everything but the composite. The gather is the
+        // only pass that pays for the kernel, and paying for it at a quarter of
+        // the pixels is what makes a 48-tap disc affordable at all; the
+        // composite's bilinear upsample puts back more detail than the extra
+        // resolution would have carried, because the field it is upsampling is
+        // by definition out of focus.
+        let prefiltered = builder.create_image(
+            "dof_prefiltered",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(1)),
+        );
+        let near = builder.create_image(
+            "dof_near",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(1)),
+        );
+        let far = builder.create_image(
+            "dof_far",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(1)),
+        );
+        // Two channels of maxima in an `HDR_FORMAT` image, for the reason the
+        // motion blur tiles are: `R16G16_SFLOAT` is only a guaranteed storage
+        // format behind an optional device feature, and at one texel per 4096
+        // the unused half is not worth a feature flag.
+        let tile = builder.create_image(
+            "dof_tile",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(COC_TILE_SHIFT)),
+        );
+        let output = builder.create_image("dof_color", ImageDesc::new(HDR_FORMAT));
+
+        let id = builder
+            .pass("dof_prefilter", PassKind::Compute)
+            .access(source, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(prefiltered, Access::StorageWrite)
+            .build();
+        record(id, PassBody::DofPrefilter, &mut bodies);
+
+        // Between the prefilter and the gather for the same reason motion blur's
+        // tile pass sits between the velocities and its gather: a fixed tap
+        // budget has to be spread over the blur that is actually there, not over
+        // the widest one the lens could produce.
+        let id = builder
+            .pass("dof_tile_max", PassKind::Compute)
+            .access(prefiltered, Access::Sampled)
+            .access(tile, Access::StorageWrite)
+            .build();
+        record(id, PassBody::DofTileMax, &mut bodies);
+
+        // One dispatch writing both fields rather than two over the same tiles:
+        // they are gathered with different kernels but read the same maxima.
+        let id = builder
+            .pass("dof_gather", PassKind::Compute)
+            .access(prefiltered, Access::Sampled)
+            .access(tile, Access::Sampled)
+            .access(near, Access::StorageWrite)
+            .access(far, Access::StorageWrite)
+            .build();
+        record(id, PassBody::DofGather, &mut bodies);
+
+        // Reads `source` again rather than accumulating into it, and has to:
+        // resources are unversioned, so a pass that both read and wrote the
+        // frame's colour would make "readers after all writers" point in two
+        // directions at once and `compile` would report a cycle.
+        let id = builder
+            .pass("dof_composite", PassKind::Compute)
+            .access(source, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(near, Access::Sampled)
+            .access(far, Access::Sampled)
+            .access(output, Access::StorageWrite)
+            .build();
+        record(id, PassBody::DofComposite, &mut bodies);
+
+        DofIds {
+            source,
+            prefiltered,
+            tile,
+            near,
+            far,
+            output,
+        }
+    });
+    if let Some(dof) = dof {
+        scene_color = dof.output;
+    }
+
+    let motion_blur = config.motion_blur.then(|| {
+        let prepass = prepass.expect("motion blur reads the geometry prepass");
+        let source = scene_color;
+
+        // `FrameDiv(TILE_SHIFT)` and not a fixed size, because a tile has to be
+        // exactly what successive halvings produce: the gather derives its tile
+        // from its own pixel coordinate, and a level sized any other way is a
+        // texel off from the one it means to read at odd extents.
+        //
+        // Both carry a two-component vector in an `HDR_FORMAT` image. A storage
+        // image is only guaranteed to support `R16G16_SFLOAT` behind an optional
+        // device feature, while `R16G16B16A16_SFLOAT` is always available — and
+        // at one texel per 256 the two unused channels are not worth a feature
+        // flag on the device.
+        let tile = builder.create_image(
+            "motion_blur_tile",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
+        );
+        let neighbour = builder.create_image(
+            "motion_blur_neighbour",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
+        );
+        let output = builder.create_image("motion_blur_color", ImageDesc::new(HDR_FORMAT));
+
+        // Depth as well as velocity, because where nothing was rasterised the
+        // prepass wrote no motion and the sky still sweeps when the camera
+        // turns. Both this pass and the gather recover it the same way TAA does,
+        // by reprojecting the far plane.
+        let id = builder
+            .pass("motion_blur_tile_max", PassKind::Compute)
+            .access(prepass.velocity, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(tile, Access::StorageWrite)
+            .build();
+        record(id, PassBody::MotionBlurTileMax, &mut bodies);
+
+        let id = builder
+            .pass("motion_blur_neighbour_max", PassKind::Compute)
+            .access(tile, Access::Sampled)
+            .access(neighbour, Access::StorageWrite)
+            .build();
+        record(id, PassBody::MotionBlurNeighbourMax, &mut bodies);
+
+        let id = builder
+            .pass("motion_blur_gather", PassKind::Compute)
+            .access(source, Access::Sampled)
+            .access(prepass.velocity, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(neighbour, Access::Sampled)
+            .access(output, Access::StorageWrite)
+            .build();
+        record(id, PassBody::MotionBlurGather, &mut bodies);
+
+        MotionBlurIds {
+            source,
+            tile,
+            neighbour,
+            output,
+        }
+    });
+    if let Some(motion_blur) = motion_blur {
+        scene_color = motion_blur.output;
+    }
 
     // Imported, not created: temporal adaptation is a value that has to outlive
     // the frame, and a transient is `Undefined` at every frame's start by
@@ -495,6 +723,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             prepass,
             ssao,
             taa,
+            dof,
+            motion_blur,
             shadows,
         },
         bodies,

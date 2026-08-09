@@ -4,8 +4,8 @@ use crate::gfx::shadows::MAX_CASCADES;
 
 use super::{color_row, vec3_row};
 use crate::scene::{
-    AmbientLight, BloomSettings, Camera, EnvironmentSettings, FogSettings, HdrSettings,
-    ShadowSettings, SsaoSettings, TaaSettings,
+    AmbientLight, BloomSettings, Camera, DofSettings, EnvironmentSettings, FogSettings,
+    HdrSettings, MotionBlurSettings, ShadowSettings, SsaoSettings, TaaSettings,
 };
 
 type Column = fn(&mut egui::Ui, &World);
@@ -205,16 +205,70 @@ fn lighting_column(ui: &mut egui::Ui, world: &World) {
 
 fn camera_column(ui: &mut egui::Ui, world: &World) {
     ui.strong("Camera");
-    let mut cam = world.resource_mut::<Camera>();
-    vec3_row(ui, "Position", &mut cam.position, 0.1);
-    vec3_row(ui, "Target", &mut cam.target, 0.1);
+    let fov_y = {
+        let mut cam = world.resource_mut::<Camera>();
+        vec3_row(ui, "Position", &mut cam.position, 0.1);
+        vec3_row(ui, "Target", &mut cam.target, 0.1);
 
-    let mut fov = cam.fov_y.to_degrees();
-    if ui
-        .add(egui::Slider::new(&mut fov, 20.0..=110.0).text("FOV"))
-        .changed()
+        let mut fov = cam.fov_y.to_degrees();
+        if ui
+            .add(egui::Slider::new(&mut fov, 20.0..=110.0).text("FOV"))
+            .changed()
+        {
+            cam.fov_y = fov.to_radians();
+        }
+        cam.fov_y
+    };
+
+    // Under the camera rather than beside the other post-process effects,
+    // because that is where their inputs are: the lens takes its focal length
+    // from the field of view above, so widening the shot deepens the image
+    // exactly as it would on a real one.
+    ui.add_space(6.0);
+    ui.strong("Lens")
+        .on_hover_text("Defocus everything the lens is not focused on");
     {
-        cam.fov_y = fov.to_radians();
+        let mut dof = world.resource_mut::<DofSettings>();
+        // Frame structure, like bloom and TAA: it registers or drops all four
+        // passes, so it recompiles the graph.
+        ui.checkbox(&mut dof.enabled, "Depth of field");
+        ui.add(
+            egui::Slider::new(&mut dof.focus_distance, 0.1..=100.0)
+                .logarithmic(true)
+                .text("Focus")
+                .suffix(" m"),
+        );
+        ui.add(
+            egui::Slider::new(&mut dof.f_number, 1.0..=22.0)
+                .logarithmic(true)
+                .text("Aperture")
+                .prefix("f/"),
+        )
+        .on_hover_text("Larger is a smaller opening, and a deeper image");
+        ui.add(
+            egui::Slider::new(&mut dof.sensor_height, 5.0..=36.0)
+                .text("Sensor")
+                .suffix(" mm"),
+        )
+        .on_hover_text("24mm is full frame, 14.2mm is Super 35");
+        // Derived, never set — showing it is what makes the coupling to the FOV
+        // slider above legible rather than something to be discovered.
+        ui.label(format!("≈{:.0}mm lens", dof.focal_length(fov_y) * 1e3))
+            .on_hover_text("Derived from the field of view and the sensor height");
+    }
+
+    ui.add_space(6.0);
+    ui.strong("Shutter")
+        .on_hover_text("Reconstruct the exposure from the frame's motion vectors");
+    {
+        let mut motion_blur = world.resource_mut::<MotionBlurSettings>();
+        ui.checkbox(&mut motion_blur.enabled, "Motion blur");
+        ui.add(
+            egui::Slider::new(&mut motion_blur.shutter_angle, 0.0..=360.0)
+                .text("Angle")
+                .suffix("°"),
+        )
+        .on_hover_text("180° is the film standard: half a frame of travel");
     }
 }
 

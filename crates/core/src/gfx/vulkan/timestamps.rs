@@ -337,6 +337,8 @@ mod tests {
             ssao: true,
             taa: true,
             auto_exposure: true,
+            motion_blur: true,
+            dof: true,
             bloom_mips: MAX_BLOOM_MIPS as u8,
             overlay: true,
             shadow_cascades: MAX_CASCADES as u8,

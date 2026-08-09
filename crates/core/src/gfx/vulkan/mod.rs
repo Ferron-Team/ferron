@@ -1,11 +1,13 @@
 mod bloom;
 mod context;
+mod dof;
 mod environment;
 mod exposure;
 mod forward;
 pub mod frame;
 mod hdr;
 mod line;
+mod motion_blur;
 mod prepass;
 mod resources;
 mod shadow;
@@ -34,20 +36,22 @@ use vulkano::{Validated, VulkanError};
 use crate::geom::Aabb;
 use crate::gfx::shadows::CascadeSet;
 use crate::scene::{
-    BloomSettings, Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle,
-    ShadowSettings, SsaoSettings, TaaSettings,
+    BloomSettings, Camera, CpuMesh, DofSettings, EnvironmentSettings, HdrSettings, MaterialHandle,
+    MeshHandle, MotionBlurSettings, ShadowSettings, SsaoSettings, TaaSettings,
 };
 
 use self::context::VkContext;
 use self::environment::EnvironmentPass;
 use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
-use crate::gfx::graph::PassKind;
+use crate::gfx::graph::{PassKind, ResourceId};
 
 use self::bloom::BloomPass;
+use self::dof::DofPass;
 use self::exposure::ExposurePass;
 use self::frame::{Frame, FrameConfig, PassBody};
 use self::hdr::HdrPass;
 use self::line::LinePass;
+use self::motion_blur::MotionBlurPass;
 use self::prepass::GeometryPrepass;
 use self::resources::{GraphImages, PassFramebuffers, begin_info};
 use self::shadow::ShadowPass;
@@ -108,6 +112,11 @@ pub struct VulkanRenderer {
     /// Owns the ping-ponged history the graph imports, and decides the frame's
     /// subpixel jitter — which is why it is consulted before any pass records.
     taa: TaaPass,
+    /// Defocus. Like bloom, it holds only pipelines and the resolved lens: the
+    /// three images it works over are graph-owned transients.
+    dof: DofPass,
+    /// The shutter's reconstruction, and the velocity pyramid it reads.
+    motion_blur: MotionBlurPass,
     shadow: ShadowPass,
     /// Debug-line overlay, recorded into the forward pass. Editor-only in
     /// practice: fed lines only through `render_with_overlay`.
@@ -149,6 +158,8 @@ impl VulkanRenderer {
         let prepass = GeometryPrepass::new(&ctx);
         let ssao = SsaoPass::new(&ctx);
         let taa = TaaPass::new(&ctx);
+        let dof = DofPass::new(&ctx);
+        let motion_blur = MotionBlurPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx);
         let line = LinePass::new(&ctx.device, &ctx.memory_allocator, &forward.render_pass);
         let environment = EnvironmentPass::new(&ctx, &forward.render_pass);
@@ -181,6 +192,8 @@ impl VulkanRenderer {
             ssao: true,
             taa: true,
             auto_exposure: true,
+            motion_blur: false,
+            dof: false,
             bloom_mips: bloom::mip_count(extent),
             overlay: true,
             shadow_cascades: 0,
@@ -201,6 +214,8 @@ impl VulkanRenderer {
             prepass,
             ssao,
             taa,
+            dof,
+            motion_blur,
             shadow,
             line,
             environment,
@@ -240,6 +255,21 @@ impl VulkanRenderer {
             CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap()
+    }
+
+    /// The view backing a graph resource, whoever owns the allocation.
+    ///
+    /// Every image in a frame is graph-owned but one: the TAA resolve's output
+    /// is *imported*, because a history has to survive a frame boundary and a
+    /// transient by contract does not. Anything downstream that reads the
+    /// frame's colour can be handed either, depending on which optical stages
+    /// the frame has — so it asks by `ResourceId` and this decides, rather than
+    /// each consumer re-deriving which pass ran last.
+    fn view_of(&self, id: ResourceId) -> Arc<ImageView> {
+        match self.frame.ids.taa {
+            Some(taa) if id == taa.output => self.taa.output_view(),
+            _ => self.images.view(id),
+        }
     }
 
     fn reallocate(&mut self) {
@@ -334,6 +364,8 @@ impl RenderBackend for VulkanRenderer {
         camera: &Camera,
         ssao: &SsaoSettings,
         taa: &TaaSettings,
+        motion_blur: &MotionBlurSettings,
+        dof: &DofSettings,
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
@@ -347,6 +379,8 @@ impl RenderBackend for VulkanRenderer {
             camera,
             ssao,
             taa,
+            motion_blur,
+            dof,
             bloom,
             hdr,
             environment,
@@ -398,6 +432,7 @@ impl VulkanRenderer {
 
     /// Like [`render`](RenderBackend::render) but composites `overlay` (the
     /// editor UI) onto the final image before present.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_with_overlay(
         &mut self,
         draws: DrawList<'_>,
@@ -405,6 +440,8 @@ impl VulkanRenderer {
         camera: &Camera,
         ssao: &SsaoSettings,
         taa: &TaaSettings,
+        motion_blur: &MotionBlurSettings,
+        dof: &DofSettings,
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
@@ -420,6 +457,8 @@ impl VulkanRenderer {
             camera,
             ssao,
             taa,
+            motion_blur,
+            dof,
             bloom,
             hdr,
             environment,
@@ -431,6 +470,7 @@ impl VulkanRenderer {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_frame(
         &mut self,
         draws: DrawList<'_>,
@@ -438,6 +478,8 @@ impl VulkanRenderer {
         camera: &Camera,
         ssao: &SsaoSettings,
         taa: &TaaSettings,
+        motion_blur: &MotionBlurSettings,
+        dof: &DofSettings,
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
@@ -472,6 +514,8 @@ impl VulkanRenderer {
             ssao: ssao.enabled,
             taa: taa.enabled,
             auto_exposure: hdr.auto_exposure,
+            motion_blur: motion_blur.enabled,
+            dof: dof.enabled,
             // Zero when bloom is off, and also when the window is too small for
             // a chain — so a frame dragged to a sliver drops the passes rather
             // than dispatching over one-texel levels.
@@ -548,6 +592,11 @@ impl VulkanRenderer {
         let view = self
             .taa
             .begin_frame(&self.ctx, taa, camera, self.swapchain.extent);
+        // Both resolve their optics against this frame's camera: the lens takes
+        // its focal length from the field of view, and the shutter takes the
+        // depth range it linearises with.
+        self.dof.begin_frame(dof, camera, self.swapchain.extent);
+        self.motion_blur.begin_frame(motion_blur, camera);
         // Sourced from the compiled frame, not from the setting: a window too
         // small for a chain leaves bloom enabled but unbuilt, and a non-zero
         // strength would then blend the 1x1 black stand-in into the image and
@@ -637,15 +686,11 @@ impl VulkanRenderer {
             "the forward pipeline binds the cascades as texture2DArray",
         );
 
-        // What everything past shading composites. `scene_color` is the TAA
-        // output in a frame that has one and `hdr_color` in a frame that does
-        // not, and the graph already decided which — but the TAA images are
-        // imported, so their views come from the module that owns them rather
-        // than from the graph's allocations.
-        let scene_color = match self.frame.ids.taa {
-            Some(_) => self.taa.output_view(),
-            None => self.images.view(self.frame.ids.scene_color),
-        };
+        // What everything past shading composites: whichever image the optical
+        // chain left the frame's colour in. `declare` already decided that, and
+        // every pass in the chain recorded what it was handed, so nothing here
+        // re-derives an order.
+        let scene_color = self.view_of(self.frame.ids.scene_color);
 
         // The whole frame, in the order the compiler derived. Nothing below
         // decides what runs next, what an image's layout is, or what has to
@@ -690,6 +735,129 @@ impl VulkanRenderer {
                             self.images.view(self.frame.ids.hdr_color),
                             self.images.view(ids.velocity),
                             self.images.view(ids.depth),
+                        );
+                    }
+                    PassBody::DofPrefilter => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .dof
+                            .expect("depth of field without its images");
+                        let prepass = self
+                            .frame
+                            .ids
+                            .prepass
+                            .expect("the graph scheduled depth of field with no prepass");
+                        self.dof.record_prefilter(
+                            &mut builder,
+                            &self.ctx,
+                            self.view_of(ids.source),
+                            self.images.view(prepass.depth),
+                            self.images.view(ids.prefiltered),
+                        );
+                    }
+                    PassBody::DofTileMax => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .dof
+                            .expect("depth of field without its images");
+                        self.dof.record_tile_max(
+                            &mut builder,
+                            &self.ctx,
+                            self.images.view(ids.prefiltered),
+                            self.images.view(ids.tile),
+                        );
+                    }
+                    PassBody::DofGather => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .dof
+                            .expect("depth of field without its images");
+                        self.dof.record_gather(
+                            &mut builder,
+                            &self.ctx,
+                            self.images.view(ids.prefiltered),
+                            self.images.view(ids.tile),
+                            self.images.view(ids.near),
+                            self.images.view(ids.far),
+                        );
+                    }
+                    PassBody::DofComposite => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .dof
+                            .expect("depth of field without its images");
+                        let prepass = self
+                            .frame
+                            .ids
+                            .prepass
+                            .expect("the graph scheduled depth of field with no prepass");
+                        self.dof.record_composite(
+                            &mut builder,
+                            &self.ctx,
+                            self.view_of(ids.source),
+                            self.images.view(prepass.depth),
+                            self.images.view(ids.near),
+                            self.images.view(ids.far),
+                            self.images.view(ids.output),
+                        );
+                    }
+                    PassBody::MotionBlurTileMax => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .motion_blur
+                            .expect("motion blur without its images");
+                        let prepass = self
+                            .frame
+                            .ids
+                            .prepass
+                            .expect("the graph scheduled motion blur with no prepass");
+                        self.motion_blur.record_tile_max(
+                            &mut builder,
+                            &self.ctx,
+                            &view,
+                            self.images.view(prepass.velocity),
+                            self.images.view(prepass.depth),
+                            self.images.view(ids.tile),
+                        );
+                    }
+                    PassBody::MotionBlurNeighbourMax => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .motion_blur
+                            .expect("motion blur without its images");
+                        self.motion_blur.record_neighbour_max(
+                            &mut builder,
+                            &self.ctx,
+                            self.images.view(ids.tile),
+                            self.images.view(ids.neighbour),
+                        );
+                    }
+                    PassBody::MotionBlurGather => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .motion_blur
+                            .expect("motion blur without its images");
+                        let prepass = self
+                            .frame
+                            .ids
+                            .prepass
+                            .expect("the graph scheduled motion blur with no prepass");
+                        self.motion_blur.record_gather(
+                            &mut builder,
+                            &self.ctx,
+                            &view,
+                            self.view_of(ids.source),
+                            self.images.view(prepass.velocity),
+                            self.images.view(prepass.depth),
+                            self.images.view(ids.neighbour),
+                            self.images.view(ids.output),
                         );
                     }
                     PassBody::LuminanceHistogram => self.exposure.record_histogram(
@@ -852,6 +1020,13 @@ impl VulkanRenderer {
                 ),
                 PassBody::Overlay
                 | PassBody::TaaResolve
+                | PassBody::DofPrefilter
+                | PassBody::DofTileMax
+                | PassBody::DofGather
+                | PassBody::DofComposite
+                | PassBody::MotionBlurTileMax
+                | PassBody::MotionBlurNeighbourMax
+                | PassBody::MotionBlurGather
                 | PassBody::LuminanceHistogram
                 | PassBody::LuminanceAverage
                 | PassBody::BloomPrefilter

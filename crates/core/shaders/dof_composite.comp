@@ -1,0 +1,66 @@
+#version 460
+
+// Depth of field, step three: put the two gathered fields back over the sharp
+// frame, at full resolution.
+//
+// The order is the optical one and the guards are not symmetric, which is the
+// only subtle thing here. The far field is admitted in proportion to how
+// defocused *this* pixel is, so a sharp foreground standing against a blurred
+// background keeps its edge — background light does not reach past geometry
+// that occludes it. The near field is admitted on its own coverage alone, with
+// no such guard, because a defocused foreground genuinely does spill over
+// whatever is behind it, sharp or not.
+//
+// Drop that asymmetry and the effect fails in the way most cheap DoF does: a
+// foreground object stays cut out with a hard edge, no matter how far out of
+// focus it is meant to be.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_color;
+layout(set = 0, binding = 1) uniform sampler2D u_depth;
+layout(set = 0, binding = 2) uniform sampler2D u_near;
+layout(set = 0, binding = 3) uniform sampler2D u_far;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D u_target;
+// Matches the prefilter's, so the CoC this composites by is the one the gather
+// spread with.
+layout(push_constant) uniform Push {
+    float coc_scale;
+    float focus_distance;
+    float near;
+    float far;
+} dof;
+
+float linear_depth(float d) {
+    return dof.near * dof.far / max(dof.far - d * (dof.far - dof.near), 1e-6);
+}
+
+// Premultiplied by coverage on the way in, so undo that before blending. The
+// floor matters: a texel no sample reached carries a zero coverage, and the
+// blend weight is zero there too, so the value chosen here is never seen — but
+// it must not be a NaN, because mixing by zero does not rescue one.
+vec3 resolve(vec4 field) {
+    return field.rgb / max(field.a, 1e-4);
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_target);
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    vec2 uv = (vec2(texel) + 0.5) / vec2(size);
+    vec3 color = texelFetch(u_color, texel, 0).rgb;
+
+    float depth = linear_depth(texelFetch(u_depth, texel, 0).r);
+    float coc = dof.coc_scale * (1.0 - dof.focus_distance / max(depth, 1e-4));
+
+    vec4 far = texture(u_far, uv);
+    color = mix(color, resolve(far), clamp(far.a, 0.0, 1.0) * clamp(coc, 0.0, 1.0));
+
+    vec4 near = texture(u_near, uv);
+    color = mix(color, resolve(near), clamp(near.a, 0.0, 1.0));
+
+    imageStore(u_target, texel, vec4(color, 1.0));
+}

@@ -210,6 +210,13 @@ impl PassFramebuffers {
                     PassBody::Tonemap
                     | PassBody::Overlay
                     | PassBody::TaaResolve
+                    | PassBody::DofPrefilter
+                    | PassBody::DofTileMax
+                    | PassBody::DofGather
+                    | PassBody::DofComposite
+                    | PassBody::MotionBlurTileMax
+                    | PassBody::MotionBlurNeighbourMax
+                    | PassBody::MotionBlurGather
                     | PassBody::LuminanceHistogram
                     | PassBody::LuminanceAverage
                     | PassBody::BloomPrefilter
@@ -257,6 +264,13 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         // No render pass, so nothing to clear.
         PassBody::Overlay
         | PassBody::TaaResolve
+        | PassBody::DofPrefilter
+        | PassBody::DofTileMax
+        | PassBody::DofGather
+        | PassBody::DofComposite
+        | PassBody::MotionBlurTileMax
+        | PassBody::MotionBlurNeighbourMax
+        | PassBody::MotionBlurGather
         | PassBody::LuminanceHistogram
         | PassBody::LuminanceAverage
         | PassBody::BloomPrefilter
