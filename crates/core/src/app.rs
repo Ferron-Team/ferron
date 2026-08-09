@@ -26,7 +26,7 @@ use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, Culling, DebugLine, DebugLines, DofSettings,
     EnvironmentSettings, FogSettings, HdrSettings, InputState, LogBuffer, LogLevel,
-    MotionBlurSettings, ShadowSettings, SsaoSettings, TaaSettings, Time, load_hdri,
+    MotionBlurSettings, ShadowSettings, SsaoSettings, SsrSettings, TaaSettings, Time, load_hdri,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -191,6 +191,7 @@ impl App {
         world.insert_resource(Time::new());
         world.insert_resource(AmbientLight::default());
         world.insert_resource(SsaoSettings::default());
+        world.insert_resource(SsrSettings::default());
         world.insert_resource(ShadowSettings::default());
         world.insert_resource(HdrSettings::default());
         world.insert_resource(BloomSettings::default());
@@ -563,6 +564,7 @@ impl ApplicationHandler for App {
                 }
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
+                let ssr = *self.world.resource::<SsrSettings>();
                 let taa = *self.world.resource::<TaaSettings>();
                 let motion_blur = *self.world.resource::<MotionBlurSettings>();
                 let dof = *self.world.resource::<DofSettings>();
@@ -604,6 +606,7 @@ impl ApplicationHandler for App {
                         &self.lighting,
                         &camera,
                         &ssao,
+                        &ssr,
                         &taa,
                         &motion_blur,
                         &dof,

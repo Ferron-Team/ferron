@@ -9,7 +9,7 @@ pub use headless::HeadlessBackend;
 use crate::geom::Aabb;
 use crate::scene::{
     BloomSettings, Camera, CpuMesh, DofSettings, EnvironmentSettings, HdrSettings, MaterialHandle,
-    MeshHandle, MotionBlurSettings, SsaoSettings, TaaSettings,
+    MeshHandle, MotionBlurSettings, SsaoSettings, SsrSettings, TaaSettings,
 };
 use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
@@ -248,6 +248,7 @@ pub trait RenderBackend {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        ssr: &SsrSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
         dof: &DofSettings,

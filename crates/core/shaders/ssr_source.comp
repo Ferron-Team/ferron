@@ -1,0 +1,111 @@
+#version 460
+
+// A mip pyramid of the lit frame, for the trace to sample a reflection *cone*
+// out of rather than a single texel.
+//
+// This is what makes a rough reflection affordable. The lobe a ray was sampled
+// from has an angular width, so by the time the ray has travelled any distance
+// it covers a patch of the world rather than a point — and reading one texel of
+// that patch is precisely the variance that shows up as grain on everything
+// that is not a mirror. Reading the level of this pyramid whose texel *is* the
+// patch costs the same fetch and carries the average instead of a sample.
+//
+// The tile shape is `hiz_build.comp`'s exactly: one workgroup owns a 64x64 tile
+// and reduces it alone, because the render graph's unversioned resources forbid
+// a pass per level. Only the reduction differs — a mean here, a minimum there.
+
+const int MAX_LEVELS = 7;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_source;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_mips[MAX_LEVELS];
+
+layout(push_constant) uniform Push {
+    // Extent of level 0, which is half the frame — the resolution the trace
+    // works at, so a mirror loses nothing here it was not already losing.
+    ivec2 extent;
+    int levels;
+} push;
+
+shared vec4 lds[64];
+
+// One bilinear fetch centred between four full-resolution texels averages them
+// for free, which is exactly the 2:1 reduction level 0 is.
+vec4 load(ivec2 p) {
+    vec2 uv = (vec2(clamp(p, ivec2(0), push.extent - 1)) + 0.5) / vec2(push.extent);
+    return texture(u_source, uv);
+}
+
+#define STORE(level, coord, value)                                \
+    if (push.levels > (level)) {                                  \
+        ivec2 size_ = imageSize(u_mips[level]);                   \
+        if (all(lessThan(coord, size_))) {                        \
+            imageStore(u_mips[level], coord, value);              \
+        }                                                         \
+    }
+
+vec4 mean4(vec4 a, vec4 b, vec4 c, vec4 d) {
+    return (a + b + c + d) * 0.25;
+}
+
+void main() {
+    ivec2 tile = ivec2(gl_WorkGroupID.xy) * 64;
+    ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    ivec2 base = tile + lid * 8;
+
+    vec4 d[64];
+    for (int j = 0; j < 8; ++j) {
+        for (int i = 0; i < 8; ++i) {
+            vec4 v = load(base + ivec2(i, j));
+            d[j * 8 + i] = v;
+            STORE(0, base + ivec2(i, j), v)
+        }
+    }
+
+    vec4 m1[16];
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 4; ++i) {
+            vec4 v = mean4(d[(2 * j) * 8 + 2 * i], d[(2 * j) * 8 + 2 * i + 1],
+                           d[(2 * j + 1) * 8 + 2 * i], d[(2 * j + 1) * 8 + 2 * i + 1]);
+            m1[j * 4 + i] = v;
+            STORE(1, (base >> 1) + ivec2(i, j), v)
+        }
+    }
+
+    vec4 m2[4];
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            vec4 v = mean4(m1[(2 * j) * 4 + 2 * i], m1[(2 * j) * 4 + 2 * i + 1],
+                           m1[(2 * j + 1) * 4 + 2 * i], m1[(2 * j + 1) * 4 + 2 * i + 1]);
+            m2[j * 2 + i] = v;
+            STORE(2, (base >> 2) + ivec2(i, j), v)
+        }
+    }
+
+    vec4 m3 = mean4(m2[0], m2[1], m2[2], m2[3]);
+    STORE(3, (base >> 3) + ivec2(0, 0), m3)
+
+    int slot = lid.y * 8 + lid.x;
+    lds[slot] = m3;
+    barrier();
+
+    if ((lid.x & 1) == 0 && (lid.y & 1) == 0) {
+        vec4 v = mean4(lds[slot], lds[slot + 1], lds[slot + 8], lds[slot + 9]);
+        lds[slot] = v;
+        STORE(4, ivec2(gl_WorkGroupID.xy) * 4 + (lid >> 1), v)
+    }
+    barrier();
+
+    if ((lid.x & 3) == 0 && (lid.y & 3) == 0) {
+        vec4 v = mean4(lds[slot], lds[slot + 2], lds[slot + 16], lds[slot + 18]);
+        lds[slot] = v;
+        STORE(5, ivec2(gl_WorkGroupID.xy) * 2 + (lid >> 2), v)
+    }
+    barrier();
+
+    if (slot == 0) {
+        vec4 v = mean4(lds[0], lds[4], lds[32], lds[36]);
+        STORE(6, ivec2(gl_WorkGroupID.xy), v)
+    }
+}

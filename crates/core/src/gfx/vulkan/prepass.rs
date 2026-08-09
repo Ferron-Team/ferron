@@ -1,10 +1,18 @@
 //! The one geometry pass in front of shading: view-space normals, screen-space
-//! motion, and the depth both are read against.
+//! motion, the specular colour a surface reflects with, and the depth all three
+//! are read against.
 //!
 //! It started as SSAO's private prepass and is shared now because TAA needs the
 //! same rasterisation for a different attachment. Everything downstream of it —
-//! SSAO today, screen-space reflections and motion blur when they arrive — reads
-//! the targets it leaves rather than rasterising the scene again.
+//! SSAO, TAA, motion blur, depth of field, screen-space reflections — reads the
+//! targets it leaves rather than rasterising the scene again.
+//!
+//! Reflections are what made it sample material maps rather than only transform
+//! vertices. A reflection has to be tinted by the surface's own `f0` and
+//! sharpened or spread by its roughness, and neither survives as a per-object
+//! constant once a metal-rough map is involved; the normal it reflects about is
+//! the mapped one for the same reason, or reflections slide over bumps the lit
+//! image clearly has. SSAO reads the better normals too.
 
 use std::sync::Arc;
 
@@ -14,6 +22,8 @@ use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
 use vulkano::format::Format;
+use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
+use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::MemoryTypeFilter;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
@@ -39,6 +49,16 @@ use super::taa::FrameView;
 
 pub(super) const NORMAL_FORMAT: Format = Format::R8G8B8A8_UNORM;
 
+/// `rgb` = the surface's normal-incidence specular colour, `a` = perceptual
+/// roughness.
+///
+/// `f0` rather than base colour and metallic, because `f0` is the only thing
+/// downstream actually wants and packing it here means the mix a metal implies
+/// is done once, next to the material that decides it. Eight bits costs a
+/// dielectric's ~4% about a thousandth in absolute terms, which lands well
+/// inside the error the split-sum approximation already carries.
+pub(super) const MATERIAL_FORMAT: Format = Format::R8G8B8A8_UNORM;
+
 /// Signed and float, unlike the normal target: a motion vector is a UV *delta*,
 /// so it is negative half the time, and a UNORM encoding would need a bias that
 /// costs precision exactly where the vectors are smallest and matter most.
@@ -62,11 +82,18 @@ pub(super) struct FrameUbo {
 struct PrepassPush {
     /// First object row of this instanced run; the shader adds `gl_InstanceIndex`.
     object_base: u32,
+    /// Row of the set-2 material table this run draws with, as the forward pass
+    /// pushes it. A run is one (mesh, material) pair, so one index covers it.
+    material_index: u32,
 }
 
 pub struct GeometryPrepass {
     pub(super) render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
+    /// The material maps are sampled at the same texture coordinates and the
+    /// same mip selection the forward pass uses, so the two rasterisations
+    /// cannot disagree about what a surface is.
+    sampler: Arc<Sampler>,
     uniform_allocator: SubbufferAllocator,
 }
 
@@ -75,6 +102,21 @@ impl GeometryPrepass {
         let device = &ctx.device;
         let render_pass = build_render_pass(device);
         let pipeline = build_pipeline(device, &render_pass);
+        let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
+            device
+                .physical_device()
+                .properties()
+                .max_sampler_anisotropy
+                .min(16.0)
+        });
+        let sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                anisotropy,
+                ..SamplerCreateInfo::simple_repeat_linear()
+            },
+        )
+        .unwrap();
         let uniform_allocator = SubbufferAllocator::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -88,6 +130,7 @@ impl GeometryPrepass {
         Self {
             render_pass,
             pipeline,
+            sampler,
             uniform_allocator,
         }
     }
@@ -120,6 +163,53 @@ impl GeometryPrepass {
         .unwrap()
     }
 
+    /// The set-2 material table, over the same buffer the forward pass reads.
+    ///
+    /// Its own set rather than the forward pass's, for the reason the object
+    /// sets are kept apart: set compatibility is a property of the layout each
+    /// pipeline declares, not of the buffer written into it. The *data* is
+    /// shared, which is what keeps the two passes agreeing about a material.
+    pub(super) fn build_material_set(
+        &self,
+        ctx: &VkContext,
+        materials: &Subbuffer<[super::forward::GpuMaterial]>,
+    ) -> Arc<DescriptorSet> {
+        DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[2].clone(),
+            [WriteDescriptorSet::buffer(0, materials.clone())],
+            [],
+        )
+        .unwrap()
+    }
+
+    /// The set-3 texture array, filled exactly as the forward pass fills its
+    /// own: every unused slot points at the white default so no descriptor is
+    /// left unwritten.
+    pub(super) fn build_texture_set(
+        &self,
+        ctx: &VkContext,
+        textures: &[Arc<ImageView>],
+    ) -> Arc<DescriptorSet> {
+        let default_view = textures[0].clone();
+        let texture_array = (0..crate::gfx::MAX_TEXTURES).map(|index| {
+            textures
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| default_view.clone())
+        });
+        DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[3].clone(),
+            [
+                WriteDescriptorSet::image_view_array(0, 0, texture_array),
+                WriteDescriptorSet::sampler(1, self.sampler.clone()),
+            ],
+            [],
+        )
+        .unwrap()
+    }
+
     pub(super) fn record(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
@@ -128,6 +218,8 @@ impl GeometryPrepass {
         extent: [u32; 2],
         frame: Subbuffer<FrameUbo>,
         object_set: Arc<DescriptorSet>,
+        material_set: Arc<DescriptorSet>,
+        texture_set: Arc<DescriptorSet>,
     ) {
         let frame_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
@@ -155,7 +247,7 @@ impl GeometryPrepass {
                 PipelineBindPoint::Graphics,
                 self.pipeline.layout().clone(),
                 0,
-                vec![frame_set, object_set],
+                vec![frame_set, object_set, material_set, texture_set],
             )
             .unwrap();
 
@@ -169,6 +261,7 @@ impl GeometryPrepass {
             };
             let push = PrepassPush {
                 object_base: run.start as u32,
+                material_index: item.material.0,
             };
             builder
                 .push_constants(self.pipeline.layout().clone(), 0, push)
@@ -192,9 +285,10 @@ fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
         attachments: {
             normal:   { format: NORMAL_FORMAT,   samples: 1, load_op: Clear, store_op: Store },
             velocity: { format: VELOCITY_FORMAT, samples: 1, load_op: Clear, store_op: Store },
+            material: { format: MATERIAL_FORMAT, samples: 1, load_op: Clear, store_op: Store },
             depth:    { format: DEPTH_FORMAT,    samples: 1, load_op: Clear, store_op: Store },
         },
-        pass: { color: [normal, velocity], depth_stencil: {depth}}
+        pass: { color: [normal, velocity, material], depth_stencil: {depth}}
     )
     .unwrap()
 }

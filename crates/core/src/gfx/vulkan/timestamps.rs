@@ -36,12 +36,14 @@ use crate::profile::{Profiler, Span};
 /// `2 * MAX_PASSES` queries per slot whether used or not; passes beyond it are
 /// dropped rather than mis-attributed.
 ///
-/// The busiest frame that ships is four shadow cascades, three SSAO passes, the
-/// forward pass, two metering dispatches, an eleven-pass bloom chain and the
-/// tonemap — 22, plus the whole-frame pair. Bloom is what made the old 16 too
-/// small, and it grows with `MAX_BLOOM_MIPS`: a chain of `n` levels is `2n - 1`
-/// passes, so raising that cap means raising this one.
-const MAX_PASSES: usize = 32;
+/// The busiest frame that ships is four shadow cascades, the prepass, two SSAO
+/// passes, the forward pass, three reflection passes, the temporal resolve, four
+/// lens passes, three shutter passes, two metering dispatches, an eleven-pass
+/// bloom chain and the tonemap, plus the whole-frame pair. Bloom is what made
+/// the old 16 too small, and it grows with `MAX_BLOOM_MIPS`: a chain of `n`
+/// levels is `2n - 1` passes, so raising that cap means raising this one.
+/// `the_busiest_frame_fits_the_query_pool` is what keeps this number honest.
+const MAX_PASSES: usize = 40;
 
 /// Frame slots in rotation. Two would be correct only while `previous_frame_end`
 /// is a single fence that retires frame N-1 before N records; three removes that
@@ -335,6 +337,7 @@ mod tests {
         let config = FrameConfig {
             color_format: vulkano::format::Format::B8G8R8A8_SRGB,
             ssao: true,
+            ssr: true,
             taa: true,
             auto_exposure: true,
             motion_blur: true,

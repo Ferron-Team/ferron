@@ -12,7 +12,7 @@ use std::sync::Arc;
 use vulkano::command_buffer::RenderPassBeginInfo;
 use vulkano::format::ClearValue;
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
-use vulkano::image::{Image, ImageCreateInfo, ImageSubresourceRange, ImageType};
+use vulkano::image::{Image, ImageCreateInfo, ImageSubresourceRange, ImageType, ImageUsage};
 use vulkano::memory::MemoryPropertyFlags;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo};
@@ -56,6 +56,7 @@ impl GraphImages {
         let mut views = vec![None; graph.resource_count()];
         for (id, image) in graph.transient_images() {
             let extent = image.desc.extent.resolve(extent);
+            let mip_levels = image.desc.mip_levels.min(max_mip_levels(extent));
             let allocated = Image::new(
                 memory.clone(),
                 ImageCreateInfo {
@@ -65,6 +66,7 @@ impl GraphImages {
                     usage: image.usage,
                     samples: image.desc.samples,
                     array_layers: image.desc.array_layers.unwrap_or(1),
+                    mip_levels,
                     ..Default::default()
                 },
                 if image.memoryless {
@@ -93,6 +95,15 @@ impl GraphImages {
                         ImageViewType::Dim2dArray
                     } else {
                         ImageViewType::Dim2d
+                    },
+                    // A storage image descriptor takes exactly one level, so a
+                    // view spanning the whole pyramid cannot claim that usage —
+                    // it is the one a shader samples with `textureLod`, and the
+                    // per-level storage views come from `mip_view`.
+                    usage: if mip_levels > 1 {
+                        image.usage - ImageUsage::STORAGE
+                    } else {
+                        image.usage
                     },
                     ..ImageViewCreateInfo::from_image(&allocated)
                 },
@@ -136,6 +147,36 @@ impl GraphImages {
 
         ImageView::new(image, info).unwrap()
     }
+
+    /// A single-level view of one mip of a pyramid, which is what a storage
+    /// image descriptor requires. The whole-pyramid view `view` hands back is
+    /// the one to sample.
+    pub fn mip_view(&self, id: ResourceId, level: u32) -> Arc<ImageView> {
+        let image = self.view(id).image().clone();
+
+        let info = ImageViewCreateInfo {
+            view_type: ImageViewType::Dim2d,
+            subresource_range: ImageSubresourceRange {
+                mip_levels: level..level + 1,
+                ..image.subresource_range()
+            },
+            ..ImageViewCreateInfo::from_image(&image)
+        };
+
+        ImageView::new(image, info).unwrap()
+    }
+
+    /// How many levels the allocated image actually has, which is what a pass
+    /// writing a pyramid must loop over — the declaration is a request, and a
+    /// small window cannot honour it.
+    pub fn mip_levels(&self, id: ResourceId) -> u32 {
+        self.view(id).image().mip_levels()
+    }
+}
+
+/// The deepest pyramid an extent can carry: halving stops at one texel.
+fn max_mip_levels(extent: [u32; 2]) -> u32 {
+    32 - extent[0].max(extent[1]).max(1).leading_zeros()
 }
 
 /// One framebuffer per pass that draws into graph-owned images, indexed by
@@ -173,6 +214,7 @@ impl PassFramebuffers {
                             vec![
                                 images.view(prepass_ids.normal),
                                 images.view(prepass_ids.velocity),
+                                images.view(prepass_ids.material),
                                 images.view(prepass_ids.depth),
                             ],
                         )
@@ -209,6 +251,10 @@ impl PassFramebuffers {
                     // target no attachment at all.
                     PassBody::Tonemap
                     | PassBody::Overlay
+                    | PassBody::SsrHiz
+                    | PassBody::SsrSource
+                    | PassBody::SsrTrace
+                    | PassBody::SsrResolve
                     | PassBody::TaaResolve
                     | PassBody::DofPrefilter
                     | PassBody::DofTileMax
@@ -252,8 +298,12 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         // depth. Zero velocity is what the sky and any unrasterised pixel are
         // left with, and the resolve reads that as "reproject with the camera
         // alone" rather than as a stationary surface.
+        // A black `f0` at zero roughness in the material target, so a pixel
+        // nothing rasterised reflects nothing rather than mirroring the sky at
+        // whatever the previous contents implied.
         PassBody::GeometryPrepass => vec![
             Some([0.5, 0.5, 1.0, 0.0].into()),
+            Some([0.0, 0.0, 0.0, 0.0].into()),
             Some([0.0, 0.0, 0.0, 0.0].into()),
             Some(1.0.into()),
         ],
@@ -263,6 +313,10 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         PassBody::Tonemap => vec![None],
         // No render pass, so nothing to clear.
         PassBody::Overlay
+        | PassBody::SsrHiz
+        | PassBody::SsrSource
+        | PassBody::SsrTrace
+        | PassBody::SsrResolve
         | PassBody::TaaResolve
         | PassBody::DofPrefilter
         | PassBody::DofTileMax

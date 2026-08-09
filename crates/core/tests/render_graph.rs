@@ -48,6 +48,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                ssr: false,
                 taa: true,
                 auto_exposure: true,
                 motion_blur: false,
@@ -69,6 +70,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                ssr: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: false,
@@ -89,6 +91,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: false,
+                ssr: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: false,
@@ -107,6 +110,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: false,
+                ssr: false,
                 taa: true,
                 auto_exposure: true,
                 motion_blur: false,
@@ -127,6 +131,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                ssr: false,
                 taa: false,
                 auto_exposure: false,
                 motion_blur: false,
@@ -146,6 +151,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                ssr: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: false,
@@ -166,6 +172,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                ssr: false,
                 taa: true,
                 auto_exposure: true,
                 motion_blur: true,
@@ -186,10 +193,51 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: false,
+                ssr: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: true,
                 dof: true,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+            },
+        ),
+        // Reflections are the first thing to sit *between* shading and the
+        // temporal resolve, so this shape is what pins that the resolve reads
+        // the composite's output rather than the forward pass's own. It is also
+        // where the depth pyramid appears: one image, one pass writing every
+        // level, and the trace sampling it afterwards.
+        (
+            "editor frame, screen-space reflections",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                ssr: true,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+            },
+        ),
+        // And the same without a resolve behind it, which is the shape where
+        // the composite's output *is* what the optical chain and the tonemap
+        // read.
+        (
+            "editor frame, reflections without TAA",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: false,
+                ssr: true,
+                taa: false,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -201,6 +249,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                ssr: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: false,
@@ -297,6 +346,7 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
         let frame = declare(FrameConfig {
             color_format: COLOR_FORMAT,
             ssao: true,
+            ssr: false,
             taa: false,
             auto_exposure: true,
             motion_blur: false,
@@ -336,6 +386,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
         ssao: true,
+        ssr: false,
         taa: true,
         auto_exposure: true,
         motion_blur: false,
@@ -384,6 +435,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
         ssao: true,
+        ssr: false,
         taa: true,
         auto_exposure: true,
         motion_blur: true,
@@ -433,15 +485,17 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
 }
 
 /// The geometry prepass exists for whoever needs what it writes, and after this
-/// change that is four separate consumers. Each has to be able to keep it alive
+/// change that is five separate consumers. Each has to be able to keep it alive
 /// on its own — a prepass gated on any subset of them would leave motion blur
-/// gathering along velocities nobody rasterised, or depth of field focusing on
-/// a depth buffer that was never allocated.
+/// gathering along velocities nobody rasterised, depth of field focusing on a
+/// depth buffer that was never allocated, or a reflection trace reading a
+/// material target no pass wrote.
 #[test]
 fn any_single_consumer_keeps_the_geometry_prepass() {
     let base = FrameConfig {
         color_format: COLOR_FORMAT,
         ssao: false,
+        ssr: false,
         taa: false,
         auto_exposure: true,
         motion_blur: false,
@@ -452,11 +506,12 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         shadow_resolution: SHADOW_RESOLUTION,
     };
 
-    let consumers: [(&str, fn(&mut FrameConfig)); 4] = [
+    let consumers: [(&str, fn(&mut FrameConfig)); 5] = [
         ("ssao", |c| c.ssao = true),
         ("taa", |c| c.taa = true),
         ("motion blur", |c| c.motion_blur = true),
         ("depth of field", |c| c.dof = true),
+        ("reflections", |c| c.ssr = true),
     ];
     for (label, enable) in consumers {
         let mut config = base;

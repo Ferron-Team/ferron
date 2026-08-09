@@ -24,8 +24,9 @@ use super::bloom::MAX_BLOOM_MIPS;
 use super::dof::COC_TILE_SHIFT;
 use super::hdr::HDR_FORMAT;
 use super::motion_blur::TILE_SHIFT;
-use super::prepass::{NORMAL_FORMAT, VELOCITY_FORMAT};
+use super::prepass::{MATERIAL_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT};
 use super::ssao::AO_FORMAT;
+use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
 use super::swapchain::DEPTH_FORMAT;
 
 /// What a frame's structure depends on. A change to any of these recompiles the
@@ -35,6 +36,10 @@ use super::swapchain::DEPTH_FORMAT;
 pub struct FrameConfig {
     pub color_format: Format,
     pub ssao: bool,
+    /// Whether the frame reflects off itself. Structural like the rest, and
+    /// another consumer that can keep the geometry prepass alive on its own —
+    /// it reads depth, normals and the material target the prepass writes.
+    pub ssr: bool,
     /// Whether the frame resolves against a reprojected history. Structural
     /// twice over: it registers the resolve node, and it is what makes the
     /// geometry prepass exist in a frame that has SSAO switched off — the
@@ -76,6 +81,15 @@ pub enum PassBody {
     SsaoResolve,
     SsaoBlur,
     Forward,
+    /// Every level of the reflection trace's min-depth pyramid, in one dispatch.
+    SsrHiz,
+    /// Every level of the lit frame's pyramid, likewise — what a ray's cone is
+    /// sampled out of.
+    SsrSource,
+    /// One importance-sampled reflection ray per half-resolution pixel.
+    SsrTrace,
+    /// Upsamples those rays and swaps the environment's reflection for them.
+    SsrResolve,
     /// Reprojects the history onto this frame and accumulates into it.
     TaaResolve,
     /// Half the frame, carrying its own circle of confusion.
@@ -134,6 +148,7 @@ pub struct FrameIds {
     /// SSAO, TAA, motion blur, depth of field, or any combination of them.
     pub prepass: Option<PrepassIds>,
     pub ssao: Option<SsaoIds>,
+    pub ssr: Option<SsrIds>,
     pub taa: Option<TaaIds>,
     pub dof: Option<DofIds>,
     pub motion_blur: Option<MotionBlurIds>,
@@ -177,11 +192,15 @@ impl BloomIds {
 /// What the one geometry pass in front of shading leaves behind. Written
 /// together because they come off the same rasterisation, and read apart: SSAO
 /// wants depth and normals, TAA and motion blur want depth and motion, depth of
-/// field wants depth alone.
+/// field wants depth alone, reflections want all but the motion.
 #[derive(Clone, Copy, Debug)]
 pub struct PrepassIds {
     pub normal: ResourceId,
     pub velocity: ResourceId,
+    /// `rgb` = the surface's `f0`, `a` = perceptual roughness. What a reflection
+    /// is tinted by and how wide its lobe is — the two things a screen-space
+    /// trace cannot recover from depth and normals alone.
+    pub material: ResourceId,
     pub depth: ResourceId,
 }
 
@@ -189,6 +208,27 @@ pub struct PrepassIds {
 pub struct SsaoIds {
     pub raw_ao: ResourceId,
     pub ao: ResourceId,
+}
+
+/// The reflection trace's three images, and what it was handed.
+#[derive(Clone, Copy, Debug)]
+pub struct SsrIds {
+    /// The lit frame the rays sample, recorded rather than re-derived for the
+    /// reason depth of field records its own: this pass sits in a chain, and
+    /// the executor must bind exactly what `declare` said it would read.
+    pub source: ResourceId,
+    /// The min-depth pyramid, one image with every level — see
+    /// [`ImageDesc::mip_levels`](crate::gfx::graph::ImageDesc::mip_levels) for
+    /// why a single pass has to write all of them.
+    pub hiz: ResourceId,
+    /// Half the frame with a pyramid over it: the lit colour, prefiltered, so a
+    /// ray from a rough surface reads the average of what its cone covers
+    /// rather than one texel inside it.
+    pub source_pyramid: ResourceId,
+    /// Half the frame: the radiance each ray found, with its confidence in
+    /// alpha.
+    pub rays: ResourceId,
+    pub output: ResourceId,
 }
 
 /// The two images TAA carries across the frame boundary.
@@ -201,6 +241,11 @@ pub struct SsaoIds {
 /// `history` declares it enters in.
 #[derive(Clone, Copy, Debug)]
 pub struct TaaIds {
+    /// What this frame's colour is at the point the resolve accumulates it —
+    /// the forward pass's target, or the reflection composite's where that ran.
+    /// Recorded rather than re-derived for the reason depth of field records its
+    /// own source: the executor must bind exactly what `declare` said it reads.
+    pub source: ResourceId,
     pub history: ResourceId,
     pub output: ResourceId,
 }
@@ -323,13 +368,14 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // all three targets whichever consumer asked for it — a second pipeline that
     // dropped the normal attachment for a TAA-without-SSAO frame would buy a
     // target's bandwidth at the price of a second render pass to keep in step.
-    // Four readers now want different parts of it: SSAO takes depth and normals,
+    // Five readers now want different parts of it: SSAO takes depth and normals,
     // TAA and motion blur take depth and motion, depth of field takes depth
-    // alone.
-    let prepass =
-        (config.ssao || config.taa || config.motion_blur || config.dof).then(|| PrepassIds {
+    // alone, reflections take depth, normals and the material target.
+    let prepass = (config.ssao || config.taa || config.motion_blur || config.dof || config.ssr)
+        .then(|| PrepassIds {
             normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
             velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
+            material: builder.create_image("prepass_material", ImageDesc::new(MATERIAL_FORMAT)),
             depth: builder.create_image("prepass_depth", ImageDesc::new(DEPTH_FORMAT)),
         });
 
@@ -352,6 +398,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(object_transforms, Access::StorageRead)
             .access(prepass.normal, Access::ColorAttachment)
             .access(prepass.velocity, Access::ColorAttachment)
+            .access(prepass.material, Access::ColorAttachment)
             .access(prepass.depth, Access::DepthAttachment)
             .build();
         record(id, PassBody::GeometryPrepass, &mut bodies);
@@ -391,6 +438,97 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Forward, &mut bodies);
 
+    // Between shading and the temporal resolve, and it has to be both: a ray can
+    // only sample radiance that has been lit, and one ray per pixel is noise
+    // until TAA has accumulated it over the jitter sequence. Putting it after
+    // the resolve instead would mean denoising it separately, with a second
+    // history of its own.
+    let ssr = config.ssr.then(|| {
+        let prepass = prepass.expect("screen-space reflections read the geometry prepass");
+        let source = hdr_color;
+
+        // One image carrying the whole pyramid rather than one per level, which
+        // is what lets the trace pick a level per step with `textureLod`. The
+        // build writes every level in a single pass because it must: a pass per
+        // level, each reading the level above from the same resource, is a cycle
+        // by the rule that makes readers follow writers.
+        let hiz =
+            builder.create_image("ssr_hiz", ImageDesc::new(HIZ_FORMAT).mip_levels(HIZ_LEVELS));
+        // The same shape over the lit frame, and the reason a rough reflection
+        // is affordable: a ray sampled from a wide lobe is a cone, and the level
+        // whose texel matches the cone's footprint carries the average of what
+        // the cone covers instead of one sample from inside it. Based at half
+        // the frame, which is the resolution the trace works at anyway.
+        let source_pyramid = builder.create_image(
+            "ssr_source",
+            ImageDesc::new(HDR_FORMAT)
+                .extent(Extent::FrameDiv(1))
+                .mip_levels(SOURCE_LEVELS),
+        );
+        // Half the frame, for the reason depth of field's gather is: the cost is
+        // the ray, and a stochastic ray is denoised temporally either way, so
+        // tracing four times as many buys far less than it costs.
+        let rays = builder.create_image(
+            "ssr_rays",
+            ImageDesc::new(RAY_FORMAT).extent(Extent::FrameDiv(1)),
+        );
+        let output = builder.create_image("ssr_color", ImageDesc::new(HDR_FORMAT));
+
+        let id = builder
+            .pass("ssr_hiz", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(hiz, Access::StorageWrite)
+            .build();
+        record(id, PassBody::SsrHiz, &mut bodies);
+
+        let id = builder
+            .pass("ssr_source", PassKind::Compute)
+            .access(source, Access::Sampled)
+            .access(source_pyramid, Access::StorageWrite)
+            .build();
+        record(id, PassBody::SsrSource, &mut bodies);
+
+        let id = builder
+            .pass("ssr_trace", PassKind::Compute)
+            .access(hiz, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(prepass.material, Access::Sampled)
+            .access(source_pyramid, Access::Sampled)
+            .access(rays, Access::StorageWrite)
+            .build();
+        record(id, PassBody::SsrTrace, &mut bodies);
+
+        // Reads `source` again rather than accumulating into it, for the reason
+        // the depth-of-field composite does: resources are unversioned, so a
+        // pass that both read and wrote the frame's colour would make "readers
+        // after all writers" point in two directions and `compile` would report
+        // a cycle.
+        let id = builder
+            .pass("ssr_resolve", PassKind::Compute)
+            .access(source, Access::Sampled)
+            .access(rays, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(prepass.material, Access::Sampled)
+            .access(output, Access::StorageWrite)
+            .build();
+        record(id, PassBody::SsrResolve, &mut bodies);
+
+        SsrIds {
+            source,
+            hiz,
+            source_pyramid,
+            rays,
+            output,
+        }
+    });
+
+    // What the temporal resolve accumulates, and what the optical chain starts
+    // from in a frame with no resolve: the reflections' output where they ran,
+    // and the forward pass's own target where they did not.
+    let shaded = ssr.map_or(hdr_color, |ssr| ssr.output);
+
     let taa = config.taa.then(|| {
         let prepass = prepass.expect("TAA reads the geometry prepass");
         // Entry `ShaderReadOnlyOptimal` states the steady state, which the
@@ -415,7 +553,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
         let id = builder
             .pass("taa_resolve", PassKind::Compute)
-            .access(hdr_color, Access::Sampled)
+            .access(shaded, Access::Sampled)
             .access(prepass.velocity, Access::Sampled)
             .access(prepass.depth, Access::Sampled)
             .access(history, Access::Sampled)
@@ -423,14 +561,18 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .build();
         record(id, PassBody::TaaResolve, &mut bodies);
 
-        TaaIds { history, output }
+        TaaIds {
+            source: shaded,
+            history,
+            output,
+        }
     });
 
     // Everything past shading reads this rather than `hdr_color`, so inserting
     // the resolve is a change to one binding rather than to every consumer.
     // Each optical stage below rebinds it in turn, which is what makes the
     // chain's order a property of this function alone.
-    let mut scene_color = taa.map_or(hdr_color, |taa| taa.output);
+    let mut scene_color = taa.map_or(shaded, |taa| taa.output);
 
     // Lens before shutter before sensor, which is the order light actually
     // meets them and the order Unity and Unreal both settled on. Defocus first,
@@ -722,6 +864,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             bloom,
             prepass,
             ssao,
+            ssr,
             taa,
             dof,
             motion_blur,

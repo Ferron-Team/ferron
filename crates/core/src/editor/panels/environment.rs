@@ -5,7 +5,7 @@ use crate::gfx::shadows::MAX_CASCADES;
 use super::{color_row, vec3_row};
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, DofSettings, EnvironmentSettings, FogSettings,
-    HdrSettings, MotionBlurSettings, ShadowSettings, SsaoSettings, TaaSettings,
+    HdrSettings, MotionBlurSettings, ShadowSettings, SsaoSettings, SsrSettings, TaaSettings,
 };
 
 type Column = fn(&mut egui::Ui, &World);
@@ -75,6 +75,37 @@ fn screen_space_column(ui: &mut egui::Ui, world: &World) {
             .on_hover_text("How much of the reprojected history each frame keeps");
         ui.add(egui::Slider::new(&mut taa.jitter_scale, 0.0..=1.5).text("Jitter"))
             .on_hover_text("Fraction of a pixel the camera samples across");
+    }
+    ui.add_space(6.0);
+    ui.strong("Reflections").on_hover_text(
+        "Reflect the frame off itself, where the frame contains what a surface faces",
+    );
+    {
+        let mut ssr = world.resource_mut::<SsrSettings>();
+        // Frame structure like the rest: it registers the pyramid, the trace and
+        // the composite, and it is another reason the prepass exists.
+        ui.checkbox(&mut ssr.enabled, "Screen-space reflections");
+        ui.add(egui::Slider::new(&mut ssr.intensity, 0.0..=1.0).text("Intensity"))
+            .on_hover_text("1.0 is the physical answer; lower hides the screen-space failures");
+        ui.add(egui::Slider::new(&mut ssr.max_roughness, 0.05..=1.0).text("Max roughness"))
+            .on_hover_text("Rougher than this is left to the environment cubemap");
+        ui.add(
+            egui::Slider::new(&mut ssr.thickness, 0.01..=2.0)
+                .logarithmic(true)
+                .text("Thickness")
+                .suffix(" m"),
+        )
+        .on_hover_text(
+            "How deep a surface is assumed to be — the depth buffer records only its front",
+        );
+        ui.add(
+            egui::Slider::new(&mut ssr.max_distance, 1.0..=200.0)
+                .logarithmic(true)
+                .text("Range")
+                .suffix(" m"),
+        );
+        ui.add(egui::Slider::new(&mut ssr.max_steps, 8..=128).text("Steps"))
+            .on_hover_text("A step crosses a whole cell of the depth pyramid, not a texel");
     }
 }
 

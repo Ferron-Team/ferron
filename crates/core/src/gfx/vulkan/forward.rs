@@ -399,28 +399,14 @@ impl ForwardPass {
         .unwrap()
     }
 
-    /// Build the set-1 material storage buffer + descriptor set. Cached by the
-    /// renderer and only rebuilt when the material table changes.
+    /// Build the set-1 material descriptor set over the shared table. Cached by
+    /// the renderer and only rebuilt when the material table changes.
     pub fn build_material_set(
         &self,
         ctx: &VkContext,
-        materials: &[GpuMaterial],
+        buffer: &Subbuffer<[GpuMaterial]>,
     ) -> Arc<DescriptorSet> {
-        let buffer = Buffer::from_iter(
-            ctx.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            materials.iter().copied(),
-        )
-        .expect("failed to allocate material buffer");
-
+        let buffer = buffer.clone();
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
             self.pipeline.layout().set_layouts()[1].clone(),
@@ -623,6 +609,31 @@ impl ForwardPass {
     }
 }
 
+/// The material table both geometry passes read.
+///
+/// One buffer rather than one per pipeline: the prepass writes the `f0` and
+/// roughness the forward pass shades with, and two uploads of the same table are
+/// two ways for one material to be described differently.
+pub(super) fn material_buffer(
+    ctx: &VkContext,
+    materials: &[GpuMaterial],
+) -> Subbuffer<[GpuMaterial]> {
+    Buffer::from_iter(
+        ctx.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        materials.iter().copied(),
+    )
+    .expect("failed to allocate material buffer")
+}
+
 pub fn upload_mesh(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     vertices: &[Vertex],
@@ -763,5 +774,6 @@ mod fs {
     vulkano_shaders::shader! {
         ty: "fragment",
         path: "shaders/forward.frag",
+        include: ["shaders"],
     }
 }

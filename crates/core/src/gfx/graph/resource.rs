@@ -61,6 +61,20 @@ pub struct ImageDesc {
     /// `texture2DArray`. Deriving the view type from the layer count instead
     /// silently produces a plain 2D view whenever the count happens to be one.
     pub array_layers: Option<u32>,
+    /// How many mip levels the image carries. More than one makes it a pyramid,
+    /// which one pass writes whole and later passes sample with `textureLod`.
+    ///
+    /// It has to be written whole by a single pass, and that is a property of
+    /// this graph rather than of pyramids: resources are unversioned, so a chain
+    /// of passes each reading level `n - 1` and writing level `n` of the same
+    /// resource makes "readers after all writers" point both ways and `compile`
+    /// reports a cycle. A chain that wants a pass per level takes the bloom
+    /// shape instead — one image per level.
+    ///
+    /// Clamped at allocation to what the extent can actually carry, so a window
+    /// too small for the requested depth gets a shorter pyramid rather than a
+    /// failed allocation. A pass that cares reads the count back off the image.
+    pub mip_levels: u32,
 }
 
 impl ImageDesc {
@@ -70,6 +84,7 @@ impl ImageDesc {
             extent: Extent::Frame,
             samples: SampleCount::Sample1,
             array_layers: None,
+            mip_levels: 1,
         }
     }
 
@@ -88,6 +103,13 @@ impl ImageDesc {
     /// Make this a 2D array image of `layers` layers, even when `layers` is 1.
     pub fn array_layers(mut self, layers: u32) -> Self {
         self.array_layers = Some(layers);
+        self
+    }
+
+    /// Give this image a mip pyramid `levels` deep. See [`mip_levels`](Self::mip_levels)
+    /// for why one pass has to write all of them.
+    pub fn mip_levels(mut self, levels: u32) -> Self {
+        self.mip_levels = levels.max(1);
         self
     }
 }

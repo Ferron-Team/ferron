@@ -12,6 +12,7 @@ mod prepass;
 mod resources;
 mod shadow;
 mod ssao;
+mod ssr;
 mod swapchain;
 mod taa;
 mod texture;
@@ -37,7 +38,7 @@ use crate::geom::Aabb;
 use crate::gfx::shadows::CascadeSet;
 use crate::scene::{
     BloomSettings, Camera, CpuMesh, DofSettings, EnvironmentSettings, HdrSettings, MaterialHandle,
-    MeshHandle, MotionBlurSettings, ShadowSettings, SsaoSettings, TaaSettings,
+    MeshHandle, MotionBlurSettings, ShadowSettings, SsaoSettings, SsrSettings, TaaSettings,
 };
 
 use self::context::VkContext;
@@ -56,6 +57,7 @@ use self::prepass::GeometryPrepass;
 use self::resources::{GraphImages, PassFramebuffers, begin_info};
 use self::shadow::ShadowPass;
 use self::ssao::SsaoPass;
+use self::ssr::SsrPass;
 use self::swapchain::SwapchainState;
 use self::taa::TaaPass;
 use self::timestamps::GpuTimestamps;
@@ -109,6 +111,10 @@ pub struct VulkanRenderer {
     /// The one geometry pass in front of shading, shared by SSAO and TAA.
     prepass: GeometryPrepass,
     ssao: SsaoPass,
+    /// The depth pyramid, the reflection rays, and the composite that swaps the
+    /// environment's reflection for them. Holds only pipelines and the resolved
+    /// settings; every image it works over is graph-owned.
+    ssr: SsrPass,
     /// Owns the ping-ponged history the graph imports, and decides the frame's
     /// subpixel jitter — which is why it is consulted before any pass records.
     taa: TaaPass,
@@ -129,10 +135,17 @@ pub struct VulkanRenderer {
     /// Texture views indexed by `TextureHandle`. Index 0 is a 1x1 white texture
     /// and index 1 a flat normal map; materials without a given map point here.
     pub(crate) textures: Vec<Arc<ImageView>>,
-    /// Cached set-1 (materials) and set-2 (textures) descriptor sets. `None` =
-    /// dirty; rebuilt lazily in `render` after a `load_material`/`load_texture`.
+    /// The material table, shared by both geometry passes. `None` = dirty;
+    /// rebuilt lazily in `render` after a `load_material`.
+    material_buffer: Option<vulkano::buffer::Subbuffer<[GpuMaterial]>>,
+    /// Cached descriptor sets over that table and the texture array, one pair
+    /// per pipeline layout. Two pairs and not one because set compatibility is
+    /// a property of the layout each pipeline declares, not of the buffer
+    /// written into it — the same reason the object sets are kept apart.
     material_set: Option<Arc<DescriptorSet>>,
     texture_set: Option<Arc<DescriptorSet>>,
+    prepass_material_set: Option<Arc<DescriptorSet>>,
+    prepass_texture_set: Option<Arc<DescriptorSet>>,
     previous_frame_end: Option<FrameFuture>,
     recreate_swapchain: bool,
     pending_extent: [u32; 2],
@@ -157,6 +170,7 @@ impl VulkanRenderer {
         let bloom = BloomPass::new(&ctx);
         let prepass = GeometryPrepass::new(&ctx);
         let ssao = SsaoPass::new(&ctx);
+        let ssr = SsrPass::new(&ctx);
         let taa = TaaPass::new(&ctx);
         let dof = DofPass::new(&ctx);
         let motion_blur = MotionBlurPass::new(&ctx);
@@ -190,6 +204,7 @@ impl VulkanRenderer {
         let config = FrameConfig {
             color_format: format,
             ssao: true,
+            ssr: false,
             taa: true,
             auto_exposure: true,
             motion_blur: false,
@@ -213,6 +228,7 @@ impl VulkanRenderer {
             bloom,
             prepass,
             ssao,
+            ssr,
             taa,
             dof,
             motion_blur,
@@ -222,8 +238,11 @@ impl VulkanRenderer {
             meshes: Vec::new(),
             materials: vec![forward::to_gpu_material(&Material::default())],
             textures,
+            material_buffer: None,
             material_set: None,
             texture_set: None,
+            prepass_material_set: None,
+            prepass_texture_set: None,
             previous_frame_end: None,
             recreate_swapchain: false,
             pending_extent: extent,
@@ -304,7 +323,9 @@ impl RenderBackend for VulkanRenderer {
     fn load_material(&mut self, material: &Material) -> MaterialHandle {
         let handle = MaterialHandle(self.materials.len() as u32);
         self.materials.push(forward::to_gpu_material(material));
+        self.material_buffer = None;
         self.material_set = None;
+        self.prepass_material_set = None;
         handle
     }
 
@@ -344,6 +365,7 @@ impl RenderBackend for VulkanRenderer {
         let handle = TextureHandle(self.textures.len() as u32);
         self.textures.push(view);
         self.texture_set = None;
+        self.prepass_texture_set = None;
         handle
     }
 
@@ -363,6 +385,7 @@ impl RenderBackend for VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        ssr: &SsrSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
         dof: &DofSettings,
@@ -378,6 +401,7 @@ impl RenderBackend for VulkanRenderer {
             lighting,
             camera,
             ssao,
+            ssr,
             taa,
             motion_blur,
             dof,
@@ -439,6 +463,7 @@ impl VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        ssr: &SsrSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
         dof: &DofSettings,
@@ -456,6 +481,7 @@ impl VulkanRenderer {
             lighting,
             camera,
             ssao,
+            ssr,
             taa,
             motion_blur,
             dof,
@@ -477,6 +503,7 @@ impl VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        ssr: &SsrSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
         dof: &DofSettings,
@@ -512,6 +539,7 @@ impl VulkanRenderer {
         self.ensure_graph(FrameConfig {
             color_format: self.swapchain.swapchain.image_format(),
             ssao: ssao.enabled,
+            ssr: ssr.enabled,
             taa: taa.enabled,
             auto_exposure: hdr.auto_exposure,
             motion_blur: motion_blur.enabled,
@@ -596,6 +624,24 @@ impl VulkanRenderer {
         // its focal length from the field of view, and the shutter takes the
         // depth range it linearises with.
         self.dof.begin_frame(dof, camera, self.swapchain.extent);
+        // Reflections resolve against the camera *and* the environment: the
+        // composite subtracts the environment term the forward pass added, so
+        // it has to be handed the same rotation and the same tint that pass
+        // will be. The pyramid depth comes off the allocated image rather than
+        // the declaration, because a window too small for seven levels gets
+        // fewer and the march has to stop at the last one that exists.
+        if let Some(ids) = self.frame.ids.ssr {
+            let ambient = lighting.ambient_color * lighting.ambient_intensity;
+            self.ssr.begin_frame(
+                ssr,
+                &view,
+                self.swapchain.extent,
+                self.images.mip_levels(ids.hiz),
+                environment.yaw,
+                environment::SPECULAR_MIPS,
+                self.environment.specular_tint(ambient, environment),
+            );
+        }
         self.motion_blur.begin_frame(motion_blur, camera);
         // Sourced from the compiled frame, not from the setting: a window too
         // small for a chain leaves bloom enabled but unbuilt, and a non-zero
@@ -613,14 +659,28 @@ impl VulkanRenderer {
 
         // Material table and texture array are static after asset load, so cache
         // their descriptor sets and rebuild only when invalidated (set to None).
+        if self.material_buffer.is_none() {
+            self.material_buffer = Some(forward::material_buffer(&self.ctx, &self.materials));
+        }
+        let materials = self.material_buffer.clone().unwrap();
         if self.material_set.is_none() {
-            self.material_set = Some(self.forward.build_material_set(&self.ctx, &self.materials));
+            self.material_set = Some(self.forward.build_material_set(&self.ctx, &materials));
         }
         if self.texture_set.is_none() {
             self.texture_set = Some(self.forward.build_texture_set(&self.ctx, &self.textures));
         }
+        if self.prepass_material_set.is_none() {
+            self.prepass_material_set =
+                Some(self.prepass.build_material_set(&self.ctx, &materials));
+        }
+        if self.prepass_texture_set.is_none() {
+            self.prepass_texture_set =
+                Some(self.prepass.build_texture_set(&self.ctx, &self.textures));
+        }
         let material_set = self.material_set.clone().unwrap();
         let texture_set = self.texture_set.clone().unwrap();
+        let prepass_material_set = self.prepass_material_set.clone().unwrap();
+        let prepass_texture_set = self.prepass_texture_set.clone().unwrap();
 
         // One upload feeding every geometry pass in the frame — the geometry
         // prepass, the forward pass, and each cascade — because the per-object
@@ -722,17 +782,105 @@ impl VulkanRenderer {
             // derived for it exactly as for a draw.
             if kind == PassKind::Compute {
                 match body {
+                    PassBody::SsrHiz => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .ssr
+                            .expect("reflections without their images");
+                        let prepass = self
+                            .frame
+                            .ids
+                            .prepass
+                            .expect("the graph scheduled reflections with no prepass");
+                        // One view per level, because a storage image descriptor
+                        // takes exactly one — the sampled view the trace reads
+                        // spans the whole pyramid instead.
+                        let mips: Vec<_> = (0..self.images.mip_levels(ids.hiz))
+                            .map(|level| self.images.mip_view(ids.hiz, level))
+                            .collect();
+                        self.ssr.record_hiz(
+                            &mut builder,
+                            &self.ctx,
+                            self.images.view(prepass.depth),
+                            &mips,
+                            extent,
+                        );
+                    }
+                    PassBody::SsrSource => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .ssr
+                            .expect("reflections without their images");
+                        let mips: Vec<_> = (0..self.images.mip_levels(ids.source_pyramid))
+                            .map(|level| self.images.mip_view(ids.source_pyramid, level))
+                            .collect();
+                        self.ssr.record_source(
+                            &mut builder,
+                            &self.ctx,
+                            self.view_of(ids.source),
+                            &mips,
+                        );
+                    }
+                    PassBody::SsrTrace => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .ssr
+                            .expect("reflections without their images");
+                        let prepass = self
+                            .frame
+                            .ids
+                            .prepass
+                            .expect("the graph scheduled reflections with no prepass");
+                        self.ssr.record_trace(
+                            &mut builder,
+                            &self.ctx,
+                            self.images.view(ids.hiz),
+                            self.images.view(prepass.depth),
+                            self.images.view(prepass.normal),
+                            self.images.view(prepass.material),
+                            self.images.view(ids.source_pyramid),
+                            self.images.view(ids.rays),
+                        );
+                    }
+                    PassBody::SsrResolve => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .ssr
+                            .expect("reflections without their images");
+                        let prepass = self
+                            .frame
+                            .ids
+                            .prepass
+                            .expect("the graph scheduled reflections with no prepass");
+                        self.ssr.record_resolve(
+                            &mut builder,
+                            &self.ctx,
+                            self.view_of(ids.source),
+                            self.images.view(ids.rays),
+                            self.images.view(prepass.depth),
+                            self.images.view(prepass.normal),
+                            self.images.view(prepass.material),
+                            self.environment.specular_view(),
+                            self.environment.sampler(),
+                            self.images.view(ids.output),
+                        );
+                    }
                     PassBody::TaaResolve => {
                         let ids = self
                             .frame
                             .ids
                             .prepass
                             .expect("the graph scheduled TAA with no prepass");
+                        let taa = self.frame.ids.taa.expect("TAA without its images");
                         self.taa.record(
                             &mut builder,
                             &self.ctx,
                             &view,
-                            self.images.view(self.frame.ids.hdr_color),
+                            self.view_of(taa.source),
                             self.images.view(ids.velocity),
                             self.images.view(ids.depth),
                         );
@@ -954,6 +1102,8 @@ impl VulkanRenderer {
                     extent,
                     frame_uniforms.clone().unwrap(),
                     prepass_object_set.clone().unwrap(),
+                    prepass_material_set.clone(),
+                    prepass_texture_set.clone(),
                 ),
                 PassBody::SsaoResolve => {
                     let ids = self.frame.ids.prepass.unwrap();
@@ -1019,6 +1169,10 @@ impl VulkanRenderer {
                     },
                 ),
                 PassBody::Overlay
+                | PassBody::SsrHiz
+                | PassBody::SsrSource
+                | PassBody::SsrTrace
+                | PassBody::SsrResolve
                 | PassBody::TaaResolve
                 | PassBody::DofPrefilter
                 | PassBody::DofTileMax
