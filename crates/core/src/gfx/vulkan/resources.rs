@@ -19,6 +19,7 @@ use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo};
 
 use crate::gfx::graph::{FrameGraph, ResourceId};
 
+use super::contact_shadows::ContactShadowPass;
 use super::forward::ForwardPass;
 use super::frame::{Frame, PassBody};
 use super::prepass::GeometryPrepass;
@@ -196,6 +197,7 @@ impl PassFramebuffers {
         forward: &ForwardPass,
         prepass: &GeometryPrepass,
         ssao: &SsaoPass,
+        contact_shadows: &ContactShadowPass,
         shadow: &ShadowPass,
     ) -> Self {
         let ids = frame.ids;
@@ -227,6 +229,15 @@ impl PassFramebuffers {
                         let ssao_ids = ids.ssao.expect("SSAO pass without SSAO resources");
                         (ssao.blur_rp.clone(), vec![images.view(ssao_ids.ao)])
                     }
+                    PassBody::ContactShadows => (
+                        contact_shadows.render_pass.clone(),
+                        vec![
+                            images.view(
+                                ids.contact_shadows
+                                    .expect("contact shadow pass without its mask"),
+                            ),
+                        ],
+                    ),
                     PassBody::Forward => (
                         forward.render_pass.clone(),
                         vec![
@@ -245,6 +256,20 @@ impl PassFramebuffers {
                             ids.shadows.expect("shadow pass without a shadow image"),
                             cascade,
                         )],
+                    ),
+                    // The cascades' render pass, because it is the same render
+                    // pass: one depth attachment of the same format, cleared and
+                    // stored. A framebuffer only needs a *compatible* one, and a
+                    // second declaration of the identical thing would be a
+                    // second place for the format to drift.
+                    PassBody::PunctualShadows => (
+                        shadow.render_pass.clone(),
+                        vec![
+                            images.view(
+                                ids.shadow_atlas
+                                    .expect("punctual shadow pass without an atlas"),
+                            ),
+                        ],
                     ),
                     // The tonemap and overlay passes target the acquired
                     // swapchain image; the metering passes are dispatches and
@@ -309,6 +334,9 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         ],
         // 1.0 = fully unoccluded, so an untouched pixel darkens nothing.
         PassBody::SsaoResolve | PassBody::SsaoBlur => vec![Some([1.0, 0.0, 0.0, 0.0].into())],
+        // 1.0 = fully lit, for the same reason: the pass writes every pixel, so
+        // this only decides what a pixel would be if it somehow did not.
+        PassBody::ContactShadows => vec![Some([1.0, 0.0, 0.0, 0.0].into())],
         PassBody::Forward => vec![Some([0.02, 0.02, 0.03, 1.0].into()), Some(1.0.into()), None],
         PassBody::Tonemap => vec![None],
         // No render pass, so nothing to clear.
@@ -330,7 +358,10 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         | PassBody::BloomPrefilter
         | PassBody::BloomDownsample(_)
         | PassBody::BloomUpsample(_) => Vec::new(),
-        PassBody::ShadowCascade(_) => vec![Some(1.0.into())],
+        // One clear for the whole atlas, which is the other half of why every
+        // face is one pass: a tile nobody drew into reads as far, and therefore
+        // as lit.
+        PassBody::ShadowCascade(_) | PassBody::PunctualShadows => vec![Some(1.0.into())],
     }
 }
 

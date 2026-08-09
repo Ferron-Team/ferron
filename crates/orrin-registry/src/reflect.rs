@@ -131,6 +131,23 @@ pub fn take<T: Reflect>(value: &Value, field: &str) -> Result<T, ValueError> {
     T::from_value(inner).map_err(|e| e.at_field(field))
 }
 
+/// Read one named field, or `fallback` if the document does not have it.
+///
+/// This is how a component grows a field without orphaning every scene saved
+/// before it existed. [`take`] is right for a field that has always been there —
+/// its absence means the document is wrong, and saying so beats inventing a
+/// value. It is exactly wrong for a field added later, where absence means the
+/// file predates it and the type's own default is the correct reading.
+///
+/// A field *present* but of the wrong type is still an error either way: that is
+/// a broken document, not an old one.
+pub fn take_or<T: Reflect>(value: &Value, field: &str, fallback: T) -> Result<T, ValueError> {
+    match value.field(field) {
+        Some(inner) => T::from_value(inner).map_err(|e| e.at_field(field)),
+        None => Ok(fallback),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -143,6 +143,7 @@ entity #1
             "\
 entity #1
   orrin.light = Point
+    casts_shadows = true
     color = (1.0, 1.0, 1.0)
     intensity = 8.0
     range = 10.0
@@ -152,12 +153,37 @@ entity #1
 
     #[test]
     fn an_unknown_variant_names_itself() {
-        let stale = Value::enumeration("Spot", [("angle", Value::F32(30.0))]);
+        let stale = Value::enumeration("Area", [("width", Value::F32(30.0))]);
         let err = Light::from_value(&stale).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "expected one of: Directional, Point, found `Spot`"
+            "expected one of: Directional, Point, Spot, found `Area`"
         );
+    }
+
+    /// A point light saved before `casts_shadows` existed still loads, and loads
+    /// as a caster — which is what it was, since every light cast before the
+    /// switch was there to say otherwise. Without the `#[reflect(default)]` on
+    /// that field this is a missing-field error and the whole entity is lost, so
+    /// the guarantee is worth a test of its own rather than trusting the derive.
+    #[test]
+    fn a_light_saved_before_the_shadow_switch_still_loads() {
+        let old = Value::enumeration(
+            "Point",
+            [
+                ("color", Vec3::ONE.to_value()),
+                ("intensity", Value::F32(8.0)),
+                ("range", Value::F32(10.0)),
+            ],
+        );
+        let light = Light::from_value(&old).expect("an older point light must still load");
+        assert!(matches!(
+            light,
+            Light::Point {
+                casts_shadows: true,
+                ..
+            }
+        ));
     }
 
     /// The reason `Spin` cannot be derived: `apply` feeds `axis` to

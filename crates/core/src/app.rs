@@ -16,6 +16,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera_controller::CameraController;
 use crate::editor::Editor;
+use crate::gfx::punctual::{MAX_SHADOW_LIGHTS, ShadowAtlas};
 use crate::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
 use crate::gfx::vulkan::ShadowFrame;
 use crate::gfx::vulkan::VulkanRenderer;
@@ -24,8 +25,8 @@ use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene};
 use crate::scene::{
-    AmbientLight, BloomSettings, Camera, Culling, DebugLine, DebugLines, DofSettings,
-    EnvironmentSettings, FogSettings, HdrSettings, InputState, LogBuffer, LogLevel,
+    AmbientLight, BloomSettings, Camera, ContactShadowSettings, Culling, DebugLine, DebugLines,
+    DofSettings, EnvironmentSettings, FogSettings, HdrSettings, InputState, LogBuffer, LogLevel,
     MotionBlurSettings, ShadowSettings, SsaoSettings, SsrSettings, TaaSettings, Time, load_hdri,
 };
 use crate::stats::FrameStats;
@@ -59,6 +60,11 @@ pub struct App {
     /// This frame's cascade matrices. The caster orders live in `geometry`,
     /// which was culled against exactly these.
     cascades: CascadeSet,
+    /// Which punctual lights got atlas tiles this frame, where those tiles are,
+    /// and the matrix each face is drawn with. Fitted between extracting the
+    /// lighting and extracting the geometry, because the caster lists are culled
+    /// against the very lights it chose.
+    atlas: ShadowAtlas,
     /// This frame's debug lines, copied out of the `DebugLines` resource so the
     /// renderer borrow doesn't overlap the world borrow.
     debug_lines: Vec<DebugLine>,
@@ -162,6 +168,7 @@ impl App {
             geometry: FrameGeometry::default(),
             lighting: SceneLighting::default(),
             cascades: CascadeSet::default(),
+            atlas: ShadowAtlas::default(),
             debug_lines: Vec::new(),
             #[cfg(feature = "scripting")]
             scripting: None,
@@ -193,6 +200,7 @@ impl App {
         world.insert_resource(SsaoSettings::default());
         world.insert_resource(SsrSettings::default());
         world.insert_resource(ShadowSettings::default());
+        world.insert_resource(ContactShadowSettings::default());
         world.insert_resource(HdrSettings::default());
         world.insert_resource(BloomSettings::default());
         world.insert_resource(TaaSettings::default());
@@ -547,13 +555,27 @@ impl ApplicationHandler for App {
                     } else {
                         CascadeSet::default()
                     };
-                    // One sweep for both questions: the camera's list and every
-                    // cascade's are orderings over the same derived items, so the
-                    // cascades have to be fitted before it rather than after.
+                    // Same reason the cascades are fitted first, and it has to
+                    // be after `extract_lighting`: the atlas spends its tiles on
+                    // the lights that frame produced, and the caster lists are
+                    // culled against the reach of exactly those.
+                    self.atlas = match shadow_settings.atlas_config() {
+                        Some(config) => crate::gfx::punctual::fit(
+                            &self.lighting,
+                            self.world.resource::<Camera>().position,
+                            &config,
+                        ),
+                        None => ShadowAtlas::default(),
+                    };
+                    // One sweep for every question: the camera's list, every
+                    // cascade's, and every punctual light's are orderings over
+                    // the same derived items, so both fits have to happen before
+                    // it rather than after.
                     systems::extract_geometry(
                         &self.world,
                         aspect,
                         &self.cascades,
+                        &self.atlas,
                         &mut self.geometry,
                     );
                     // Copy this frame's debug lines out (they're Copy) so the render
@@ -564,6 +586,7 @@ impl ApplicationHandler for App {
                 }
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
+                let contact_shadows = *self.world.resource::<ContactShadowSettings>();
                 let ssr = *self.world.resource::<SsrSettings>();
                 let taa = *self.world.resource::<TaaSettings>();
                 let motion_blur = *self.world.resource::<MotionBlurSettings>();
@@ -601,11 +624,14 @@ impl ApplicationHandler for App {
                     // `geometry`, so the array has to outlive the call.
                     let caster_lists: [DrawList<'_>; MAX_CASCADES] =
                         std::array::from_fn(|i| self.geometry.cascade(i));
+                    let punctual_lists: [DrawList<'_>; MAX_SHADOW_LIGHTS] =
+                        std::array::from_fn(|i| self.geometry.punctual(i));
                     renderer.render_with_overlay(
                         self.geometry.visible(),
                         &self.lighting,
                         &camera,
                         &ssao,
+                        &contact_shadows,
                         &ssr,
                         &taa,
                         &motion_blur,
@@ -616,10 +642,18 @@ impl ApplicationHandler for App {
                         dt,
                         &self.debug_lines,
                         profiler_frame,
-                        (self.cascades.count > 0).then(|| ShadowFrame {
-                            cascades: &self.cascades,
-                            casters: &caster_lists,
-                            settings: &shadow_settings,
+                        // Either half is reason enough to hand one over: the sun
+                        // and the punctual lights are independent, and a scene
+                        // with cascades off and a lamp casting is an ordinary
+                        // thing to want.
+                        (self.cascades.count > 0 || !self.atlas.faces.is_empty()).then(|| {
+                            ShadowFrame {
+                                cascades: &self.cascades,
+                                casters: &caster_lists,
+                                atlas: &self.atlas,
+                                punctual_casters: &punctual_lists,
+                                settings: &shadow_settings,
+                            }
                         }),
                         &mut overlay,
                     );

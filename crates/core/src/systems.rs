@@ -3,8 +3,11 @@ use glam::{Mat3, Mat4, Vec3};
 use orrin_ecs::{Entity, World};
 
 use crate::geom::Aabb;
+use crate::gfx::punctual::{MAX_SHADOW_LIGHTS, ShadowAtlas};
 use crate::gfx::shadows::{Cascade, CascadeSet, MAX_CASCADES};
-use crate::gfx::{DrawList, MAX_POINT_LIGHTS, PointLight, RenderItem, SceneLighting};
+use crate::gfx::{
+    DrawList, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, PointLight, RenderItem, SceneLighting, SpotLight,
+};
 use crate::scene::{
     AmbientLight, Camera, Culling, FogSettings, Light, LocalTransform, MaterialHandle, MeshBounds,
     MeshHandle, Spin, WorldTransform,
@@ -32,6 +35,11 @@ pub struct FrameGeometry {
     visible: Vec<u32>,
     /// What casts into each active cascade, in draw order.
     cascades: [Vec<u32>; MAX_CASCADES],
+    /// What casts for each punctual light that got atlas tiles, indexed like
+    /// `ShadowAtlas::casters`. One list per *light* rather than per face: a
+    /// point light's six frustums share a reach, and testing them apart costs
+    /// more than the draws it would save at these ranges.
+    punctual: [Vec<u32>; MAX_SHADOW_LIGHTS],
     /// Where every extracted entity stood last frame, and where it stands now.
     /// Swapped rather than updated in place at the end of each extraction, so an
     /// entity nobody extracted last frame has no entry at all — which is what
@@ -89,6 +97,12 @@ impl FrameGeometry {
     pub fn cascade(&self, index: usize) -> DrawList<'_> {
         DrawList::new(&self.items, &self.cascades[index])
     }
+
+    /// What punctual caster `index` draws into every one of its faces. Empty for
+    /// a slot the atlas did not fill.
+    pub fn punctual(&self, index: usize) -> DrawList<'_> {
+        DrawList::new(&self.items, &self.punctual[index])
+    }
 }
 
 /// Build this frame's draw lists: what the camera can see, and what casts into
@@ -112,11 +126,15 @@ pub fn extract_geometry(
     world: &World,
     aspect: f32,
     cascades: &CascadeSet,
+    atlas: &ShadowAtlas,
     out: &mut FrameGeometry,
 ) {
     out.items.clear();
     out.visible.clear();
     for list in out.cascades.iter_mut() {
+        list.clear();
+    }
+    for list in out.punctual.iter_mut() {
         list.clear();
     }
     out.motion.begin();
@@ -128,6 +146,10 @@ pub fn extract_geometry(
     let frustum = camera.as_ref().map(|c| c.frustum(aspect));
     let bounds = world.get_resource::<MeshBounds>();
     let active = &cascades.cascades[..cascades.count];
+    // Truncated rather than asserted: the atlas cannot produce more than
+    // `MAX_SHADOW_LIGHTS` casters, and a slice keeps that from being something
+    // this loop has to believe.
+    let punctual = &atlas.casters[..atlas.casters.len().min(MAX_SHADOW_LIGHTS)];
     let mut total = 0usize;
 
     world
@@ -153,11 +175,20 @@ pub fn extract_geometry(
                     .get(i)
                     .is_some_and(|cascade| casts_into(&world_bounds, cascade))
             });
+            // A punctual light reaches a sphere, so anything outside it cannot
+            // shadow anything it lights. Distance to the *box* rather than to
+            // its centre, or a long wall through a light's volume would be
+            // culled out of the shadow it plainly casts.
+            let lights: [bool; MAX_SHADOW_LIGHTS] = std::array::from_fn(|i| {
+                punctual.get(i).is_some_and(|caster| {
+                    world_bounds.distance_squared_to(caster.center) <= caster.radius * caster.radius
+                })
+            });
 
             // An object no list wants still costs the sweep, but it must not
             // cost a row in `items` — the object buffer is uploaded from this
             // array and a row nothing indexes is upload bandwidth for nothing.
-            if !visible && !casts.iter().any(|&c| c) {
+            if !visible && !casts.iter().any(|&c| c) && !lights.iter().any(|&c| c) {
                 return;
             }
 
@@ -179,6 +210,11 @@ pub fn extract_geometry(
                     list.push(index);
                 }
             }
+            for (list, casts) in out.punctual.iter_mut().zip(lights) {
+                if casts {
+                    list.push(index);
+                }
+            }
         });
 
     // Grouping by mesh lets the passes bind vertex/index buffers once per run
@@ -190,6 +226,9 @@ pub fn extract_geometry(
     };
     out.visible.sort_unstable_by_key(|i| key(&out.items, i));
     for list in out.cascades.iter_mut() {
+        list.sort_unstable_by_key(|i| key(&out.items, i));
+    }
+    for list in out.punctual.iter_mut() {
         list.sort_unstable_by_key(|i| key(&out.items, i));
     }
 
@@ -414,6 +453,7 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
     out.fog_height_falloff = defaults.fog_height_falloff;
     out.fog_height = defaults.fog_height;
     out.point_lights.clear();
+    out.spot_lights.clear();
 
     if let Some(ambient) = world.get_resource::<AmbientLight>() {
         out.ambient_color = ambient.color;
@@ -444,6 +484,7 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                 color,
                 intensity,
                 range,
+                casts_shadows,
             } => {
                 if out.point_lights.len() < MAX_POINT_LIGHTS {
                     out.point_lights.push(PointLight {
@@ -451,6 +492,34 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                         color,
                         intensity,
                         range,
+                        casts_shadows,
+                    });
+                }
+            }
+            Light::Spot {
+                color,
+                intensity,
+                range,
+                inner_angle,
+                outer_angle,
+                casts_shadows,
+            } => {
+                if out.spot_lights.len() < MAX_SPOT_LIGHTS {
+                    // Cosines here rather than in the shader, and ordered so the
+                    // inner cone is never outside the outer one — the falloff
+                    // divides by their difference, and a cone authored inside
+                    // out would otherwise light its own outside.
+                    let outer = outer_angle.clamp(1.0, 89.0);
+                    let inner = inner_angle.clamp(0.0, outer);
+                    out.spot_lights.push(SpotLight {
+                        position: transform.translation,
+                        direction: (transform.rotation * Vec3::NEG_Z).normalize_or_zero(),
+                        color,
+                        intensity,
+                        range,
+                        inner_cos: inner.to_radians().cos(),
+                        outer_cos: outer.to_radians().cos(),
+                        casts_shadows,
                     });
                 }
             }
@@ -462,6 +531,7 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
 mod tests {
     use super::{FrameGeometry, extract_geometry, normal_matrix};
     use crate::gfx::RenderItem;
+    use crate::gfx::punctual::ShadowAtlas;
     use crate::gfx::shadows::CascadeSet;
     use crate::scene::propagate_transforms;
     use crate::scene::{
@@ -499,7 +569,13 @@ mod tests {
         let mut geometry = FrameGeometry::default();
         // No cascades: these cover the camera list, and a cascade would only
         // add items to `geometry.items` that the visible order does not name.
-        extract_geometry(world, ASPECT, &CascadeSet::default(), &mut geometry);
+        extract_geometry(
+            world,
+            ASPECT,
+            &CascadeSet::default(),
+            &ShadowAtlas::default(),
+            &mut geometry,
+        );
         let visible = geometry.visible();
         (0..visible.len()).map(|i| *visible.item(i)).collect()
     }
@@ -525,14 +601,26 @@ mod tests {
 
         let mut geometry = FrameGeometry::default();
         propagate_transforms(&mut world);
-        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &CascadeSet::default(),
+            &ShadowAtlas::default(),
+            &mut geometry,
+        );
         let before = *geometry.visible().item(0);
 
         world
             .query::<&mut LocalTransform>()
             .for_each(|_entity, local| local.translation.x += 2.0);
         propagate_transforms(&mut world);
-        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &CascadeSet::default(),
+            &ShadowAtlas::default(),
+            &mut geometry,
+        );
         let after = *geometry.visible().item(0);
 
         assert_ne!(after.model, before.model);
@@ -550,7 +638,13 @@ mod tests {
 
         let mut geometry = FrameGeometry::default();
         propagate_transforms(&mut world);
-        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &CascadeSet::default(),
+            &ShadowAtlas::default(),
+            &mut geometry,
+        );
         let first = *geometry.visible().item(0);
 
         let mut existing = Vec::new();
@@ -560,7 +654,13 @@ mod tests {
         world.despawn(existing[0]);
         spawn(&mut world, Vec3::ZERO, CUBE);
         propagate_transforms(&mut world);
-        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &CascadeSet::default(),
+            &ShadowAtlas::default(),
+            &mut geometry,
+        );
         let second = *geometry.visible().item(0);
 
         assert_ne!(second.model, first.model);
@@ -832,6 +932,7 @@ mod tests {
 #[cfg(test)]
 mod geometry_tests {
     use super::{FrameGeometry, extract_geometry};
+    use crate::gfx::punctual::ShadowAtlas;
     use crate::gfx::shadows::{CascadeConfig, CascadeSet, cascades};
     use crate::scene::{
         Camera, CpuMesh, Culling, LocalTransform, MaterialHandle, MeshBounds, MeshHandle,
@@ -889,7 +990,7 @@ mod geometry_tests {
         let set = sun_cascades(&camera);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &set, &mut geometry);
+        extract_geometry(&world, ASPECT, &set, &ShadowAtlas::default(), &mut geometry);
 
         assert_eq!(geometry.visible().len(), 0, "it should not be visible");
         assert!(
@@ -908,7 +1009,7 @@ mod geometry_tests {
         let set = sun_cascades(&camera);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &set, &mut geometry);
+        extract_geometry(&world, ASPECT, &set, &ShadowAtlas::default(), &mut geometry);
 
         assert_eq!(geometry.visible().len(), 0);
         for i in 0..set.count {
@@ -930,7 +1031,7 @@ mod geometry_tests {
         let set = sun_cascades(&camera);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &set, &mut geometry);
+        extract_geometry(&world, ASPECT, &set, &ShadowAtlas::default(), &mut geometry);
 
         assert_eq!(geometry.items.len(), 1);
         assert_eq!(geometry.visible.len(), 1);
@@ -954,7 +1055,13 @@ mod geometry_tests {
         ]);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &CascadeSet::default(),
+            &ShadowAtlas::default(),
+            &mut geometry,
+        );
         let visible = geometry.visible();
         assert_eq!(visible.len(), 4, "the camera should see all four");
 
@@ -983,7 +1090,13 @@ mod geometry_tests {
         ]);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &CascadeSet::default(),
+            &ShadowAtlas::default(),
+            &mut geometry,
+        );
         let visible = geometry.visible();
         assert_eq!(visible.len(), 2);
 

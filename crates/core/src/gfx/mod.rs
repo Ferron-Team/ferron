@@ -1,5 +1,6 @@
 pub mod graph;
 pub mod headless;
+pub mod punctual;
 pub mod sh;
 pub mod shadows;
 pub mod vulkan;
@@ -8,8 +9,9 @@ pub use headless::HeadlessBackend;
 
 use crate::geom::Aabb;
 use crate::scene::{
-    BloomSettings, Camera, CpuMesh, DofSettings, EnvironmentSettings, HdrSettings, MaterialHandle,
-    MeshHandle, MotionBlurSettings, SsaoSettings, SsrSettings, TaaSettings,
+    BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
+    HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, SsaoSettings, SsrSettings,
+    TaaSettings,
 };
 use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
@@ -128,6 +130,11 @@ impl<'a> DrawList<'a> {
 
 pub const MAX_POINT_LIGHTS: usize = 16;
 
+/// Half the point-light cap, because a cone is a narrower thing to want a lot
+/// of and every slot costs the same uniform-buffer space whether a scene uses it
+/// or not. Keep in sync with `MAX_SPOT_LIGHTS` in `forward.frag`.
+pub const MAX_SPOT_LIGHTS: usize = 8;
+
 /// Size of the shader's bound texture array (set 2). Keep at or below the
 /// device's `maxPerStageDescriptorSampledImages` (≥16 guaranteed; MoltenVK
 /// allows far more).
@@ -145,12 +152,46 @@ pub struct DirectionalLight {
     pub intensity: f32,
 }
 
+impl DirectionalLight {
+    /// The direction *toward* the light, which is what every shader wants.
+    ///
+    /// One definition because two consumers march along it: the forward pass
+    /// shades with it, and the contact-shadow pass traces the depth buffer
+    /// toward it. A sign flipped in one of them would be a shadow cast on the
+    /// lit side of everything, and nothing about either result would say which
+    /// one was wrong.
+    pub fn direction_to_light(&self) -> Vec3 {
+        (-self.direction).normalize_or_zero()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PointLight {
     pub position: Vec3,
     pub color: Vec3,
     pub intensity: f32,
     pub range: f32,
+    /// Whether this light asks for atlas tiles. Asking is not getting: the atlas
+    /// has a fixed number of tiles and a point light spends six, so
+    /// [`fit`](punctual::fit) spends them on the lights that matter most and
+    /// leaves the rest shading unshadowed.
+    pub casts_shadows: bool,
+}
+
+/// A cone of light. `inner_cos`/`outer_cos` are cosines of the half angles
+/// rather than the angles, because that is what the shader compares against —
+/// converting once here keeps a transcendental out of the per-light loop.
+#[derive(Clone, Copy, Debug)]
+pub struct SpotLight {
+    pub position: Vec3,
+    /// The direction the cone points, normalised.
+    pub direction: Vec3,
+    pub color: Vec3,
+    pub intensity: f32,
+    pub range: f32,
+    pub inner_cos: f32,
+    pub outer_cos: f32,
+    pub casts_shadows: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +201,8 @@ pub struct SceneLighting {
     pub sun: DirectionalLight,
     /// Anything past [`MAX_POINT_LIGHTS`] is ignored.
     pub point_lights: Vec<PointLight>,
+    /// Anything past [`MAX_SPOT_LIGHTS`] is ignored.
+    pub spot_lights: Vec<SpotLight>,
     /// Blinn-Phong specular exponent. Higher = smaller, sharper highlight.
     pub shininess: f32,
     pub specular_strength: f32,
@@ -210,6 +253,7 @@ impl Default for SceneLighting {
                 intensity: 1.0,
             },
             point_lights: Vec::new(),
+            spot_lights: Vec::new(),
             shininess: 32.0,
             specular_strength: 0.4,
             fog_color: Vec3::new(0.55, 0.62, 0.72),
@@ -248,6 +292,7 @@ pub trait RenderBackend {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,

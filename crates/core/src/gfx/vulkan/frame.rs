@@ -21,6 +21,7 @@ use crate::gfx::shadows::MAX_CASCADES;
 
 use super::MSAA_SAMPLES;
 use super::bloom::MAX_BLOOM_MIPS;
+use super::contact_shadows::MASK_FORMAT;
 use super::dof::COC_TILE_SHIFT;
 use super::hdr::HDR_FORMAT;
 use super::motion_blur::TILE_SHIFT;
@@ -36,6 +37,12 @@ use super::swapchain::DEPTH_FORMAT;
 pub struct FrameConfig {
     pub color_format: Format,
     pub ssao: bool,
+    /// Whether the frame marches the depth buffer for the shadow band the
+    /// cascades cannot resolve. Structural like the rest, and one more consumer
+    /// that keeps the geometry prepass alive on its own — it reads the depth and
+    /// the normals that pass writes, and its result is what the forward pass
+    /// multiplies the sun's term by.
+    pub contact_shadows: bool,
     /// Whether the frame reflects off itself. Structural like the rest, and
     /// another consumer that can keep the geometry prepass alive on its own —
     /// it reads depth, normals and the material target the prepass writes.
@@ -68,6 +75,14 @@ pub struct FrameConfig {
     pub overlay: bool,
     pub shadow_cascades: u8,
     pub shadow_resolution: u32,
+    /// Edge of the punctual shadow atlas in texels, zero for a frame where
+    /// nothing punctual casts. Sourced from the fitted atlas rather than from
+    /// the setting, for the reason `shadow_cascades` is: a frame whose lights
+    /// all opted out declares no atlas rather than clearing one nobody reads.
+    ///
+    /// One number and one pass however many lights cast — the tile count varies
+    /// frame to frame *inside* the pass, which is exactly why it is not here.
+    pub shadow_atlas: u32,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -80,6 +95,8 @@ pub enum PassBody {
     GeometryPrepass,
     SsaoResolve,
     SsaoBlur,
+    /// The sun's visibility over the short range a cascade texel cannot resolve.
+    ContactShadows,
     Forward,
     /// Every level of the reflection trace's min-depth pyramid, in one dispatch.
     SsrHiz,
@@ -118,6 +135,10 @@ pub enum PassBody {
     Tonemap,
     Overlay,
     ShadowCascade(u32),
+    /// Every point and spot light's faces, in one pass over one atlas. A tile is
+    /// a viewport rather than a node, which is what keeps this a single barrier
+    /// instead of one per face.
+    PunctualShadows,
 }
 
 /// Handles the executor needs to bind per-frame resources and to find the
@@ -148,11 +169,19 @@ pub struct FrameIds {
     /// SSAO, TAA, motion blur, depth of field, or any combination of them.
     pub prepass: Option<PrepassIds>,
     pub ssao: Option<SsaoIds>,
+    /// The sun-visibility mask, when the frame marches for one. One image and no
+    /// struct: the pass reads the prepass and writes this, and there is nothing
+    /// else to name.
+    pub contact_shadows: Option<ResourceId>,
     pub ssr: Option<SsrIds>,
     pub taa: Option<TaaIds>,
     pub dof: Option<DofIds>,
     pub motion_blur: Option<MotionBlurIds>,
     pub shadows: Option<ResourceId>,
+    /// The punctual atlas, when anything punctual casts. One image and no
+    /// struct, like the contact-shadow mask: one pass writes it and the forward
+    /// pass reads it.
+    pub shadow_atlas: Option<ResourceId>,
 }
 
 /// The two chains bloom needs, each level a separate image.
@@ -362,16 +391,43 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         }
     }
 
+    // Beside the cascades rather than after the prepass, because it is the same
+    // kind of thing: geometry rasterised from a light's point of view, needed
+    // before anything shades. One node for every face of every light — a tile is
+    // a viewport into this attachment, so six faces of sixteen lights would
+    // still be one barrier.
+    let shadow_atlas = (config.shadow_atlas > 0).then(|| {
+        let atlas = builder.create_image(
+            "shadow_atlas",
+            ImageDesc::new(DEPTH_FORMAT).extent(Extent::Fixed([config.shadow_atlas; 2])),
+        );
+
+        let id = builder
+            .pass("punctual_shadows", PassKind::Inline)
+            .access(object_transforms, Access::StorageRead)
+            .access(atlas, Access::DepthAttachment)
+            .build();
+        record(id, PassBody::PunctualShadows, &mut bodies);
+
+        atlas
+    });
+
     // One prepass serves every consumer rather than one each: they need the same
     // rasterisation, and running it twice to hand each part of the result to a
     // different reader is the cost the shared node exists to avoid. It writes
     // all three targets whichever consumer asked for it — a second pipeline that
     // dropped the normal attachment for a TAA-without-SSAO frame would buy a
     // target's bandwidth at the price of a second render pass to keep in step.
-    // Five readers now want different parts of it: SSAO takes depth and normals,
-    // TAA and motion blur take depth and motion, depth of field takes depth
-    // alone, reflections take depth, normals and the material target.
-    let prepass = (config.ssao || config.taa || config.motion_blur || config.dof || config.ssr)
+    // Six readers now want different parts of it: SSAO and contact shadows take
+    // depth and normals, TAA and motion blur take depth and motion, depth of
+    // field takes depth alone, reflections take depth, normals and the material
+    // target.
+    let prepass = (config.ssao
+        || config.contact_shadows
+        || config.taa
+        || config.motion_blur
+        || config.dof
+        || config.ssr)
         .then(|| PrepassIds {
             normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
             velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
@@ -422,14 +478,41 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         record(id, PassBody::SsaoBlur, &mut bodies);
     }
 
+    // Between the prepass and shading, and it can be nowhere else: it marches
+    // the depth that pass wrote, and the mask it leaves is what the forward pass
+    // multiplies the sun's term by. Unblurred, unlike the AO beside it — this is
+    // a hard visibility term whose noise is a dithered ray origin, and a spatial
+    // filter would smear the contact it exists to sharpen. The temporal resolve
+    // is what averages it.
+    let contact_shadows = config.contact_shadows.then(|| {
+        let prepass = prepass.expect("contact shadows read the geometry prepass");
+        let mask = builder.create_image("contact_shadow_mask", ImageDesc::new(MASK_FORMAT));
+
+        let id = builder
+            .pass("contact_shadows", PassKind::Inline)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(mask, Access::ColorAttachment)
+            .build();
+        record(id, PassBody::ContactShadows, &mut bodies);
+
+        mask
+    });
+
     let mut forward = builder
         .pass("forward", PassKind::Inline)
         .access(object_transforms, Access::StorageRead);
     if let Some(ssao) = ssao {
         forward = forward.access(ssao.ao, Access::Sampled);
     }
+    if let Some(mask) = contact_shadows {
+        forward = forward.access(mask, Access::Sampled);
+    }
     if let Some(shadows) = shadows {
         forward = forward.access(shadows, Access::Sampled);
+    }
+    if let Some(atlas) = shadow_atlas {
+        forward = forward.access(atlas, Access::Sampled);
     }
     let id = forward
         .access(msaa_hdr, Access::ColorAttachment)
@@ -864,11 +947,13 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             bloom,
             prepass,
             ssao,
+            contact_shadows,
             ssr,
             taa,
             dof,
             motion_blur,
             shadows,
+            shadow_atlas,
         },
         bodies,
     })

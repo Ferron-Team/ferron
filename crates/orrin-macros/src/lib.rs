@@ -22,6 +22,14 @@ use syn::{Attribute, Data, DataEnum, DataStruct, DeriveInput, Fields, parse_macr
 /// restored with `Default::default()`, so a skipped field's type must be
 /// `Default`. This is the Rust counterpart of C#'s `[Transient]`.
 ///
+/// `#[reflect(default)]` (or `#[reflect(default = <expr>)]`) keeps the field in
+/// the value but makes reading it tolerate absence, falling back to
+/// `Default::default()` or to the given expression. This is how a component
+/// grows a field without orphaning every scene saved before it existed: without
+/// it, `from_value` reports a missing field and the whole entity fails to load.
+/// Use it for a field added after the fact and never for one that has always
+/// been there, where absence really does mean the document is wrong.
+///
 /// A type whose constructor establishes an invariant its fields do not must
 /// *not* use this derive — the generated `from_value` assigns fields directly
 /// and would happily build an instance the constructor would have rejected.
@@ -73,7 +81,8 @@ fn struct_bodies(data: &DataStruct) -> syn::Result<(TokenStream2, TokenStream2)>
             for field in &fields.named {
                 let ident = field.ident.as_ref().expect("named field");
                 let key = ident.to_string();
-                if skipped(&field.attrs)? {
+                let options = field_options(&field.attrs)?;
+                if options.skip {
                     inits.push(quote! { #ident: ::core::default::Default::default() });
                 } else {
                     entries.push(quote! {
@@ -82,7 +91,8 @@ fn struct_bodies(data: &DataStruct) -> syn::Result<(TokenStream2, TokenStream2)>
                             ::orrin_registry::Reflect::to_value(&self.#ident),
                         )
                     });
-                    inits.push(quote! { #ident: ::orrin_registry::take(value, #key)? });
+                    let read = options.read(&key);
+                    inits.push(quote! { #ident: #read });
                 }
             }
 
@@ -104,10 +114,16 @@ fn struct_bodies(data: &DataStruct) -> syn::Result<(TokenStream2, TokenStream2)>
         // meaningless `.0` level either.
         Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
             let field = &fields.unnamed[0];
-            if skipped(&field.attrs)? {
+            // A newtype flattens, so there is no named field for either option
+            // to attach to: `skip` would discard the whole value, and `default`
+            // would need an absent field to notice, which a flattened value
+            // does not have.
+            let options = field_options(&field.attrs)?;
+            if options.skip || options.default.is_some() {
                 return Err(syn::Error::new_spanned(
                     field,
-                    "`skip` on a newtype's only field would discard the whole value",
+                    "`skip` and `default` have no meaning on a newtype's only \
+                     field — it flattens to the value itself",
                 ));
             }
             let ty = &field.ty;
@@ -154,7 +170,8 @@ fn enum_bodies(data: &DataEnum) -> syn::Result<(TokenStream2, TokenStream2)> {
                 for field in &fields.named {
                     let field_ident = field.ident.as_ref().expect("named field");
                     let field_key = field_ident.to_string();
-                    if skipped(&field.attrs)? {
+                    let options = field_options(&field.attrs)?;
+                    if options.skip {
                         bindings.push(quote! { #field_ident: _ });
                         inits.push(quote! { #field_ident: ::core::default::Default::default() });
                     } else {
@@ -165,9 +182,8 @@ fn enum_bodies(data: &DataEnum) -> syn::Result<(TokenStream2, TokenStream2)> {
                                 ::orrin_registry::Reflect::to_value(#field_ident),
                             )
                         });
-                        inits.push(quote! {
-                            #field_ident: ::orrin_registry::take(value, #field_key)?
-                        });
+                        let read = options.read(&field_key);
+                        inits.push(quote! { #field_ident: #read });
                     }
                 }
 
@@ -231,20 +247,59 @@ fn enum_bodies(data: &DataEnum) -> syn::Result<(TokenStream2, TokenStream2)> {
     ))
 }
 
-fn skipped(attrs: &[Attribute]) -> syn::Result<bool> {
-    let mut skip = false;
+/// What `#[reflect(..)]` said about one field.
+#[derive(Default)]
+struct FieldOptions {
+    skip: bool,
+    /// `Some(None)` for a bare `default`, `Some(Some(expr))` for `default = ..`.
+    default: Option<Option<syn::Expr>>,
+}
+
+impl FieldOptions {
+    /// The expression that reads this field out of a `Value`.
+    fn read(&self, key: &str) -> TokenStream2 {
+        match &self.default {
+            None => quote! { ::orrin_registry::take(value, #key)? },
+            Some(None) => quote! {
+                ::orrin_registry::take_or(value, #key, ::core::default::Default::default())?
+            },
+            Some(Some(fallback)) => {
+                quote! { ::orrin_registry::take_or(value, #key, #fallback)? }
+            }
+        }
+    }
+}
+
+fn field_options(attrs: &[Attribute]) -> syn::Result<FieldOptions> {
+    let mut options = FieldOptions::default();
     for attr in attrs {
         if !attr.path().is_ident("reflect") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("skip") {
-                skip = true;
+                options.skip = true;
+                Ok(())
+            } else if meta.path.is_ident("default") {
+                // `default` alone or `default = <expr>`; the `=` is what tells
+                // them apart, and a bare one is only useful where the type's
+                // own `Default` is the value the old documents implied.
+                options.default = Some(match meta.input.peek(syn::Token![=]) {
+                    true => Some(meta.value()?.parse()?),
+                    false => None,
+                });
                 Ok(())
             } else {
-                Err(meta.error("unrecognized `reflect` option; expected `skip`"))
+                Err(meta.error("unrecognized `reflect` option; expected `skip` or `default`"))
             }
         })?;
     }
-    Ok(skip)
+    if options.skip && options.default.is_some() {
+        return Err(syn::Error::new_spanned(
+            attrs.first(),
+            "`skip` and `default` are the same instruction for a field that is \
+             never written; use one",
+        ));
+    }
+    Ok(options)
 }

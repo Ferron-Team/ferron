@@ -4,8 +4,9 @@ use crate::gfx::shadows::MAX_CASCADES;
 
 use super::{color_row, vec3_row};
 use crate::scene::{
-    AmbientLight, BloomSettings, Camera, DofSettings, EnvironmentSettings, FogSettings,
-    HdrSettings, MotionBlurSettings, ShadowSettings, SsaoSettings, SsrSettings, TaaSettings,
+    AmbientLight, BloomSettings, Camera, ContactShadowSettings, DofSettings, EnvironmentSettings,
+    FogSettings, HdrSettings, MotionBlurSettings, ShadowSettings, SsaoSettings, SsrSettings,
+    TaaSettings,
 };
 
 type Column = fn(&mut egui::Ui, &World);
@@ -141,6 +142,95 @@ fn shadow_column(ui: &mut egui::Ui, world: &World) {
     ui.add(egui::Slider::new(&mut s.slope_bias, 0.0..=8.0).text("Slope bias"));
     ui.add(egui::Slider::new(&mut s.strength, 0.0..=1.0).text("Strength"));
     ui.checkbox(&mut s.debug_cascades, "Tint cascades");
+
+    ui.add_space(6.0);
+    ui.strong("Point & spot shadows")
+        .on_hover_text("One atlas, a tile per cube face, drawn in a single pass");
+    // Whether a *given* light casts is on the light, in the inspector; these are
+    // the shape of the atlas it competes for.
+    ui.checkbox(&mut s.punctual_enabled, "Enabled");
+    ui.horizontal(|ui| {
+        ui.label("Atlas");
+        // 4096 is the ceiling on purpose, twice over. Vulkan guarantees
+        // `maxImageDimension2D` of only 4096, so offering 8192 is offering a
+        // startup panic on a conformant device that Metal happens to let this
+        // one get away with. And it would buy nothing if it worked: the budget
+        // is `MAX_SHADOW_LIGHTS` casters, so the most faces anything can ask for
+        // is 48, and 4096 at 512 already holds 64.
+        egui::ComboBox::from_id_salt("shadow_atlas_resolution")
+            .selected_text(format!("{}", s.atlas_resolution))
+            .show_ui(ui, |ui| {
+                for size in [1024u32, 2048, 4096] {
+                    ui.selectable_value(&mut s.atlas_resolution, size, format!("{size}"));
+                }
+            });
+        egui::ComboBox::from_id_salt("shadow_atlas_tile")
+            .selected_text(format!("{}", s.atlas_tile_size))
+            .show_ui(ui, |ui| {
+                for size in [128u32, 256, 512, 1024] {
+                    ui.selectable_value(&mut s.atlas_tile_size, size, format!("{size}"));
+                }
+            });
+    });
+    // Both are structure, so the reader deserves to know what they bought: a
+    // point light spends six of these and a spot one.
+    {
+        let tiles = s.atlas_config().map_or(0, |config| config.capacity());
+        ui.weak(format!("{tiles} tiles — {} point lights", tiles / 6));
+    }
+    ui.add(
+        egui::Slider::new(&mut s.punctual_near, 0.005..=1.0)
+            .logarithmic(true)
+            .text("Near")
+            .suffix(" m"),
+    )
+    .on_hover_text("Depth precision near the light, which is where its contacts are");
+    ui.add(egui::Slider::new(&mut s.punctual_constant_bias, 0.0..=8.0).text("Bias"));
+    ui.add(egui::Slider::new(&mut s.punctual_slope_bias, 0.0..=8.0).text("Slope bias"));
+    drop(s);
+
+    ui.add_space(6.0);
+    ui.strong("Contact shadows")
+        .on_hover_text("March the depth buffer for the band a cascade texel is too coarse to hold");
+    {
+        let mut s = world.resource_mut::<ContactShadowSettings>();
+        // Frame structure like the rest: it registers the march and it is one
+        // more thing that keeps the geometry prepass in the frame.
+        ui.checkbox(&mut s.enabled, "Enabled");
+        ui.add(
+            egui::Slider::new(&mut s.ray_length, 0.01..=2.0)
+                .logarithmic(true)
+                .text("Length")
+                .suffix(" m"),
+        )
+        .on_hover_text("Longer than a near cascade's texel spends steps on shadows the maps have");
+        ui.add(egui::Slider::new(&mut s.steps, 4..=64).text("Steps"))
+            .on_hover_text("The shortest occluder the march can find is one step of the ray");
+        ui.add(
+            egui::Slider::new(&mut s.bias, 0.0..=0.2)
+                .logarithmic(true)
+                .text("Bias")
+                .suffix(" m"),
+        )
+        .on_hover_text("How far in front of the ray a surface must be to be something else");
+        ui.add(
+            egui::Slider::new(&mut s.thickness, 0.01..=2.0)
+                .logarithmic(true)
+                .text("Thickness")
+                .suffix(" m"),
+        )
+        .on_hover_text(
+            "How deep a surface is assumed to be past the bias — the buffer records only its front",
+        );
+        ui.add(egui::Slider::new(&mut s.intensity, 0.0..=1.0).text("Strength"));
+        ui.add(
+            egui::Slider::new(&mut s.fade_distance, 1.0..=200.0)
+                .logarithmic(true)
+                .text("Range")
+                .suffix(" m"),
+        )
+        .on_hover_text("Where the band is thinner than a pixel and the march is only noise");
+    }
 }
 
 fn lighting_column(ui: &mut egui::Ui, world: &World) {

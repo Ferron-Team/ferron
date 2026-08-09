@@ -3,7 +3,7 @@ use glam::Vec3;
 use orrin_ecs::World;
 
 use super::textures::{bump_normals, checkerboard, load_rgba, metallic_roughness, sky_equirect};
-use super::{spawn_directional_light, spawn_mesh, spawn_point_light};
+use super::{spawn_directional_light, spawn_mesh, spawn_point_light, spawn_spot_light};
 use crate::gfx::{Material, RenderBackend};
 use crate::scene::{Assets, Camera, CpuMesh, MeshBounds, Spin, Transform};
 
@@ -136,6 +136,24 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
         // strength they washed the nearby cubes toward their own hues.
         spawn_point_light(world, format!("Point Light {i}"), pos, color, 3.0, 10.0);
     }
+
+    // Aimed down at the grid from one corner, which is where a cone's shadow
+    // reads: the cubes are far enough apart that each throws its own onto the
+    // floor rather than into its neighbour.
+    spawn_spot_light(
+        world,
+        "Spot Light",
+        Vec3::new(-6.0, 9.0, 6.0),
+        Vec3::new(0.55, -1.0, -0.55).normalize(),
+        Vec3::new(1.0, 0.9, 0.75),
+        // Low enough to read as a lit cone rather than a clipped highlight: at
+        // this range the old 60 saturated every face it touched, and a shadow
+        // inside a blown-out region is a shadow nobody can see.
+        15.0,
+        30.0,
+        22.0,
+        32.0,
+    );
 
     let span = GRID as f32 * SPACING;
     world.insert_resource(Camera {

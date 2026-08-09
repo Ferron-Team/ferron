@@ -2,6 +2,7 @@ mod assets;
 mod bloom;
 mod camera;
 mod components;
+mod contact_shadows;
 mod culling;
 mod debug;
 mod dof;
@@ -31,6 +32,7 @@ pub use components::{
     AmbientLight, Collider, ColliderShape, Light, LocalTransform, MaterialHandle, MeshHandle, Name,
     Parent, Spin, Tag, UnknownComponents, WorldTransform,
 };
+pub use contact_shadows::ContactShadowSettings;
 pub use culling::Culling;
 pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
 pub use dof::DofSettings;

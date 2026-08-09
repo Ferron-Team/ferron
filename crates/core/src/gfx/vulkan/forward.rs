@@ -26,9 +26,12 @@ use vulkano::pipeline::{
 use vulkano::render_pass::{RenderPass, Subpass};
 
 use crate::geom::Aabb;
+use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, MAX_SHADOW_LIGHTS, ShadowAtlas};
 use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
-use crate::gfx::{DrawList, MAX_POINT_LIGHTS, MAX_TEXTURES, Material, SceneLighting, Vertex};
+use crate::gfx::{
+    DrawList, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, MAX_TEXTURES, Material, SceneLighting, Vertex,
+};
 use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
@@ -101,11 +104,13 @@ pub(crate) struct GpuMaterial {
 }
 
 /// Pack the engine's [`SceneLighting`] into the std140 layout the shader expects.
+#[allow(clippy::too_many_arguments)]
 fn to_gpu_lighting(
     lighting: &SceneLighting,
     camera_pos: Vec3,
     extent: [u32; 2],
     shadows: Option<ShadowFrame<'_>>,
+    atlas: &ShadowAtlas,
     irradiance: [Vec3; SH9],
     environment_yaw: f32,
     env_specular: Vec3,
@@ -113,9 +118,10 @@ fn to_gpu_lighting(
     let (w, h) = (extent[0] as f32, extent[1] as f32);
     let count = lighting.point_lights.len().min(MAX_POINT_LIGHTS);
     let mut point_lights = [GpuPointLight::ZERO; MAX_POINT_LIGHTS];
-    for (slot, light) in point_lights
+    for (index, (slot, light)) in point_lights
         .iter_mut()
         .zip(lighting.point_lights.iter().take(count))
+        .enumerate()
     {
         slot.position = [
             light.position.x,
@@ -124,6 +130,41 @@ fn to_gpu_lighting(
             light.range.max(1e-4),
         ];
         slot.color = [light.color.x, light.color.y, light.color.z, light.intensity];
+        // A light that asked for tiles and did not get them keeps its -1 and
+        // shades unshadowed, which is the whole behaviour of the budget: too
+        // many casters costs shadows, never correctness.
+        slot.shadow = match atlas.caster(LightKind::Point, index) {
+            Some(caster) => [caster.first_face as f32, caster.near, 0.0, 0.0],
+            None => [-1.0, 0.0, 0.0, 0.0],
+        };
+    }
+
+    let spot_count = lighting.spot_lights.len().min(MAX_SPOT_LIGHTS);
+    let mut spot_lights = [GpuSpotLight::ZERO; MAX_SPOT_LIGHTS];
+    for (index, (slot, light)) in spot_lights
+        .iter_mut()
+        .zip(lighting.spot_lights.iter().take(spot_count))
+        .enumerate()
+    {
+        slot.position = [
+            light.position.x,
+            light.position.y,
+            light.position.z,
+            light.range.max(1e-4),
+        ];
+        slot.direction = [
+            light.direction.x,
+            light.direction.y,
+            light.direction.z,
+            light.outer_cos,
+        ];
+        slot.color = [light.color.x, light.color.y, light.color.z, light.intensity];
+        let face = atlas
+            .caster(LightKind::Spot, index)
+            .map_or([-1.0, 0.0], |caster| {
+                [caster.first_face as f32, caster.near]
+            });
+        slot.params = [light.inner_cos, face[0], face[1], 0.0];
     }
 
     // The shader wants the direction *toward* the light, so negate.
@@ -182,7 +223,7 @@ fn to_gpu_lighting(
             count as f32,
             lighting.shininess,
             lighting.specular_strength,
-            0.0,
+            spot_count as f32,
         ],
         viewport: [w, h, 1.0 / w, 1.0 / h],
         fog_color: [
@@ -197,6 +238,7 @@ fn to_gpu_lighting(
         cascade_texel_sizes,
         shadow_params,
         point_lights,
+        spot_lights,
         environment: {
             let (sin, cos) = environment_yaw.to_radians().sin_cos();
             [sin, cos, 0.0, 0.0]
@@ -207,7 +249,7 @@ fn to_gpu_lighting(
 }
 
 /// GPU mirror of a [`PointLight`](crate::gfx::PointLight), padded to std140
-/// (two `vec4`s).
+/// (three `vec4`s).
 #[derive(vulkano::buffer::BufferContents, Clone, Copy)]
 #[repr(C)]
 struct GpuPointLight {
@@ -215,12 +257,43 @@ struct GpuPointLight {
     position: [f32; 4],
     /// rgb = color, w = intensity.
     color: [f32; 4],
+    /// x = index of this light's first atlas face, negative for a light the
+    /// atlas had no room for; y = the near plane its faces were rendered with,
+    /// which the shader needs to bias the comparison against.
+    shadow: [f32; 4],
 }
 
 impl GpuPointLight {
     const ZERO: Self = Self {
         position: [0.0; 4],
         color: [0.0; 4],
+        shadow: [-1.0, 0.0, 0.0, 0.0],
+    };
+}
+
+/// GPU mirror of a [`SpotLight`](crate::gfx::SpotLight), padded to std140.
+#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[repr(C)]
+struct GpuSpotLight {
+    /// xyz = world position, w = range.
+    position: [f32; 4],
+    /// xyz = cone axis, w = cosine of the outer half angle.
+    direction: [f32; 4],
+    /// rgb = color, w = intensity.
+    color: [f32; 4],
+    /// x = cosine of the inner half angle, y = atlas face index (negative for
+    /// none), z = near plane.
+    params: [f32; 4],
+}
+
+impl GpuSpotLight {
+    const ZERO: Self = Self {
+        position: [0.0; 4],
+        // A `w` of 1.0 is a cone of zero width, so an unused slot lights
+        // nothing even if the count were ever wrong.
+        direction: [0.0, 0.0, -1.0, 1.0],
+        color: [0.0; 4],
+        params: [1.0, -1.0, 0.0, 0.0],
     };
 }
 
@@ -238,7 +311,8 @@ struct GpuLighting {
     sun_direction: [f32; 4],
     /// rgb = sun color, w = sun intensity.
     sun_color: [f32; 4],
-    /// x = point light count, y = shininess, z = specular strength.
+    /// x = point light count, y = shininess, z = specular strength,
+    /// w = spot light count.
     params: [f32; 4],
     /// x=w, y=h, z=1/w, w=1/h
     viewport: [f32; 4],
@@ -259,6 +333,7 @@ struct GpuLighting {
     /// w = 1.0 to tint by cascade index.
     shadow_params: [f32; 4],
     point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
+    spot_lights: [GpuSpotLight; MAX_SPOT_LIGHTS],
     /// x = sin(environment yaw), y = cos(environment yaw). The same rotation
     /// the skybox samples through, so the sky and what it lights agree.
     environment: [f32; 4],
@@ -273,10 +348,37 @@ struct GpuLighting {
     irradiance: [[f32; 4]; SH9],
 }
 
+/// One atlas face as the shader reads it: the matrix that rendered it, and the
+/// slice of the atlas it landed in.
+///
+/// The matrix is stored rather than rebuilt from the light's position and a face
+/// convention, which the `vector_to_depth` trick would allow. Storing it means
+/// the shader projects with *the same* matrix the tile was rasterised with, so
+/// the two cannot disagree about a near plane, a border, or a handedness — the
+/// only thing left to get right is which face, and that is one comparison.
+#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[repr(C)]
+struct GpuShadowFace {
+    view_proj: [[f32; 4]; 4],
+    /// xy = atlas UV offset, zw = atlas UV scale.
+    rect: [f32; 4],
+}
+
+impl GpuShadowFace {
+    const ZERO: Self = Self {
+        view_proj: [[0.0; 4]; 4],
+        rect: [0.0; 4],
+    };
+}
+
 pub struct ForwardPass {
     pub render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
     uniform_buffer_allocator: SubbufferAllocator,
+    /// Per-frame storage for the atlas face table. A storage buffer rather than
+    /// more of the lighting uniform: forty-eight matrices is three kilobytes,
+    /// and the guaranteed uniform-buffer range is sixteen.
+    shadow_face_allocator: SubbufferAllocator,
     /// Per-frame streaming allocator for the set-4 per-object transform buffer.
     object_buffer_allocator: SubbufferAllocator,
     sampler: Arc<Sampler>,
@@ -342,6 +444,16 @@ impl ForwardPass {
             },
         );
 
+        let shadow_face_allocator = SubbufferAllocator::new(
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::STORAGE_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
+
         // Material textures are the only ones with a mip chain to sample; the
         // AO and tonemap inputs are screen-space targets read at 1:1.
         let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
@@ -375,6 +487,7 @@ impl ForwardPass {
             pipeline,
             uniform_buffer_allocator,
             object_buffer_allocator,
+            shadow_face_allocator,
             sampler,
             ao_sampler,
         }
@@ -450,15 +563,23 @@ impl ForwardPass {
     /// object rows stay contiguous and a run's base is just its start.
     ///
     /// `items` goes first so the forward and SSAO passes keep indexing from
-    /// zero; each cascade's casters follow, and the returned bases say where.
-    /// One buffer rather than one per list is what keeps `object_transforms` a
-    /// single resource in the graph rather than a convenient fiction.
+    /// zero; each cascade's casters follow, then each punctual light's, and the
+    /// returned bases say where. One buffer rather than one per list is what
+    /// keeps `object_transforms` a single resource in the graph rather than a
+    /// convenient fiction.
     pub(super) fn upload_objects(
         &self,
         visible: DrawList<'_>,
         casters: &[DrawList<'_>],
-    ) -> (Subbuffer<[GpuObject]>, [u32; MAX_CASCADES]) {
-        let total: usize = visible.len() + casters.iter().map(DrawList::len).sum::<usize>();
+        punctual: &[DrawList<'_>],
+    ) -> (
+        Subbuffer<[GpuObject]>,
+        [u32; MAX_CASCADES],
+        [u32; MAX_SHADOW_LIGHTS],
+    ) {
+        let total: usize = visible.len()
+            + casters.iter().map(DrawList::len).sum::<usize>()
+            + punctual.iter().map(DrawList::len).sum::<usize>();
         // allocate_slice rejects length 0; an empty scene still needs a bindable
         // buffer, so round up to one (unwritten, unread) slot.
         let buffer = self
@@ -467,6 +588,7 @@ impl ForwardPass {
             .unwrap();
 
         let mut bases = [0u32; MAX_CASCADES];
+        let mut punctual_bases = [0u32; MAX_SHADOW_LIGHTS];
         {
             let mut rows = buffer.write().unwrap();
             let mut next = 0usize;
@@ -486,8 +608,12 @@ impl ForwardPass {
                 *base = next as u32;
                 write(list, &mut next);
             }
+            for (base, list) in punctual_bases.iter_mut().zip(punctual) {
+                *base = next as u32;
+                write(list, &mut next);
+            }
         }
-        (buffer, bases)
+        (buffer, bases, punctual_bases)
     }
 
     pub fn draw(
@@ -500,8 +626,11 @@ impl ForwardPass {
         view: &FrameView,
         extent: [u32; 2],
         ao_view: Arc<ImageView>,
+        contact_shadow_view: Arc<ImageView>,
         shadow_view: Arc<ImageView>,
+        atlas_view: Arc<ImageView>,
         shadows: Option<ShadowFrame<'_>>,
+        atlas: &ShadowAtlas,
         material_set: Arc<DescriptorSet>,
         texture_set: Arc<DescriptorSet>,
         object_set: Arc<DescriptorSet>,
@@ -527,10 +656,31 @@ impl ForwardPass {
             camera.position,
             extent,
             shadows,
+            atlas,
             irradiance,
             environment.yaw,
             env_specular,
         );
+
+        // Always at least one entry: `allocate_slice` rejects a length of zero,
+        // and a frame where nothing punctual casts still has to bind something
+        // for the descriptor. Every light's face index is -1 in that frame, so
+        // the row is never read.
+        let face_count = atlas.faces.len().min(MAX_ATLAS_FACES).max(1);
+        let shadow_faces = self
+            .shadow_face_allocator
+            .allocate_slice::<GpuShadowFace>(face_count as u64)
+            .unwrap();
+        {
+            let mut rows = shadow_faces.write().unwrap();
+            rows.fill(GpuShadowFace::ZERO);
+            for (row, face) in rows.iter_mut().zip(&atlas.faces) {
+                *row = GpuShadowFace {
+                    view_proj: face.view_proj.to_cols_array_2d(),
+                    rect: face.tile.uv_rect(atlas.resolution),
+                };
+            }
+        }
 
         let lighting_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
@@ -552,6 +702,18 @@ impl ForwardPass {
                 WriteDescriptorSet::image_view(1, shadow_view),
                 WriteDescriptorSet::image_view(3, renderer.environment.specular_view()),
                 WriteDescriptorSet::sampler(4, renderer.environment.sampler()),
+                WriteDescriptorSet::image_view_sampler(
+                    5,
+                    contact_shadow_view,
+                    self.ao_sampler.clone(),
+                ),
+                // The atlas reads through the cascades' comparison sampler at
+                // binding 2 — same conventions, same `Less` against a map
+                // cleared to 1.0 — so it needs no sampler of its own. Which
+                // matters: Metal caps samplers per stage far below sampled
+                // images, and this shader is already at five.
+                WriteDescriptorSet::image_view(6, atlas_view),
+                WriteDescriptorSet::buffer(7, shadow_faces),
             ],
             [],
         )

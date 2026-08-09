@@ -7,6 +7,7 @@
 //! isn't.
 
 use glam::Vec3;
+use orrin_core::gfx::punctual::ShadowAtlas;
 use orrin_core::gfx::shadows::CascadeSet;
 use orrin_core::scene::propagate_transforms;
 use orrin_core::scene::{
@@ -70,7 +71,13 @@ fn visible(world: &mut World, camera: Camera) -> usize {
     *world.resource_mut::<Camera>() = camera;
     propagate_transforms(world);
     let mut geometry = FrameGeometry::default();
-    extract_geometry(world, ASPECT, &CascadeSet::default(), &mut geometry);
+    extract_geometry(
+        world,
+        ASPECT,
+        &CascadeSet::default(),
+        &ShadowAtlas::default(),
+        &mut geometry,
+    );
     geometry.visible().len()
 }
 

@@ -274,10 +274,36 @@ fn light_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
                 color,
                 intensity,
                 range,
+                casts_shadows,
             } => {
                 color_row(ui, "Color", color);
                 ui.add(egui::Slider::new(intensity, 0.0..=50.0).text("Intensity"));
                 ui.add(egui::Slider::new(range, 0.0..=100.0).text("Range"));
+                ui.checkbox(casts_shadows, "Casts shadows")
+                    .on_hover_text("Six atlas tiles, and only if the budget reaches this light");
+            }
+            Light::Spot {
+                color,
+                intensity,
+                range,
+                inner_angle,
+                outer_angle,
+                casts_shadows,
+            } => {
+                color_row(ui, "Color", color);
+                ui.add(egui::Slider::new(intensity, 0.0..=50.0).text("Intensity"));
+                ui.add(egui::Slider::new(range, 0.0..=100.0).text("Range"));
+                // Dragged together: the inner cone cannot leave the outer one,
+                // and the falloff divides by their difference — so clamping
+                // here is what keeps the editor from authoring a light the
+                // shader has to defend itself against.
+                ui.add(egui::Slider::new(outer_angle, 1.0..=89.0).text("Outer angle"))
+                    .on_hover_text("Half angle from the axis, where the cone reaches nothing");
+                *inner_angle = inner_angle.min(*outer_angle);
+                ui.add(egui::Slider::new(inner_angle, 0.0..=*outer_angle).text("Inner angle"))
+                    .on_hover_text("Half angle out to which it is still at full brightness");
+                ui.checkbox(casts_shadows, "Casts shadows")
+                    .on_hover_text("One atlas tile, and only if the budget reaches this light");
             }
         });
 }

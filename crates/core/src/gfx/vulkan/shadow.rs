@@ -21,7 +21,7 @@ use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, DepthBiasState, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex as _, VertexDefinition};
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
+use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
@@ -30,6 +30,7 @@ use vulkano::pipeline::{
 use vulkano::render_pass::{RenderPass, Subpass};
 use vulkano::sync::GpuFuture;
 
+use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::{DrawList, Vertex};
 
 use super::VulkanRenderer;
@@ -54,8 +55,20 @@ pub struct ShadowPass {
     /// resource: with shadows off the graph has no cascade image at all, so
     /// there is nothing for the forward pass to declare a read of.
     lit_view: Arc<ImageView>,
+    /// A 1x1 non-array depth texture of 1.0, bound as the punctual atlas when
+    /// there is none. The cascades' `lit_view` cannot serve: the forward shader
+    /// declares the atlas as a plain `texture2D` and the cascades as a
+    /// `texture2DArray`, and a view satisfies one or the other.
+    lit_atlas_view: Arc<ImageView>,
     pub constant_bias: f32,
     pub slope_bias: f32,
+    /// The punctual maps get their own pair. A cascade is orthographic, so one
+    /// depth unit is the same world distance everywhere in it and a constant
+    /// bias means one thing; a punctual face is perspective, where the same
+    /// offset is millimetres at the light and metres at its range. They are
+    /// tuned apart because they cannot be tuned together.
+    pub punctual_constant_bias: f32,
+    pub punctual_slope_bias: f32,
 }
 
 impl ShadowPass {
@@ -68,9 +81,17 @@ impl ShadowPass {
             render_pass,
             pipeline,
             lit_view: build_lit_view(ctx),
+            lit_atlas_view: build_lit_atlas_view(ctx),
             constant_bias: 1.25,
             slope_bias: 2.5,
+            punctual_constant_bias: 2.0,
+            punctual_slope_bias: 3.0,
         }
+    }
+
+    /// The "everything is lit" atlas, bound when nothing punctual casts.
+    pub(super) fn lit_atlas_view(&self) -> Arc<ImageView> {
+        self.lit_atlas_view.clone()
     }
 
     /// The "everything is lit" view, bound when shadows are disabled.
@@ -113,18 +134,7 @@ impl ShadowPass {
         resolution: u32,
         object_set: Arc<DescriptorSet>,
     ) {
-        builder
-            .set_viewport(
-                0,
-                [Viewport {
-                    offset: [0.0, 0.0],
-                    extent: [resolution as f32, resolution as f32],
-                    depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap();
+        self.set_tile(builder, [0, 0], resolution);
         // Dynamic so the editor's bias sliders tune acne live instead of
         // rebuilding the pipeline on every drag. `clamp` stays 0.0: a nonzero
         // one needs the `depth_bias_clamp` device feature.
@@ -141,6 +151,99 @@ impl ShadowPass {
             )
             .unwrap();
 
+        self.draw(builder, renderer, casters, view_proj, object_base);
+    }
+
+    /// Record every face of every punctual caster into one atlas.
+    ///
+    /// One render pass for all of them, which is the whole reason the atlas
+    /// exists: a tile is a viewport, so the sixteen-light worst case is one
+    /// barrier rather than ninety-six. `casters` and `bases` are indexed like
+    /// `atlas.casters` — one culled list per *light*, drawn into each of its
+    /// faces, because a point light's reach is small enough that culling its six
+    /// frustums apart would cost more test than it saved draw.
+    pub(super) fn record_atlas(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        renderer: &VulkanRenderer,
+        atlas: &ShadowAtlas,
+        casters: &[DrawList<'_>],
+        bases: &[u32],
+        object_set: Arc<DescriptorSet>,
+    ) {
+        builder
+            .set_depth_bias(self.punctual_constant_bias, 0.0, self.punctual_slope_bias)
+            .unwrap()
+            .bind_pipeline_graphics(self.pipeline.clone())
+            .unwrap()
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                self.pipeline.layout().clone(),
+                0,
+                vec![object_set],
+            )
+            .unwrap();
+
+        for (index, caster) in atlas.casters.iter().enumerate() {
+            let (Some(list), Some(&base)) = (casters.get(index), bases.get(index)) else {
+                continue;
+            };
+            if list.is_empty() {
+                continue;
+            }
+            for face in &atlas.faces[caster.first_face..caster.first_face + caster.face_count] {
+                self.set_tile(builder, face.tile.offset, face.tile.size);
+                self.draw(builder, renderer, *list, face.view_proj, base);
+            }
+        }
+    }
+
+    /// Aim the rasteriser at one tile.
+    ///
+    /// The scissor is not redundant with the viewport. A viewport confines where
+    /// NDC *lands*, and an implementation is allowed a guard band around the
+    /// clip volume — so without a scissor a triangle straddling a tile's edge
+    /// may write a fragment into the neighbour, which is another light's depth.
+    fn set_tile(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        offset: [u32; 2],
+        size: u32,
+    ) {
+        builder
+            .set_viewport(
+                0,
+                [Viewport {
+                    offset: [offset[0] as f32, offset[1] as f32],
+                    extent: [size as f32, size as f32],
+                    depth_range: 0.0..=1.0,
+                }]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap()
+            .set_scissor(
+                0,
+                [Scissor {
+                    offset,
+                    extent: [size, size],
+                }]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+    }
+
+    /// The draw loop both callers share: one instanced draw per (mesh, material)
+    /// run, with the light's matrix pushed per run.
+    fn draw(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        renderer: &VulkanRenderer,
+        casters: DrawList<'_>,
+        view_proj: Mat4,
+        object_base: u32,
+    ) {
         for run in casters.runs() {
             let item = casters.item(run.start);
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
@@ -259,9 +362,16 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
             }),
             // No color attachments to blend into.
             color_blend_state: None,
-            dynamic_state: [DynamicState::Viewport, DynamicState::DepthBias]
-                .into_iter()
-                .collect(),
+            // Scissor as well as viewport, because the atlas aims this pipeline
+            // at one tile of a shared attachment and the viewport alone does
+            // not promise a fragment stays inside it.
+            dynamic_state: [
+                DynamicState::Viewport,
+                DynamicState::Scissor,
+                DynamicState::DepthBias,
+            ]
+            .into_iter()
+            .collect(),
             subpass: Some(subpass.into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
@@ -269,12 +379,27 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
     .unwrap()
 }
 
-/// A 1x1 single-layer depth *array* image cleared to 1.0.
+/// A 1x1 depth *array* image cleared to 1.0, for the cascades.
 ///
 /// The array view type is load-bearing: the forward shader declares the
 /// cascades as `texture2DArray`, and a plain 2D view would not satisfy that
 /// descriptor when shadows are off.
 fn build_lit_view(ctx: &VkContext) -> Arc<ImageView> {
+    build_lit_depth(ctx, ImageViewType::Dim2dArray)
+}
+
+/// The same, viewed as a plain 2D image, for the punctual atlas.
+///
+/// Two views over two allocations rather than one image viewed both ways,
+/// because a view's type is fixed at creation and the two descriptors want
+/// different ones. A pair of one-texel images is not worth avoiding.
+fn build_lit_atlas_view(ctx: &VkContext) -> Arc<ImageView> {
+    build_lit_depth(ctx, ImageViewType::Dim2d)
+}
+
+/// A 1x1 single-layer depth image cleared to 1.0 — "nothing is nearer than the
+/// far plane", which every comparison reads as lit.
+fn build_lit_depth(ctx: &VkContext, view_type: ImageViewType) -> Arc<ImageView> {
     let image = Image::new(
         ctx.memory_allocator.clone(),
         ImageCreateInfo {
@@ -315,7 +440,7 @@ fn build_lit_view(ctx: &VkContext) -> Arc<ImageView> {
     ImageView::new(
         image.clone(),
         ImageViewCreateInfo {
-            view_type: ImageViewType::Dim2dArray,
+            view_type,
             ..ImageViewCreateInfo::from_image(&image)
         },
     )

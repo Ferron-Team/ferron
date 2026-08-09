@@ -43,6 +43,39 @@ pub fn spawn_point_light(
         .id()
 }
 
+/// Like a point light, but coned. The axis is the entity's forward, `-Z`, the
+/// same convention `spawn_directional_light` uses, and the angles are half
+/// angles from that axis in degrees.
+pub fn spawn_spot_light(
+    world: &mut World,
+    name: impl Into<String>,
+    position: Vec3,
+    direction: Vec3,
+    color: Vec3,
+    intensity: f32,
+    range: f32,
+    inner_angle: f32,
+    outer_angle: f32,
+) -> Entity {
+    let rotation = Quat::from_rotation_arc(Vec3::NEG_Z, direction.normalize_or_zero());
+    world
+        .spawn_entity()
+        .with(Name::new(name))
+        .with(LocalTransform::from(Transform {
+            translation: position,
+            rotation,
+            ..Default::default()
+        }))
+        .with(Light::spot(
+            color,
+            intensity,
+            range,
+            inner_angle,
+            outer_angle,
+        ))
+        .id()
+}
+
 /// The direction is stored as the entity's rotation (forward = `-Z`), so it can
 /// be reoriented like any other transform.
 pub fn spawn_directional_light(

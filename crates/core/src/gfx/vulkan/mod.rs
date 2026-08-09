@@ -1,4 +1,5 @@
 mod bloom;
+mod contact_shadows;
 mod context;
 mod dof;
 mod environment;
@@ -35,12 +36,15 @@ use vulkano::sync::{self, future::FenceSignalFuture};
 use vulkano::{Validated, VulkanError};
 
 use crate::geom::Aabb;
+use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::shadows::CascadeSet;
 use crate::scene::{
-    BloomSettings, Camera, CpuMesh, DofSettings, EnvironmentSettings, HdrSettings, MaterialHandle,
-    MeshHandle, MotionBlurSettings, ShadowSettings, SsaoSettings, SsrSettings, TaaSettings,
+    BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
+    HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, ShadowSettings, SsaoSettings,
+    SsrSettings, TaaSettings,
 };
 
+use self::contact_shadows::ContactShadowPass;
 use self::context::VkContext;
 use self::environment::EnvironmentPass;
 use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
@@ -94,6 +98,11 @@ pub struct ShadowFrame<'a> {
     /// array the camera's list indexes, so an object both visible and casting
     /// exists once on the CPU however many cascades want it.
     pub casters: &'a [DrawList<'a>],
+    /// The punctual lights that got atlas tiles, and one caster list per light —
+    /// indexed like `atlas.casters`, not like the light arrays, because the
+    /// budget means most lights have no list at all.
+    pub atlas: &'a ShadowAtlas,
+    pub punctual_casters: &'a [DrawList<'a>],
     pub settings: &'a ShadowSettings,
 }
 
@@ -111,6 +120,10 @@ pub struct VulkanRenderer {
     /// The one geometry pass in front of shading, shared by SSAO and TAA.
     prepass: GeometryPrepass,
     ssao: SsaoPass,
+    /// The short march toward the sun, and the visibility mask the forward pass
+    /// multiplies its sun term by. Holds only a pipeline and the dither's frame
+    /// counter; the mask is graph-owned.
+    contact_shadows: ContactShadowPass,
     /// The depth pyramid, the reflection rays, and the composite that swaps the
     /// environment's reflection for them. Holds only pipelines and the resolved
     /// settings; every image it works over is graph-owned.
@@ -170,6 +183,7 @@ impl VulkanRenderer {
         let bloom = BloomPass::new(&ctx);
         let prepass = GeometryPrepass::new(&ctx);
         let ssao = SsaoPass::new(&ctx);
+        let contact_shadows = ContactShadowPass::new(&ctx);
         let ssr = SsrPass::new(&ctx);
         let taa = TaaPass::new(&ctx);
         let dof = DofPass::new(&ctx);
@@ -204,6 +218,7 @@ impl VulkanRenderer {
         let config = FrameConfig {
             color_format: format,
             ssao: true,
+            contact_shadows: true,
             ssr: false,
             taa: true,
             auto_exposure: true,
@@ -213,11 +228,19 @@ impl VulkanRenderer {
             overlay: true,
             shadow_cascades: 0,
             shadow_resolution: 1,
+            shadow_atlas: 0,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let images = GraphImages::allocate(&ctx.memory_allocator, &frame.graph, extent);
-        let framebuffers =
-            PassFramebuffers::build(&frame, &images, &forward, &prepass, &ssao, &shadow);
+        let framebuffers = PassFramebuffers::build(
+            &frame,
+            &images,
+            &forward,
+            &prepass,
+            &ssao,
+            &contact_shadows,
+            &shadow,
+        );
 
         Self {
             ctx,
@@ -228,6 +251,7 @@ impl VulkanRenderer {
             bloom,
             prepass,
             ssao,
+            contact_shadows,
             ssr,
             taa,
             dof,
@@ -303,6 +327,7 @@ impl VulkanRenderer {
             &self.forward,
             &self.prepass,
             &self.ssao,
+            &self.contact_shadows,
             &self.shadow,
         );
     }
@@ -385,6 +410,7 @@ impl RenderBackend for VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
@@ -395,12 +421,14 @@ impl RenderBackend for VulkanRenderer {
         dt: f32,
     ) {
         // No overlay path (e.g. export/headless) draws no debug lines and no
-        // shadows.
+        // cascades. Contact shadows are not cascades: they need no caster list
+        // and no matrices, only the depth buffer, so they run here too.
         self.render_frame(
             draws,
             lighting,
             camera,
             ssao,
+            contact_shadows,
             ssr,
             taa,
             motion_blur,
@@ -463,6 +491,7 @@ impl VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
@@ -481,6 +510,7 @@ impl VulkanRenderer {
             lighting,
             camera,
             ssao,
+            contact_shadows,
             ssr,
             taa,
             motion_blur,
@@ -503,6 +533,7 @@ impl VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
@@ -539,6 +570,7 @@ impl VulkanRenderer {
         self.ensure_graph(FrameConfig {
             color_format: self.swapchain.swapchain.image_format(),
             ssao: ssao.enabled,
+            contact_shadows: contact_shadows.enabled,
             ssr: ssr.enabled,
             taa: taa.enabled,
             auto_exposure: hdr.auto_exposure,
@@ -558,6 +590,17 @@ impl VulkanRenderer {
             // number of matrices there are to draw them with.
             shadow_cascades: shadows.map_or(0, |s| s.cascades.count as u8),
             shadow_resolution: shadows.map_or(1, |s| s.settings.resolution),
+            // Sourced from the fitted atlas for the reason the cascade count is
+            // sourced from the cascade set: a frame where every punctual light
+            // opted out, or where none reached the budget, declares no atlas
+            // rather than clearing one nothing reads.
+            shadow_atlas: shadows.map_or(0, |s| {
+                if s.atlas.faces.is_empty() {
+                    0
+                } else {
+                    s.atlas.resolution
+                }
+            }),
         });
 
         // Split out because under Fifo this blocks until the presentation engine
@@ -655,6 +698,8 @@ impl VulkanRenderer {
         if let Some(shadows) = shadows {
             self.shadow.constant_bias = shadows.settings.constant_bias;
             self.shadow.slope_bias = shadows.settings.slope_bias;
+            self.shadow.punctual_constant_bias = shadows.settings.punctual_constant_bias;
+            self.shadow.punctual_slope_bias = shadows.settings.punctual_slope_bias;
         }
 
         // Material table and texture array are static after asset load, so cache
@@ -688,9 +733,11 @@ impl VulkanRenderer {
         // camera-visible items come first, so the two screen-space passes still
         // index from zero and the cascades index from `caster_bases`.
         let no_casters: [DrawList<'_>; 0] = [];
-        let (object_buffer, caster_bases) = self
-            .forward
-            .upload_objects(draws, shadows.map_or(&no_casters, |s| s.casters));
+        let (object_buffer, caster_bases, punctual_bases) = self.forward.upload_objects(
+            draws,
+            shadows.map_or(&no_casters, |s| s.casters),
+            shadows.map_or(&no_casters, |s| s.punctual_casters),
+        );
 
         // One set per pipeline layout per frame, rather than one per pass. The
         // buffer is a fresh subbuffer each frame so none of these can be cached
@@ -725,12 +772,33 @@ impl VulkanRenderer {
                     .expect("SSAO reads the geometry prepass"),
             )
         });
+        // The frame's view matrix rather than the camera's, for the reason every
+        // rasterising pass takes its matrices from `FrameView`: the depth this
+        // marches was written under that projection's jitter.
+        let contact_shadow_uniforms = self.frame.ids.contact_shadows.map(|_| {
+            self.contact_shadows.begin_frame(
+                contact_shadows,
+                &view,
+                lighting.sun.direction_to_light(),
+                frame_uniforms
+                    .clone()
+                    .expect("contact shadows read the geometry prepass"),
+            )
+        });
 
         // With SSAO off the graph has no AO node, so the forward pass samples a
         // 1x1 white view instead: "no occlusion" with no second shader path.
         let ao_view = match self.frame.ids.ssao {
             Some(ids) => self.images.view(ids.ao),
             None => self.ssao.white_view(),
+        };
+
+        // And again for the contact-shadow mask: with the march off there is no
+        // node to read, so the forward pass samples a 1x1 white view and every
+        // pixel reports "lit".
+        let contact_shadow_view = match self.frame.ids.contact_shadows {
+            Some(id) => self.images.view(id),
+            None => self.contact_shadows.lit_view(),
         };
 
         // Same trick for shadows: with them off there is no cascade image to
@@ -745,6 +813,18 @@ impl VulkanRenderer {
             vulkano::image::view::ImageViewType::Dim2dArray,
             "the forward pipeline binds the cascades as texture2DArray",
         );
+
+        // And the same for the punctual atlas, which is a plain 2D image: with
+        // nothing casting there is no atlas to read, so the forward pass samples
+        // a 1x1 depth texture of 1.0 and every lookup reports "lit".
+        let atlas_view = match self.frame.ids.shadow_atlas {
+            Some(id) => self.images.view(id),
+            None => self.shadow.lit_atlas_view(),
+        };
+        // What the forward pass indexes the face table by. Empty when nothing
+        // casts, which is the frame where every light's face index is -1.
+        let empty_atlas = ShadowAtlas::default();
+        let atlas = shadows.map_or(&empty_atlas, |s| s.atlas);
 
         // What everything past shading composites: whichever image the optical
         // chain left the frame's colour in. `declare` already decided that, and
@@ -1095,6 +1175,20 @@ impl VulkanRenderer {
                             .expect("the graph scheduled a cascade with no shadows"),
                     );
                 }
+                PassBody::PunctualShadows => {
+                    let shadows =
+                        shadows.expect("the graph scheduled the atlas with no shadow frame");
+                    self.shadow.record_atlas(
+                        &mut builder,
+                        self,
+                        shadows.atlas,
+                        shadows.punctual_casters,
+                        &punctual_bases,
+                        shadow_object_set
+                            .clone()
+                            .expect("the graph scheduled the atlas with no shadow frame"),
+                    );
+                }
                 PassBody::GeometryPrepass => self.prepass.record(
                     &mut builder,
                     self,
@@ -1121,6 +1215,23 @@ impl VulkanRenderer {
                     self.ssao
                         .record_blur(&mut builder, self, extent, self.images.view(ids.raw_ao));
                 }
+                PassBody::ContactShadows => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled contact shadows with no prepass");
+                    self.contact_shadows.record(
+                        &mut builder,
+                        self,
+                        extent,
+                        contact_shadow_uniforms
+                            .as_ref()
+                            .expect("contact shadows without their uniforms"),
+                        self.images.view(ids.depth),
+                        self.images.view(ids.normal),
+                    );
+                }
                 PassBody::Forward => {
                     self.forward.draw(
                         &mut builder,
@@ -1131,8 +1242,11 @@ impl VulkanRenderer {
                         &view,
                         extent,
                         ao_view.clone(),
+                        contact_shadow_view.clone(),
                         shadow_view.clone(),
+                        atlas_view.clone(),
                         shadows,
+                        atlas,
                         material_set.clone(),
                         texture_set.clone(),
                         forward_object_set.clone(),

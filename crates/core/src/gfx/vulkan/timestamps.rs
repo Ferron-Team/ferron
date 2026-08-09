@@ -337,6 +337,7 @@ mod tests {
         let config = FrameConfig {
             color_format: vulkano::format::Format::B8G8R8A8_SRGB,
             ssao: true,
+            contact_shadows: true,
             ssr: true,
             taa: true,
             auto_exposure: true,
@@ -346,6 +347,7 @@ mod tests {
             overlay: true,
             shadow_cascades: MAX_CASCADES as u8,
             shadow_resolution: 2048,
+            shadow_atlas: 4096,
         };
         let frame = declare(config).expect("the busiest frame must compile");
 

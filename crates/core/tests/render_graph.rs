@@ -48,6 +48,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                contact_shadows: false,
                 ssr: false,
                 taa: true,
                 auto_exposure: true,
@@ -57,6 +58,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
             },
         ),
         // Four cascades write four layers of one image, which the graph tracks
@@ -70,6 +72,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                contact_shadows: false,
                 ssr: false,
                 taa: false,
                 auto_exposure: true,
@@ -79,6 +82,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
             },
         ),
         // SSAO off is a different graph, not a flag read at record time: the
@@ -91,6 +95,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: false,
+                contact_shadows: false,
                 ssr: false,
                 taa: false,
                 auto_exposure: true,
@@ -100,6 +105,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
             },
         ),
         // The shape that proves the prepass belongs to the frame rather than to
@@ -110,6 +116,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: false,
+                contact_shadows: false,
                 ssr: false,
                 taa: true,
                 auto_exposure: true,
@@ -119,6 +126,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
             },
         ),
         // Metering off is the other shape that ships. Worth baselining for one
@@ -131,6 +139,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                contact_shadows: false,
                 ssr: false,
                 taa: false,
                 auto_exposure: false,
@@ -140,6 +149,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
             },
         ),
         // A window too small for a real chain still gets one level, and that
@@ -151,6 +161,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                contact_shadows: false,
                 ssr: false,
                 taa: false,
                 auto_exposure: true,
@@ -160,6 +171,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
             },
         ),
         // The whole optical chain at once: lens, then shutter, then sensor.
@@ -172,6 +184,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                contact_shadows: false,
                 ssr: false,
                 taa: true,
                 auto_exposure: true,
@@ -181,6 +194,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
             },
         ),
         // The other shape that proves the prepass belongs to the frame rather
@@ -193,6 +207,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: false,
+                contact_shadows: false,
                 ssr: false,
                 taa: false,
                 auto_exposure: true,
@@ -202,6 +217,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
             },
         ),
         // Reflections are the first thing to sit *between* shading and the
@@ -214,6 +230,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                contact_shadows: false,
                 ssr: true,
                 taa: true,
                 auto_exposure: true,
@@ -223,6 +240,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
             },
         ),
         // And the same without a resolve behind it, which is the shape where
@@ -233,6 +251,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: false,
+                contact_shadows: false,
                 ssr: true,
                 taa: false,
                 auto_exposure: true,
@@ -242,6 +261,95 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
+        // What actually ships in the editor: the march sits between the prepass
+        // and shading, and the forward pass declares a read of its mask beside
+        // the one it declares of the AO. Two single-channel screen-space inputs
+        // to one pass is the shape that would break if either were ever moved
+        // behind it.
+        (
+            "editor frame, contact shadows",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                contact_shadows: true,
+                ssr: false,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 4,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
+        // And the march on its own, which is the shape that proves it keeps the
+        // geometry prepass in the frame by itself: nothing else here reads
+        // depth, normals or motion, and the prepass still runs.
+        (
+            "editor frame, contact shadows alone",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: false,
+                contact_shadows: true,
+                ssr: false,
+                taa: false,
+                auto_exposure: false,
+                motion_blur: false,
+                dof: false,
+                bloom_mips: 0,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
+        // The punctual atlas: one pass however many lights cast, because a tile
+        // is a viewport rather than a node. That is the whole reason it is an
+        // atlas, so the plan is where it should be pinned — six faces of eight
+        // lights appearing here as forty-eight passes would be the regression.
+        (
+            "editor frame, punctual shadow atlas",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                contact_shadows: true,
+                ssr: false,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 4,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 4096,
+            },
+        ),
+        // And the atlas with no cascades, which is an ordinary scene: an indoor
+        // one, lit by lamps with no sun. The sun and the punctual lights are
+        // independent, so the frame has to hold together with either half
+        // missing.
+        (
+            "editor frame, punctual shadows without cascades",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: false,
+                contact_shadows: false,
+                ssr: false,
+                taa: false,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 2048,
             },
         ),
         (
@@ -249,6 +357,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                contact_shadows: false,
                 ssr: false,
                 taa: false,
                 auto_exposure: true,
@@ -258,6 +367,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: false,
                 shadow_cascades: 2,
                 shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
             },
         ),
     ]
@@ -346,6 +456,7 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
         let frame = declare(FrameConfig {
             color_format: COLOR_FORMAT,
             ssao: true,
+            contact_shadows: false,
             ssr: false,
             taa: false,
             auto_exposure: true,
@@ -355,6 +466,7 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             overlay: true,
             shadow_cascades: count,
             shadow_resolution: SHADOW_RESOLUTION,
+            shadow_atlas: 0,
         })
         .unwrap();
 
@@ -386,6 +498,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
         ssao: true,
+        contact_shadows: false,
         ssr: false,
         taa: true,
         auto_exposure: true,
@@ -395,6 +508,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         overlay: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
     })
     .unwrap();
 
@@ -435,6 +549,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
         ssao: true,
+        contact_shadows: false,
         ssr: false,
         taa: true,
         auto_exposure: true,
@@ -444,6 +559,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         overlay: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
     })
     .unwrap();
 
@@ -495,6 +611,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
     let base = FrameConfig {
         color_format: COLOR_FORMAT,
         ssao: false,
+        contact_shadows: false,
         ssr: false,
         taa: false,
         auto_exposure: true,
@@ -504,10 +621,12 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         overlay: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
     };
 
-    let consumers: [(&str, fn(&mut FrameConfig)); 5] = [
+    let consumers: [(&str, fn(&mut FrameConfig)); 6] = [
         ("ssao", |c| c.ssao = true),
+        ("contact shadows", |c| c.contact_shadows = true),
         ("taa", |c| c.taa = true),
         ("motion blur", |c| c.motion_blur = true),
         ("depth of field", |c| c.dof = true),
