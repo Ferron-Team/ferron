@@ -182,9 +182,14 @@ impl ShadowAtlas {
 /// Distance to the light's *reach* rather than to the light itself, so standing
 /// inside a large dim light scores above squinting at a bright one across the
 /// level — which is what a viewer would say about whose shadows they can see.
-fn importance(position: Vec3, range: f32, intensity: f32, camera: Vec3) -> f32 {
+///
+/// Candela rather than the authored lumens, so the comparison is between what the
+/// two lights actually put out in a direction: a spot's reflector concentrates
+/// its power, and ranking a 3 000 lumen beam against a 3 000 lumen bulb by their
+/// labels would rate them equal when one is an order of magnitude brighter.
+fn importance(position: Vec3, range: f32, candela: f32, camera: Vec3) -> f32 {
     let to_surface = (position.distance(camera) - range).max(0.0);
-    intensity.max(0.0) / (1.0 + to_surface * to_surface)
+    candela.max(0.0) / (1.0 + to_surface * to_surface)
 }
 
 /// Which faces a kind of light needs.
@@ -257,11 +262,11 @@ pub fn fit(lighting: &SceneLighting, camera: Vec3, config: &AtlasConfig) -> Shad
         .take(MAX_POINT_LIGHTS)
         .enumerate()
     {
-        if light.casts_shadows && light.intensity > 0.0 && light.range > 0.0 {
+        if light.casts_shadows && light.candela > 0.0 && light.range > 0.0 {
             candidates.push((
                 LightKind::Point,
                 index,
-                importance(light.position, light.range, light.intensity, camera),
+                importance(light.position, light.range, light.candela, camera),
             ));
         }
     }
@@ -271,11 +276,11 @@ pub fn fit(lighting: &SceneLighting, camera: Vec3, config: &AtlasConfig) -> Shad
         .take(MAX_SPOT_LIGHTS)
         .enumerate()
     {
-        if light.casts_shadows && light.intensity > 0.0 && light.range > 0.0 {
+        if light.casts_shadows && light.candela > 0.0 && light.range > 0.0 {
             candidates.push((
                 LightKind::Spot,
                 index,
-                importance(light.position, light.range, light.intensity, camera),
+                importance(light.position, light.range, light.candela, camera),
             ));
         }
     }
@@ -375,22 +380,22 @@ mod tests {
     use super::*;
     use crate::gfx::{PointLight, SpotLight};
 
-    fn point(position: Vec3, intensity: f32, casts: bool) -> PointLight {
+    fn point(position: Vec3, candela: f32, casts: bool) -> PointLight {
         PointLight {
             position,
             color: Vec3::ONE,
-            intensity,
+            candela,
             range: 10.0,
             casts_shadows: casts,
         }
     }
 
-    fn spot(position: Vec3, intensity: f32, casts: bool) -> SpotLight {
+    fn spot(position: Vec3, candela: f32, casts: bool) -> SpotLight {
         SpotLight {
             position,
             direction: Vec3::NEG_Y,
             color: Vec3::ONE,
-            intensity,
+            candela,
             range: 10.0,
             inner_cos: 0.9,
             outer_cos: 0.7,

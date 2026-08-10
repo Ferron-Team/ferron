@@ -42,24 +42,29 @@ const int MAX_TEXTURES = 64;
 const int MAX_CASCADES = 4;
 const float PI = 3.14159265359;
 
+// Every quantity below is photometric, and the frame this shader writes is in
+// nits (cd/m2) as a result: a candela over a squared distance is a lux, and a lux
+// through a BRDF's 1/sr is a nit. That is what lets `exposure.rs` meter the
+// histogram in real luminance and `HdrSettings` speak in EV100 rather than in
+// multipliers nobody can transfer between scenes.
 struct PointLight {
     vec4 position; // xyz = world position, w = range
-    vec4 color;    // rgb = color,         w = intensity
+    vec4 color;    // rgb = color,         w = luminous intensity (cd)
     vec4 shadow;   // x = first atlas face (< 0 = none), y = near plane
 };
 
 struct SpotLight {
     vec4 position;  // xyz = world position, w = range
     vec4 direction; // xyz = cone axis,      w = cos(outer half angle)
-    vec4 color;     // rgb = color,          w = intensity
+    vec4 color;     // rgb = color,          w = luminous intensity (cd)
     vec4 params;    // x = cos(inner), y = atlas face (< 0 = none), z = near
 };
 
 layout(set = 0, binding = 0) uniform Lighting {
     vec4 camera_pos;    // xyz = camera world position
-    vec4 ambient;       // rgb = color, w = intensity
+    vec4 ambient;       // rgb = color, w = luminance (cd/m2)
     vec4 sun_direction; // xyz = direction toward the sun (normalized)
-    vec4 sun_color;     // rgb = color, w = intensity
+    vec4 sun_color;     // rgb = color, w = illuminance (lux)
     vec4 params;        // x = point light count (y,z legacy), w = spot count
     vec4 viewport;      // x=w, y=h, z=1/w, w=1/h
     vec4 fog_color;     // rgb = color, w = density at the reference height
@@ -587,7 +592,14 @@ vec3 cascade_debug_tint(int cascade) {
     return vec3(1.0, 1.0, 0.4);
 }
 
-// Smooth, range-limited falloff (windowed inverse-square).
+// Smooth, range-limited falloff (windowed inverse-square). Multiplying a
+// light's candela by this gives the illuminance it lays on a surface facing it,
+// in lux — which is only true because one world unit is one metre.
+//
+// `range` is the window, not the physics: inverse-square never actually reaches
+// zero, so a light would touch every pixel in the scene and cost a shadow lookup
+// there. The window is what buys the early-out below, and it is a performance
+// control rather than a photometric one.
 float attenuate(float dist, float range) {
     float s = dist / max(range, 1e-4);
     if (s >= 1.0) return 0.0;
@@ -1004,6 +1016,9 @@ vec4 shade_surface() {
     float view_dist = length(v_world_pos - lighting.camera_pos.xyz);
     {
         vec3 L = normalize(lighting.sun_direction.xyz);
+        // Illuminance straight out of the uniform: `brdf` multiplies by n.l,
+        // which is what turns light arriving perpendicular to itself into light
+        // arriving at this surface.
         vec3 radiance = lighting.sun_color.rgb * lighting.sun_color.w;
         // The cascades and the screen-space march answer the same question at
         // two scales, so their answers multiply: the maps carry everything past
@@ -1055,7 +1070,9 @@ vec4 shade_surface() {
     color += transmitted_radiance(s, m, transmission, thickness);
 #endif
 
-    // Emissive adds on top, unaffected by scene lighting.
+    // Emissive adds on top, unaffected by scene lighting. Already a luminance
+    // in nits, so it needs no conversion — it is the one material quantity in the
+    // same unit as the target it is written into.
     color += m.emissive.rgb * emis_tex;
 
     color = apply_fog(color, v_world_pos, lighting.camera_pos.xyz);

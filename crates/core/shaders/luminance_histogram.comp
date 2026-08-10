@@ -23,6 +23,12 @@ shared uint local_bins[256];
 // scene should be exposed, and the averaging pass excludes them -- otherwise a
 // night sky, most of which is nearly zero, drags the metering down until the few
 // lit pixels blow out.
+//
+// 0.005 cd/m², and now that lights are photometric that is a claim about the
+// world rather than a tuned constant: it sits below the darkest surface anyone
+// can see, some three stops under an unlit interior at night. It was arbitrary
+// while scene radiance had no units; a threshold in real luminance is one that
+// holds for a scene lit at any hour.
 const float BLACK_LUMINANCE = 0.005;
 
 uint bin_for(vec3 color) {

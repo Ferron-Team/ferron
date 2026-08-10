@@ -13,7 +13,7 @@ mod unknown;
 mod world_transform;
 
 pub use collider::{Collider, ColliderShape};
-pub use light::{AmbientLight, Light};
+pub use light::{AmbientLight, Light, MAX_CONE_ANGLE, MIN_CONE_ANGLE};
 pub use local_transform::LocalTransform;
 pub use material_handle::MaterialHandle;
 pub use mesh_handle::MeshHandle;

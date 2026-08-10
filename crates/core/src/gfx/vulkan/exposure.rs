@@ -46,8 +46,13 @@ const TILE: u32 = 16;
 pub(super) struct GpuExposure {
     /// The linear multiplier applied to scene radiance before the ACES curve.
     exposure: f32,
-    /// Adapted average scene luminance. The one value carried across frames, and
-    /// therefore the reason this buffer is imported rather than transient.
+    /// Adapted average scene luminance, in cd/m². The one value carried across
+    /// frames, and therefore the reason this buffer is imported rather than
+    /// transient.
+    ///
+    /// Zero is not a luminance but a state: it says nothing has metered yet, and
+    /// the averaging pass answers it by adopting its measurement whole instead of
+    /// easing toward it.
     average_luminance: f32,
     ev100: f32,
 }
@@ -133,10 +138,20 @@ impl ExposurePass {
         )
         .expect("failed to allocate the luminance histogram");
 
-        // Seeded at middle grey so the first frame is exposed sanely rather than
-        // adapting up out of black while the user watches.
-        let seed = 0.18f32;
-        let ev100 = (seed * 100.0 / 12.5).log2();
+        // No adapted luminance yet, which the averaging pass reads as "adopt this
+        // frame's measurement outright" — so the first metered frame is exposed
+        // for the scene rather than for a constant somebody picked.
+        //
+        // It used to be seeded at 0.18, middle grey, which was defensible while
+        // scene radiance was uncalibrated and averaged near one. Physical light
+        // units put an overcast afternoon nine stops above that, so the seed
+        // became a frame that opens blown out and spends a second recovering. A
+        // seed cannot be right for every scene; not needing one can.
+        //
+        // The exposure and EV100 beside it are still filled from the default
+        // manual exposure, for the frames where metering is off and nothing
+        // writes this buffer at all.
+        let ev100 = HdrSettings::default().manual_ev100;
         let exposure = Buffer::from_data(
             ctx.memory_allocator.clone(),
             BufferCreateInfo {
@@ -150,7 +165,7 @@ impl ExposurePass {
             },
             GpuExposure {
                 exposure: HdrSettings::exposure_from_ev100(ev100),
-                average_luminance: seed,
+                average_luminance: 0.0,
                 ev100,
             },
         )

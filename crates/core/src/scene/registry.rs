@@ -133,7 +133,7 @@ entity #1
         register_components(&mut registry);
         let mut world = World::new();
         let entity = world.spawn();
-        world.insert(entity, Light::point(Vec3::ONE, 8.0, 10.0));
+        world.insert(entity, Light::point(Vec3::ONE, 800.0, 10.0));
 
         let mut out = String::new();
         orrin_registry::write_entity(&mut out, &registry, &world, entity);
@@ -145,7 +145,7 @@ entity #1
   orrin.light = Point
     casts_shadows = true
     color = (1.0, 1.0, 1.0)
-    intensity = 8.0
+    lumens = 800.0
     range = 10.0
 "
         );
@@ -172,7 +172,7 @@ entity #1
             "Point",
             [
                 ("color", Vec3::ONE.to_value()),
-                ("intensity", Value::F32(8.0)),
+                ("lumens", Value::F32(800.0)),
                 ("range", Value::F32(10.0)),
             ],
         );
@@ -184,6 +184,33 @@ entity #1
                 ..
             }
         ));
+    }
+
+    /// The other half of the bargain in `Light`'s doc comment: a light authored
+    /// against the pre-photometric `intensity` field must fail loudly rather than
+    /// load dark.
+    ///
+    /// This is the one migration the engine deliberately does *not* smooth over.
+    /// Reading `intensity = 8` as eight lumens would load a scene lit at about a
+    /// thousandth of what its author saw, with nothing anywhere saying why — and
+    /// a plausible-looking scene that is simply black is far more expensive to
+    /// diagnose than an error naming the field. Hence the rename rather than a
+    /// reinterpretation, and hence a test: the *absence* of a compatibility path
+    /// is the feature, and nothing else would stop someone adding one back.
+    #[test]
+    fn a_light_saved_before_physical_units_refuses_to_load() {
+        let unitless = Value::enumeration(
+            "Point",
+            [
+                ("color", Vec3::ONE.to_value()),
+                ("intensity", Value::F32(8.0)),
+                ("range", Value::F32(10.0)),
+            ],
+        );
+        let err = Light::from_value(&unitless)
+            .expect_err("an intensity-based light must not load as lumens");
+        assert_eq!(err.path.to_string(), "lumens");
+        assert_eq!(err.found, "nothing");
     }
 
     /// The reason `Spin` cannot be derived: `apply` feeds `axis` to

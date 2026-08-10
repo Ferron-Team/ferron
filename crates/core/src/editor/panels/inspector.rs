@@ -259,6 +259,23 @@ fn script_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
         });
 }
 
+/// Range is where the light is cut off, not how far it carries — inverse-square
+/// decides the latter and never reaches zero. Worth spelling out on the tooltip
+/// now that brightness is a physical quantity: the instinct with a unitless
+/// intensity was to reach for this slider to make a light dimmer, and it is the
+/// one control here that cannot do that.
+fn range_row(ui: &mut egui::Ui, range: &mut f32) {
+    ui.add(
+        egui::Slider::new(range, 0.0..=100.0)
+            .suffix(" m")
+            .text("Range"),
+    )
+    .on_hover_text(
+        "Where the falloff is clamped to zero, so this light stops costing anything \
+         past it. A budget, not a brightness.",
+    );
+}
+
 fn light_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
     let Some(mut light) = world.get_mut::<Light>(entity) else {
         return;
@@ -266,33 +283,59 @@ fn light_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
     egui::CollapsingHeader::new("Light")
         .default_open(true)
         .show(ui, |ui| match &mut *light {
-            Light::Directional { color, intensity } => {
+            Light::Directional { color, lux } => {
                 color_row(ui, "Color", color);
-                ui.add(egui::Slider::new(intensity, 0.0..=20.0).text("Intensity"));
+                // Logarithmic, as every one of these is: the useful range spans
+                // five orders of magnitude, and on a linear slider everything
+                // dimmer than an overcast day is the leftmost pixel.
+                ui.add(
+                    egui::Slider::new(lux, 1.0..=150_000.0)
+                        .logarithmic(true)
+                        .suffix(" lx")
+                        .text("Illuminance"),
+                )
+                .on_hover_text("Noon sun 100 000, overcast 20 000, sunset under 1 000");
             }
             Light::Point {
                 color,
-                intensity,
+                lumens,
                 range,
                 casts_shadows,
             } => {
                 color_row(ui, "Color", color);
-                ui.add(egui::Slider::new(intensity, 0.0..=50.0).text("Intensity"));
-                ui.add(egui::Slider::new(range, 0.0..=100.0).text("Range"));
+                ui.add(
+                    egui::Slider::new(lumens, 1.0..=100_000.0)
+                        .logarithmic(true)
+                        .suffix(" lm")
+                        .text("Power"),
+                )
+                .on_hover_text("Domestic bulb 800, shop light 4 000, flood tens of thousands");
+                range_row(ui, range);
                 ui.checkbox(casts_shadows, "Casts shadows")
                     .on_hover_text("Six atlas tiles, and only if the budget reaches this light");
             }
             Light::Spot {
                 color,
-                intensity,
+                lumens,
                 range,
                 inner_angle,
                 outer_angle,
+                reflector,
                 casts_shadows,
             } => {
                 color_row(ui, "Color", color);
-                ui.add(egui::Slider::new(intensity, 0.0..=50.0).text("Intensity"));
-                ui.add(egui::Slider::new(range, 0.0..=100.0).text("Range"));
+                ui.add(
+                    egui::Slider::new(lumens, 1.0..=100_000.0)
+                        .logarithmic(true)
+                        .suffix(" lm")
+                        .text("Power"),
+                )
+                .on_hover_text("The bulb's own output, before the cone concentrates it");
+                ui.checkbox(reflector, "Reflector").on_hover_text(
+                    "On, the cone concentrates the power and narrowing it brightens the beam. \
+                     Off, the cone only masks a bare bulb and the angle is free of brightness.",
+                );
+                range_row(ui, range);
                 // Dragged together: the inner cone cannot leave the outer one,
                 // and the falloff divides by their difference — so clamping
                 // here is what keeps the editor from authoring a light the

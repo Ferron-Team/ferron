@@ -170,7 +170,14 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
     }
 
     let sun_dir = Vec3::new(-0.4, -1.0, -0.6).normalize();
-    spawn_directional_light(world, "Sun", sun_dir, Vec3::new(1.0, 0.97, 0.92), 1.0);
+    // Deep twilight, and chosen for that rather than inherited. Physical units put
+    // the sun, the sky and every fixture on one scale, and under a 100 000 lux
+    // noon sun a real lamp lands a fraction of a percent above the ambient — which
+    // is correct, and is also a demo where the punctual lights, their shadows and
+    // the emissive material are all invisible. Lighting the scene at the hour when
+    // a sun, a lamp and a neon tube are within a few stops of each other is what
+    // keeps every feature on screen without any of them lying about its units.
+    spawn_directional_light(world, "Sun", sun_dir, Vec3::new(1.0, 0.97, 0.92), 250.0);
 
     // Fed the direction *toward* the sun, so the disc in the sky and the
     // directional light that casts the shadows agree.
@@ -185,11 +192,12 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
     .into_iter()
     .enumerate()
     {
-        // Fill lights from when ambient was a flat 0.15 and everything not
-        // facing the sun was nearly black. With an environment supplying real
-        // irradiance they are decoration rather than fill, and at their old
-        // strength they washed the nearby cubes toward their own hues.
-        spawn_point_light(world, format!("Point Light {i}"), pos, color, 3.0, 10.0);
+        // 8 000 lumens is a large architectural fixture rather than a bulb,
+        // because these sit three metres from what they light: through 4pi
+        // steradian and an inverse square, that is about 70 lux where it lands,
+        // a quarter of the sun. Inverse-square is unforgiving about distance in
+        // a way the old unitless 3.0 hid.
+        spawn_point_light(world, format!("Point Light {i}"), pos, color, 8000.0, 10.0);
     }
 
     // Aimed down at the grid from one corner, which is where a cone's shadow
@@ -201,10 +209,13 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
         Vec3::new(-6.0, 9.0, 6.0),
         Vec3::new(0.55, -1.0, -0.55).normalize(),
         Vec3::new(1.0, 0.9, 0.75),
-        // Low enough to read as a lit cone rather than a clipped highlight: at
-        // this range the old 60 saturated every face it touched, and a shadow
-        // inside a blown-out region is a shadow nobody can see.
-        15.0,
+        // Nine metres up, so the beam arrives at roughly the sun's own
+        // illuminance and reads as a lit cone rather than a clipped highlight — a
+        // shadow inside a blown-out region is a shadow nobody can see. The
+        // reflector is what makes 10 000 lumens reach that far: the 32 degree cone
+        // below concentrates them into about 10 000 candela, where the same power
+        // from a bare bulb would be 800.
+        10_000.0,
         30.0,
         22.0,
         32.0,
@@ -285,7 +296,11 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Materia
                 metallic: 0.0,
                 roughness: 0.0,
                 reflectance: 0.0,
-                emissive: Vec3::new(8.0, 8.0, 8.0),
+                // Nits, like the frame, because emission is a luminance and the
+                // frame is measured in luminance. The lit floor sits near 80, so
+                // this is three stops above white: bright enough to feed the bloom
+                // chain, not so bright that it is the only thing metering sees.
+                emissive: Vec3::splat(600.0),
                 ..Material::default()
             },
         ),

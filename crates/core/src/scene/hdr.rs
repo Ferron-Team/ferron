@@ -21,6 +21,10 @@ pub struct HdrSettings {
     /// The log2-luminance window the histogram spans, in cd/m². Everything
     /// outside it lands in an end bin, so a window that excludes the scene pins
     /// the metering to one end.
+    ///
+    /// Real luminance, because the frame is: lights are photometric, so a
+    /// window stated in physical units means what it says. See
+    /// [`Light`](super::Light) for the unit each kind of light carries.
     pub min_log_luminance: f32,
     pub max_log_luminance: f32,
     /// Seconds to cover ~63% of the distance to a newly measured luminance.
@@ -34,16 +38,24 @@ impl Default for HdrSettings {
         Self {
             auto_exposure: true,
             exposure_compensation: 0.0,
-            manual_ev100: 0.0,
-            // Twenty stops, about 0.001 to 1000. Wide on purpose: the engine's
-            // radiance is not calibrated to real units, so a window sized to
-            // what looks physical is a window a bright scene sits above — and a
-            // scene pegged at the top bin stops responding to metering
-            // altogether. The cost is resolution, and there is room for it: 254
-            // bins over 20 stops is 0.08 stops each, far finer than anyone can
-            // see.
-            min_log_luminance: -10.0,
-            max_log_luminance: 10.0,
+            // Overcast daylight, which is what `Light::default` describes. The
+            // sunny-16 exterior is about 15 and a lit interior about 7, so this
+            // sits within a few stops of either — the range the compensation
+            // dial covers comfortably.
+            manual_ev100: 12.0,
+            // Twenty-five stops of real luminance, 0.004 to about 130 000 cd/m².
+            // Now that lights are photometric the window can be sized to the
+            // physical world rather than to an uncalibrated guess: the bottom is
+            // below a moonlit surface, the top above a sunlit white one, and the
+            // scene sits inside it instead of pegged against an end bin where
+            // metering stops responding.
+            //
+            // A sun disc or an emissive filament is above the top and lands in
+            // the last bin, which is correct — those are the pixels metering is
+            // supposed to ignore rather than expose for. 254 bins over 25 stops
+            // is 0.1 stops each, still far finer than anyone can see.
+            min_log_luminance: -8.0,
+            max_log_luminance: 17.0,
             adaptation_brighten: 0.4,
             adaptation_darken: 1.2,
         }

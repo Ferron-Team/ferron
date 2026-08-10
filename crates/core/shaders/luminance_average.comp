@@ -74,9 +74,16 @@ void main() {
     float measured = exp2(
         (average_bin / 254.0) * push.log_luminance_range + push.min_log_luminance);
 
+    // A non-positive history means nothing has metered yet, and there is nothing
+    // to adapt *from* on that frame: adopt the measurement outright. The same
+    // argument TAA's reset makes about its own history, and what decouples the
+    // opening second of a scene from whatever the buffer was allocated holding —
+    // a seed is a guess about scene brightness, and with lights in physical units
+    // a wrong guess is several stops rather than a fraction of one.
     float previous = target.average_luminance;
-    float adapted = previous
-        + (measured - previous) * (measured > previous ? push.brighten : push.darken);
+    float adapted = previous > 0.0
+        ? previous + (measured - previous) * (measured > previous ? push.brighten : push.darken)
+        : measured;
     // The exposure below takes log2 of this, so it may never reach zero however
     // the arithmetic above lands.
     adapted = max(adapted, 1e-5);

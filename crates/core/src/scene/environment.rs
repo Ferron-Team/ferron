@@ -28,6 +28,13 @@ pub struct EnvironmentSettings {
     /// [`HdrSettings::exposure`](super::HdrSettings) because that scales the
     /// whole frame, while this balances the environment against the analytic
     /// lights.
+    ///
+    /// With lights in physical units this is the calibration from the HDRI's own
+    /// numbers to cd/m², and it cannot be derived: an `.hdr` carries relative
+    /// radiance with no absolute scale, so nothing in the file says whether a
+    /// pixel of 1.0 is a dim wall or a bright sky. A file captured with a known
+    /// exposure wants 1.0 and a calibration baked in; everything else wants this
+    /// slider and a look at what the sun is doing beside it.
     pub intensity: f32,
     /// Rotation of the environment about world Y, in degrees. Applied to the
     /// sampling direction, so it costs nothing and needs no rebake.

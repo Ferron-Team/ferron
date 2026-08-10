@@ -173,7 +173,7 @@ fn to_gpu_lighting(
             light.position.z,
             light.range.max(1e-4),
         ];
-        slot.color = [light.color.x, light.color.y, light.color.z, light.intensity];
+        slot.color = [light.color.x, light.color.y, light.color.z, light.candela];
         // A light that asked for tiles and did not get them keeps its -1 and
         // shades unshadowed, which is the whole behaviour of the budget: too
         // many casters costs shadows, never correctness.
@@ -202,7 +202,7 @@ fn to_gpu_lighting(
             light.direction.z,
             light.outer_cos,
         ];
-        slot.color = [light.color.x, light.color.y, light.color.z, light.intensity];
+        slot.color = [light.color.x, light.color.y, light.color.z, light.candela];
         let face = atlas
             .caster(LightKind::Spot, index)
             .map_or([-1.0, 0.0], |caster| {
@@ -254,14 +254,14 @@ fn to_gpu_lighting(
             lighting.ambient_color.x,
             lighting.ambient_color.y,
             lighting.ambient_color.z,
-            lighting.ambient_intensity,
+            lighting.ambient_nits,
         ],
         sun_direction: [to_sun.x, to_sun.y, to_sun.z, 0.0],
         sun_color: [
             lighting.sun.color.x,
             lighting.sun.color.y,
             lighting.sun.color.z,
-            lighting.sun.intensity,
+            lighting.sun.illuminance,
         ],
         params: [
             count as f32,
@@ -299,7 +299,7 @@ fn to_gpu_lighting(
 struct GpuPointLight {
     /// xyz = world position, w = range.
     position: [f32; 4],
-    /// rgb = color, w = intensity.
+    /// rgb = color, w = luminous intensity in candela.
     color: [f32; 4],
     /// x = index of this light's first atlas face, negative for a light the
     /// atlas had no room for; y = the near plane its faces were rendered with,
@@ -323,7 +323,8 @@ struct GpuSpotLight {
     position: [f32; 4],
     /// xyz = cone axis, w = cosine of the outer half angle.
     direction: [f32; 4],
-    /// rgb = color, w = intensity.
+    /// rgb = color, w = luminous intensity in candela, the reflector already
+    /// divided out.
     color: [f32; 4],
     /// x = cosine of the inner half angle, y = atlas face index (negative for
     /// none), z = near plane.
@@ -349,11 +350,11 @@ impl GpuSpotLight {
 struct GpuLighting {
     /// xyz = camera world position.
     camera_pos: [f32; 4],
-    /// rgb = ambient color, w = ambient intensity.
+    /// rgb = ambient color, w = ambient luminance in cd/m².
     ambient: [f32; 4],
     /// xyz = normalized direction toward the sun.
     sun_direction: [f32; 4],
-    /// rgb = sun color, w = sun intensity.
+    /// rgb = sun color, w = illuminance in lux on a surface facing it.
     sun_color: [f32; 4],
     /// x = point light count, y = shininess, z = specular strength,
     /// w = spot light count.
@@ -743,7 +744,7 @@ impl ForwardPass {
         // loaded — the diffuse as a band-0-only series, the specular as a tint
         // on a white cube. Two descriptions of the same uniform environment,
         // which is what keeps them from disagreeing.
-        let ambient = lighting.ambient_color * lighting.ambient_intensity;
+        let ambient = lighting.ambient_color * lighting.ambient_nits;
         let irradiance = renderer.environment.irradiance(ambient, environment);
         let env_specular = renderer.environment.specular_tint(ambient, environment);
         *lighting_buffer.write().unwrap() = to_gpu_lighting(

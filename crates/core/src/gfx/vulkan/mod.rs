@@ -811,7 +811,7 @@ impl VulkanRenderer {
         // the declaration, because a window too small for seven levels gets
         // fewer and the march has to stop at the last one that exists.
         if let Some(ids) = self.frame.ids.ssr {
-            let ambient = lighting.ambient_color * lighting.ambient_intensity;
+            let ambient = lighting.ambient_color * lighting.ambient_nits;
             self.ssr.begin_frame(
                 ssr,
                 &view,

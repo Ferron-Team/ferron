@@ -144,12 +144,21 @@ pub const MAX_TEXTURES: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextureHandle(pub u32);
 
+/// Every light below carries the unit the *shader* wants rather than the one the
+/// scene authored, because the conversion is per fixture and the loop over lights
+/// is per pixel. `extract_lighting` is where lumens become candela; nothing past
+/// it knows what kind of housing a light had.
 #[derive(Clone, Copy, Debug)]
 pub struct DirectionalLight {
     /// The direction the light *travels* (e.g. roughly downward for a sun).
     pub direction: Vec3,
     pub color: Vec3,
-    pub intensity: f32,
+    /// Illuminance on a surface facing the light, in lux.
+    ///
+    /// Unconverted, unlike the punctual lights': a directional light has no
+    /// distance to fall off over, so the illuminance it lays down is already what
+    /// the BRDF wants to be multiplied by.
+    pub illuminance: f32,
 }
 
 impl DirectionalLight {
@@ -169,7 +178,9 @@ impl DirectionalLight {
 pub struct PointLight {
     pub position: Vec3,
     pub color: Vec3,
-    pub intensity: f32,
+    /// Luminous intensity in candela, already divided out of the authored lumens
+    /// by [`Light::point_candela`](crate::scene::Light::point_candela).
+    pub candela: f32,
     pub range: f32,
     /// Whether this light asks for atlas tiles. Asking is not getting: the atlas
     /// has a fixed number of tiles and a point light spends six, so
@@ -187,7 +198,11 @@ pub struct SpotLight {
     /// The direction the cone points, normalised.
     pub direction: Vec3,
     pub color: Vec3,
-    pub intensity: f32,
+    /// Luminous intensity in candela — the authored lumens through
+    /// [`Light::spot_candela`](crate::scene::Light::spot_candela), so the
+    /// reflector has already been accounted for and `outer_cos` below is only a
+    /// falloff.
+    pub candela: f32,
     pub range: f32,
     pub inner_cos: f32,
     pub outer_cos: f32,
@@ -197,7 +212,9 @@ pub struct SpotLight {
 #[derive(Clone, Debug)]
 pub struct SceneLighting {
     pub ambient_color: Vec3,
-    pub ambient_intensity: f32,
+    /// Luminance of the uniform fallback sky, in cd/m². Ignored once an
+    /// environment is loaded — see [`AmbientLight`](crate::scene::AmbientLight).
+    pub ambient_nits: f32,
     pub sun: DirectionalLight,
     /// Anything past [`MAX_POINT_LIGHTS`] is ignored.
     pub point_lights: Vec<PointLight>,
@@ -274,6 +291,15 @@ pub struct Material {
     pub metallic: f32,
     pub roughness: f32,
     pub reflectance: f32,
+    /// Radiance the surface emits on its own, in **nits** (cd/m²) — the same
+    /// unit the frame is measured in, because that is what it adds to. A monitor
+    /// is a few hundred, a neon tube a couple of thousand, a filament tens of
+    /// thousands.
+    ///
+    /// A luminance rather than a power, unlike every light above: this is spread
+    /// over whatever area the mesh happens to have, so scaling the mesh scales
+    /// how much light it appears to put out — which is the one place emission
+    /// differs from a fixture with a lumen rating.
     pub emissive: Vec3,
     pub albedo_texture: Option<TextureHandle>,
     pub normal_texture: Option<TextureHandle>,
@@ -381,11 +407,11 @@ impl Default for SceneLighting {
     fn default() -> Self {
         Self {
             ambient_color: Vec3::new(0.6, 0.7, 1.0),
-            ambient_intensity: 0.15,
+            ambient_nits: 600.0,
             sun: DirectionalLight {
                 direction: Vec3::new(-0.4, -1.0, -0.6).normalize(),
                 color: Vec3::new(1.0, 0.97, 0.92),
-                intensity: 1.0,
+                illuminance: 20_000.0,
             },
             point_lights: Vec::new(),
             spot_lights: Vec::new(),

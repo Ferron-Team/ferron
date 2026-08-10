@@ -295,12 +295,16 @@ fn spawn(world: &mut World, kind: SpawnKind) -> Option<Entity> {
                 material,
             ))
         }
+        // Physical fixtures, matching `Light::default`: a bright shop light and an
+        // overcast sun. Both are large numbers and neither is arbitrary — a light
+        // spawned at the old unitless 8.0 would now be an 8 lumen indicator lamp,
+        // which is a feature that looks broken rather than a light that looks dim.
         SpawnKind::PointLight => Some(entities::spawn_point_light(
             world,
             "Point Light",
             Vec3::new(0.0, 3.0, 0.0),
             Vec3::ONE,
-            8.0,
+            4000.0,
             10.0,
         )),
         SpawnKind::DirectionalLight => Some(entities::spawn_directional_light(
@@ -308,7 +312,7 @@ fn spawn(world: &mut World, kind: SpawnKind) -> Option<Entity> {
             "Directional Light",
             Vec3::new(-0.4, -1.0, -0.6),
             Vec3::ONE,
-            1.0,
+            20_000.0,
         )),
     }
 }

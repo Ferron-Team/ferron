@@ -308,7 +308,13 @@ fn lighting_column(ui: &mut egui::Ui, world: &World) {
     {
         let mut ambient = world.resource_mut::<AmbientLight>();
         color_row(ui, "Color", &mut ambient.color);
-        ui.add(egui::Slider::new(&mut ambient.intensity, 0.0..=2.0).text("Intensity"));
+        ui.add(
+            egui::Slider::new(&mut ambient.nits, 0.0..=10_000.0)
+                .logarithmic(true)
+                .suffix(" cd/m²")
+                .text("Luminance"),
+        )
+        .on_hover_text("Clear zenith a few thousand, overcast under a thousand, dusk tens");
     }
     ui.add_space(6.0);
     ui.strong("Sky");

@@ -10,8 +10,8 @@ use crate::gfx::{
     SpotLight,
 };
 use crate::scene::{
-    AmbientLight, Camera, Culling, FogSettings, Light, LocalTransform, MaterialBlends,
-    MaterialHandle, MeshBounds, MeshHandle, Spin, WorldTransform,
+    AmbientLight, Camera, Culling, FogSettings, Light, LocalTransform, MAX_CONE_ANGLE,
+    MIN_CONE_ANGLE, MaterialBlends, MaterialHandle, MeshBounds, MeshHandle, Spin, WorldTransform,
 };
 
 pub fn spin(world: &World, dt: f32) {
@@ -507,7 +507,7 @@ fn normal_matrix(model: &Mat4) -> Mat3 {
 pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
     let defaults = SceneLighting::default();
     out.ambient_color = defaults.ambient_color;
-    out.ambient_intensity = defaults.ambient_intensity;
+    out.ambient_nits = defaults.ambient_nits;
     out.sun = defaults.sun;
     out.shininess = defaults.shininess;
     out.specular_strength = defaults.specular_strength;
@@ -520,7 +520,7 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
 
     if let Some(ambient) = world.get_resource::<AmbientLight>() {
         out.ambient_color = ambient.color;
-        out.ambient_intensity = ambient.intensity;
+        out.ambient_nits = ambient.nits;
     }
 
     if let Some(fog) = world.get_resource::<FogSettings>() {
@@ -533,19 +533,23 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
     let mut has_sun = false;
     world.query::<(&LocalTransform, &Light)>().for_each(
         |_entity, (transform, light)| match *light {
-            Light::Directional { color, intensity } => {
+            Light::Directional { color, lux } => {
                 // The shader supports one directional light, so the first wins.
                 if !has_sun {
                     let direction = (transform.rotation * Vec3::NEG_Z).normalize_or_zero();
                     out.sun.direction = direction;
                     out.sun.color = color;
-                    out.sun.intensity = intensity;
+                    // Straight through: illuminance is already what a surface
+                    // facing the light receives, which is the quantity the BRDF
+                    // is multiplied by. Only the punctual lights below have a
+                    // fixture to divide out.
+                    out.sun.illuminance = lux;
                     has_sun = true;
                 }
             }
             Light::Point {
                 color,
-                intensity,
+                lumens,
                 range,
                 casts_shadows,
             } => {
@@ -553,7 +557,7 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                     out.point_lights.push(PointLight {
                         position: transform.translation,
                         color,
-                        intensity,
+                        candela: Light::point_candela(lumens),
                         range,
                         casts_shadows,
                     });
@@ -561,10 +565,11 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
             }
             Light::Spot {
                 color,
-                intensity,
+                lumens,
                 range,
                 inner_angle,
                 outer_angle,
+                reflector,
                 casts_shadows,
             } => {
                 if out.spot_lights.len() < MAX_SPOT_LIGHTS {
@@ -572,13 +577,16 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                     // inner cone is never outside the outer one — the falloff
                     // divides by their difference, and a cone authored inside
                     // out would otherwise light its own outside.
-                    let outer = outer_angle.clamp(1.0, 89.0);
+                    let outer = outer_angle.clamp(MIN_CONE_ANGLE, MAX_CONE_ANGLE);
                     let inner = inner_angle.clamp(0.0, outer);
                     out.spot_lights.push(SpotLight {
                         position: transform.translation,
                         direction: (transform.rotation * Vec3::NEG_Z).normalize_or_zero(),
                         color,
-                        intensity,
+                        // The *clamped* outer angle, so the solid angle the power
+                        // is spread over is the one the shader's falloff then
+                        // measures against.
+                        candela: Light::spot_candela(lumens, outer, reflector),
                         range,
                         inner_cos: inner.to_radians().cos(),
                         outer_cos: outer.to_radians().cos(),
