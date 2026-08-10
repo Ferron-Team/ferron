@@ -24,18 +24,36 @@ pub struct EnvironmentSettings {
     /// still be reading, so it happens at the one point in the loop that is
     /// safe rather than wherever a button was clicked.
     pub reload_requested: bool,
-    /// Multiplier on environment radiance. Separate from
-    /// [`HdrSettings::exposure`](super::HdrSettings) because that scales the
-    /// whole frame, while this balances the environment against the analytic
-    /// lights.
+    /// How bright this environment's sky is, in **cd/m²** — a clear zenith
+    /// around 8 000, an overcast one 1 000–2 000, dusk in the tens.
     ///
-    /// With lights in physical units this is the calibration from the HDRI's own
-    /// numbers to cd/m², and it cannot be derived: an `.hdr` carries relative
-    /// radiance with no absolute scale, so nothing in the file says whether a
-    /// pixel of 1.0 is a dim wall or a bright sky. A file captured with a known
-    /// exposure wants 1.0 and a calibration baked in; everything else wants this
-    /// slider and a look at what the sun is doing beside it.
-    pub intensity: f32,
+    /// A stated luminance rather than a multiplier, and that is what makes an
+    /// HDRI usable at all now that the lights around it are photometric. An
+    /// `.hdr` carries *relative* radiance: nothing in the file says whether a
+    /// pixel of 1.0 is a dim wall or a bright sky, and the ones people download
+    /// land two to four orders of magnitude below real luminance. A raw
+    /// multiplier makes that the author's problem — find 4 500 by dragging, and
+    /// write a number into the scene that means nothing without that exact file
+    /// beside it.
+    ///
+    /// So the bake measures the source's own sky luminance
+    /// ([`sh::sky_luminance`](crate::gfx::sh::sky_luminance)) and the renderer
+    /// scales by the ratio. The number here is then a fact about the sky being
+    /// depicted rather than about the file depicting it: swap in a different
+    /// capture of the same weather and the lighting does not move.
+    ///
+    /// Separate from [`HdrSettings`](super::HdrSettings) because that is the
+    /// camera and this is the scene — exposure decides what a luminance looks
+    /// like, not what it is.
+    pub sky_luminance: f32,
+    /// Extra stops on the environment, on top of the calibration above.
+    ///
+    /// The one control here that is deliberately *not* physical, because two
+    /// things it cannot express are worth having anyway: an HDRI whose ground is
+    /// wrong for the scene standing on it, and a look. Zero is the calibrated
+    /// answer, and a scene that never touches this is lit by what its sky says
+    /// it is.
+    pub exposure_offset: f32,
     /// Rotation of the environment about world Y, in degrees. Applied to the
     /// sampling direction, so it costs nothing and needs no rebake.
     pub yaw: f32,
@@ -49,10 +67,38 @@ impl Default for EnvironmentSettings {
         Self {
             hdri: String::new(),
             reload_requested: false,
-            intensity: 1.0,
+            // Dusk, matching the placeholder sky the demo scene is lit at. A
+            // default has to be *some* weather; this is the one the engine ships
+            // content for.
+            sky_luminance: 30.0,
+            exposure_offset: 0.0,
             yaw: 0.0,
             show_skybox: true,
         }
+    }
+}
+
+impl EnvironmentSettings {
+    /// The factor to scale sampled environment radiance by, given what the
+    /// source's own sky measured.
+    ///
+    /// `measured` is in the file's units and [`sky_luminance`](Self::sky_luminance)
+    /// in cd/m², so the ratio between them is the calibration; the offset is then
+    /// stops on top of it. A source that measured nothing — a black image, or no
+    /// environment at all — has no ratio to take, and 1.0 leaves whatever it holds
+    /// alone rather than dividing by zero.
+    ///
+    /// One definition because three consumers scale by it: the irradiance probe,
+    /// the specular tint, and the skybox draw. The first two are what lights the
+    /// scene and the third is what stands behind it, so a copy that drifted would
+    /// be geometry lit by one sky against a picture of a different one.
+    pub fn calibration(&self, measured: f32) -> f32 {
+        let scale = if measured > 1e-6 {
+            self.sky_luminance.max(0.0) / measured
+        } else {
+            1.0
+        };
+        scale * self.exposure_offset.exp2()
     }
 }
 
@@ -150,6 +196,50 @@ pub fn load_hdri(assets_dir: &Path, relative: &str) -> Result<Hdri, HdriError> {
 
 #[cfg(test)]
 mod tests {
+    /// The contract the control rests on: a source measuring anything at all,
+    /// calibrated to N cd/m², comes out at N. Without this the number on the
+    /// slider is decoration.
+    #[test]
+    fn a_calibrated_sky_is_the_luminance_it_claims() {
+        let settings = EnvironmentSettings {
+            sky_luminance: 2000.0,
+            ..Default::default()
+        };
+        for measured in [0.01f32, 0.33, 1.0, 7.5] {
+            let lit = measured * settings.calibration(measured);
+            assert!(
+                (lit / 2000.0 - 1.0).abs() < 1e-3,
+                "a sky measuring {measured} calibrated to {lit}, not 2000",
+            );
+        }
+    }
+
+    /// A stop is a doubling here too, and it composes with the calibration rather
+    /// than replacing it — the offset is stops *on top of* a physical answer.
+    #[test]
+    fn an_offset_stop_doubles_a_calibrated_sky() {
+        let base = EnvironmentSettings {
+            sky_luminance: 2000.0,
+            ..Default::default()
+        };
+        let brighter = EnvironmentSettings {
+            exposure_offset: 1.0,
+            ..base.clone()
+        };
+        assert!((brighter.calibration(0.33) / base.calibration(0.33) - 2.0).abs() < 1e-4);
+    }
+
+    /// Nothing to measure is not a reason to divide by it. A black source, or no
+    /// environment at all, has no ratio to take and must leave what it holds
+    /// alone — this is the guard between an unloaded environment and an infinity
+    /// in the lighting uniform.
+    #[test]
+    fn an_unmeasurable_source_is_left_alone() {
+        let settings = EnvironmentSettings::default();
+        assert_eq!(settings.calibration(0.0), 1.0);
+        assert!(settings.calibration(f32::MIN_POSITIVE).is_finite());
+    }
+
     use super::*;
 
     /// The same rule `orrin.toml` paths follow, and for the same reason: this

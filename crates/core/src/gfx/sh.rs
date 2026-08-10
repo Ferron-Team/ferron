@@ -104,6 +104,59 @@ fn diffuse_ceiling(pixels: &[f32], extent: [u32; 2]) -> f32 {
     ceiling
 }
 
+/// The luminance of this environment's sky, in whatever units the source
+/// carries — the measurement a physical calibration is stated relative to.
+///
+/// Two choices in here, and both are about what "the sky" means to someone
+/// reading a number off a reference table:
+///
+/// - The **upper hemisphere only**. A capture's lower half is ground, and ground
+///   is dark; including it would answer a question about the *environment* while
+///   the control above it asks about the sky, and the two differ by a factor that
+///   depends on how much dirt the photographer stood on.
+/// - A **geometric mean**, which is what makes this robust to a sun. A clear-sky
+///   capture puts most of its arithmetic mean into a disc a fraction of a degree
+///   across, so an ordinary average would report the sun and the calibration
+///   derived from it would light the scene orders of magnitude too dark. In log
+///   space that disc is a thousandth of the frame carrying a bounded number of
+///   stops, and it moves the answer by well under a percent.
+///
+/// Deliberately *not* the clamped mean [`diffuse_ceiling`] builds, even though it
+/// sits right there and also excludes the sun. That one exists to preserve
+/// energy: irradiance is a linear integral, so an outlier has to be clamped and
+/// still counted. This one summarises a level, where the outlier should not count
+/// at all. Two different questions, and answering the second with the first
+/// leaves about a quarter of a bright sun in the result.
+pub fn sky_luminance(pixels: &[f32], extent: [u32; 2]) -> f32 {
+    let (width, height) = (extent[0] as usize, extent[1] as usize);
+    // Row 0 is the zenith — `basis`'s `cos_theta` is +Y at theta 0 — so the sky
+    // is the first half of the rows.
+    let rows = 0..height / 2;
+
+    let mut total = 0.0f64;
+    let mut measure = 0.0f64;
+    for y in rows {
+        let theta = (y as f32 + 0.5) / height as f32 * PI;
+        let weight = theta.sin() as f64;
+        for x in 0..width {
+            let texel = (y * width + x) * 4;
+            let luminance =
+                Vec3::new(pixels[texel], pixels[texel + 1], pixels[texel + 2]).dot(LUMA);
+            // Floored rather than skipped: a black pixel is information about how
+            // dark this sky is, and dropping it would report a night sky as
+            // whatever few stars it has.
+            total += (luminance.max(1e-6) as f64).ln() * weight;
+            measure += weight;
+        }
+    }
+
+    if measure > 0.0 {
+        (total / measure).exp() as f32
+    } else {
+        0.0
+    }
+}
+
 /// The real spherical-harmonic basis for bands 0..=2.
 ///
 /// Mirrored by `sh_irradiance` in `forward.frag`, which must evaluate these same
@@ -230,6 +283,66 @@ mod tests {
         Vec3::new(0.0, 0.0, 1.0),
         Vec3::new(0.0, 0.0, -1.0),
     ];
+
+    /// The measurement the whole calibration is stated against: a uniform sky of
+    /// luminance L has to measure L, or "this sky is 2 000 cd/m²" scales to
+    /// something else entirely.
+    #[test]
+    fn a_uniform_sky_measures_its_own_luminance() {
+        let pixels = equirect(64, 32, |_| Vec3::splat(0.5));
+        let expected = Vec3::splat(0.5).dot(LUMA);
+        let measured = sky_luminance(&pixels, [64, 32]);
+        assert!(
+            (measured / expected - 1.0).abs() < 0.02,
+            "measured {measured}, expected {expected}",
+        );
+    }
+
+    /// A sun disc is a fraction of a degree across and four or five orders of
+    /// magnitude above the sky around it, so a mean that counted it would answer
+    /// with the sun. The calibration derived from that answer would light the
+    /// scene orders of magnitude too dark, which is the failure this measurement
+    /// exists to avoid — and it is invisible, because the sky still looks like a
+    /// sky, just wrong.
+    #[test]
+    fn a_sun_does_not_drag_the_measurement_up() {
+        let to_sun = Vec3::new(0.3, 0.8, 0.5).normalize();
+        let clear = equirect(256, 128, |_| Vec3::splat(0.4));
+        let sunny = equirect(256, 128, |d| {
+            if d.dot(to_sun) > 0.999 {
+                Vec3::splat(40_000.0)
+            } else {
+                Vec3::splat(0.4)
+            }
+        });
+        let without = sky_luminance(&clear, [256, 128]);
+        let with = sky_luminance(&sunny, [256, 128]);
+        assert!(
+            (with / without - 1.0).abs() < 0.05,
+            "a sun moved the sky from {without} to {with}",
+        );
+    }
+
+    /// The upper hemisphere only. A capture's ground is dark and its share of the
+    /// frame depends on where the photographer stood, so including it would make
+    /// the number answer a question about the environment while the control asks
+    /// about the sky.
+    #[test]
+    fn the_ground_is_not_the_sky() {
+        let pixels = equirect(64, 32, |d| {
+            if d.y >= 0.0 {
+                Vec3::splat(1.0)
+            } else {
+                Vec3::splat(0.01)
+            }
+        });
+        let measured = sky_luminance(&pixels, [64, 32]);
+        let sky = Vec3::splat(1.0).dot(LUMA);
+        assert!(
+            (measured / sky - 1.0).abs() < 0.02,
+            "measured {measured}, expected the sky's {sky}",
+        );
+    }
 
     fn equirect(width: u32, height: u32, mut radiance: impl FnMut(Vec3) -> Vec3) -> Vec<f32> {
         let mut pixels = Vec::with_capacity((width * height * 4) as usize);

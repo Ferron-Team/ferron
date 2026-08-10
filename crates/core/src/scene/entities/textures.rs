@@ -54,28 +54,15 @@ pub fn bump_normals(size: u32, freq: f32, strength: f32) -> Vec<u8> {
 pub fn sky_equirect(width: u32, height: u32, to_sun: Vec3) -> Vec<f32> {
     use std::f32::consts::{PI, TAU};
 
-    // Now in cd/m², like everything else that lights the scene: the gradient
-    // below is a unit-scale sky shape multiplied by `SKY_NITS`, so the sky and the
-    // sun beside it are on one scale rather than two. Auto-exposure is what makes
-    // that survivable — the reason this was left uncalibrated until metering
-    // existed.
-    //
-    // Around 30 cd/m² averaged over the upper hemisphere, which integrates to
-    // roughly 90 lux of fill: a dusk sky, and about a third of the demo's 250 lux
-    // sun. That *ratio* is the number that matters. Physical units put the sun and
-    // the sky on one scale, so getting their proportion wrong is no longer a
-    // matter of taste — a clear noon sky is a twentieth of its sun and reads as
-    // hard light with black shadows, an overcast one exceeds its sun and reads as
-    // no shadows at all. This is the hour in between.
-    const SKY_NITS: f32 = 200.0;
-
-    // Uniformly, so every ratio inside the image survives — the disc below stays
-    // the two orders of magnitude above the sky that the prefilter's firefly
-    // handling exists to survive.
+    // Relative radiance, like the `.hdr` files this stands in for, because
+    // calibration is what supplies the absolute level: `EnvironmentSettings`
+    // measures whatever sky it is given and scales it to the cd/m² the scene
+    // asked for. So only the *ratios* in here matter, and a second scale factor
+    // at this end would be one the calibration divides straight back out.
     let to_sun = to_sun.normalize();
-    let zenith = Vec3::new(0.04, 0.08, 0.18) * SKY_NITS;
-    let horizon = Vec3::new(0.20, 0.24, 0.30) * SKY_NITS;
-    let ground = Vec3::new(0.02, 0.018, 0.016) * SKY_NITS;
+    let zenith = Vec3::new(0.04, 0.08, 0.18);
+    let horizon = Vec3::new(0.20, 0.24, 0.30);
+    let ground = Vec3::new(0.02, 0.018, 0.016);
 
     let mut data = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height {
@@ -100,14 +87,14 @@ pub fn sky_equirect(width: u32, height: u32, to_sun: Vec3) -> Vec<f32> {
             // reflects and what the prefilter's firefly handling exists to
             // survive, so flattening it would hide the case that matters.
             //
-            // Deliberately *not* a physical disc. A real sun is around 1e9
-            // cd/m², six orders above this sky, and a placeholder cubemap
-            // carrying that would spend every prefilter tap fighting one texel.
-            // The ratio a reflection needs is the point; the absolute value is
-            // what a real HDRI brings.
+            // Two orders rather than the six a real sun sits above a real sky,
+            // and deliberately: a placeholder carrying that ratio would spend
+            // every prefilter tap fighting one texel. The ratio a reflection
+            // needs to look like a reflection is the point here; a real capture
+            // is what brings the rest of it.
             let cosine = dir.dot(to_sun);
-            color += Vec3::splat(40.0 * SKY_NITS) * ((cosine - 0.9996) / 0.0004).clamp(0.0, 1.0);
-            color += Vec3::new(1.0, 0.85, 0.6) * SKY_NITS * cosine.max(0.0).powf(64.0) * 0.8;
+            color += Vec3::splat(40.0) * ((cosine - 0.9996) / 0.0004).clamp(0.0, 1.0);
+            color += Vec3::new(1.0, 0.85, 0.6) * cosine.max(0.0).powf(64.0) * 0.8;
 
             data.extend_from_slice(&[color.x, color.y, color.z, 1.0]);
         }

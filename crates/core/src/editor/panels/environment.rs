@@ -335,7 +335,28 @@ fn lighting_column(ui: &mut egui::Ui, world: &World) {
                 .desired_width(f32::INFINITY),
         );
         ui.checkbox(&mut env.show_skybox, "Show skybox");
-        ui.add(egui::Slider::new(&mut env.intensity, 0.0..=4.0).text("Intensity"));
+        // Logarithmic over five orders of magnitude, because that is the range
+        // real skies cover and because a downloaded `.hdr` needs a factor in the
+        // thousands to reach any of it. The old control was a raw multiplier
+        // capped at 4.0, which could not express the calibration a real capture
+        // wants at all.
+        ui.add(
+            egui::Slider::new(&mut env.sky_luminance, 1.0..=50_000.0)
+                .logarithmic(true)
+                .suffix(" cd/m²")
+                .text("Sky"),
+        )
+        .on_hover_text(
+            "How bright this sky is, whatever the file's own numbers are: clear \
+             zenith ~8 000, overcast 1 000–2 000, dusk in the tens. Set the sun \
+             beside it to match — a daylight capture wants tens of thousands of lux.",
+        );
+        ui.add(
+            egui::Slider::new(&mut env.exposure_offset, -4.0..=4.0)
+                .suffix(" EV")
+                .text("Offset"),
+        )
+        .on_hover_text("Stops on top of the calibration. Zero is what the sky above says it is.");
         // Rotates the sampling direction, so it needs no rebake and can be
         // dragged.
         ui.add(egui::Slider::new(&mut env.yaw, -180.0..=180.0).text("Rotation"));

@@ -136,6 +136,11 @@ pub struct EnvironmentPass {
     /// it was ever uploaded. Held beside the cube because the two are derived
     /// from the same source and would be wrong to have disagree.
     irradiance: Option<[Vec3; SH9]>,
+    /// The source's own sky luminance, in whatever units it carried, measured at
+    /// bake. Everything sampled from this environment is scaled by the ratio
+    /// between it and the cd/m² the scene asked for, so it is the other half of a
+    /// calibration and belongs beside the maps it calibrates.
+    measured_sky: f32,
 }
 
 impl EnvironmentPass {
@@ -184,6 +189,7 @@ impl EnvironmentPass {
             cube_sampler,
             cube: None,
             irradiance: None,
+            measured_sky: 0.0,
         }
     }
 
@@ -201,19 +207,23 @@ impl EnvironmentPass {
     }
 
     /// What the sampled environment radiance is multiplied by. With an
-    /// environment that is just its intensity; without one it is the scene's
-    /// flat ambient, which turns the 1x1 white fallback into a uniform
+    /// environment that is its calibration to cd/m²; without one it is the
+    /// scene's flat ambient, which turns the 1x1 white fallback into a uniform
     /// environment of that colour — the same environment the band-0-only
     /// irradiance describes, so the diffuse and specular halves agree.
     pub fn specular_tint(&self, ambient: Vec3, settings: &EnvironmentSettings) -> Vec3 {
         match self.cube {
-            Some(_) => Vec3::splat(settings.intensity),
+            Some(_) => Vec3::splat(settings.calibration(self.measured_sky)),
             None => ambient,
         }
     }
 
-    /// The nine coefficients the forward shader evaluates, scaled by the
-    /// environment's intensity.
+    /// The nine coefficients the forward shader evaluates, calibrated to cd/m².
+    ///
+    /// The same factor `specular_tint` returns, because the two halves describe
+    /// one sky: calibrating the diffuse probe and the specular chain differently
+    /// would make a rough surface and a smooth one disagree about how bright the
+    /// world is.
     ///
     /// With no environment loaded this is `ambient` expressed as a band-0-only
     /// series, which evaluates to exactly `ambient` for every normal. So the
@@ -222,7 +232,10 @@ impl EnvironmentPass {
     /// a 1x1 white image rather than branching.
     pub fn irradiance(&self, ambient: Vec3, settings: &EnvironmentSettings) -> [Vec3; SH9] {
         match self.irradiance {
-            Some(coefficients) => coefficients.map(|c| c * settings.intensity),
+            Some(coefficients) => {
+                let calibration = settings.calibration(self.measured_sky);
+                coefficients.map(|c| c * calibration)
+            }
             None => sh::from_constant(ambient),
         }
     }
@@ -248,6 +261,11 @@ impl EnvironmentPass {
         // pixels are already here, and a readback would be the only GPU-to-CPU
         // transfer anywhere in the engine.
         self.irradiance = Some(sh::project_equirect(pixels, extent));
+        // Measured here rather than at load: the generated placeholder sky never
+        // passes through `load_hdri`, and both sources have to be calibrated the
+        // same way or the demo scene is the one scene the mechanism does not
+        // cover.
+        self.measured_sky = sh::sky_luminance(pixels, extent);
 
         let equirect = upload_equirect(ctx, pixels, extent);
         self.cube = Some(bake(
@@ -327,7 +345,7 @@ impl EnvironmentPass {
                 0,
                 SkyboxPush {
                     inv_view_rot_proj: matrix.to_cols_array_2d(),
-                    params: [settings.intensity, 0.0, 0.0, 0.0],
+                    params: [settings.calibration(self.measured_sky), 0.0, 0.0, 0.0],
                 },
             )
             .unwrap();
