@@ -27,7 +27,8 @@ use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, ContactShadowSettings, Culling, DebugLine, DebugLines,
     DofSettings, EnvironmentSettings, FogSettings, HdrSettings, InputState, LogBuffer, LogLevel,
-    MotionBlurSettings, ShadowSettings, SsaoSettings, SsrSettings, TaaSettings, Time, load_hdri,
+    MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, TaaSettings,
+    Time, TransparencySettings, load_hdri,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -199,6 +200,8 @@ impl App {
         world.insert_resource(AmbientLight::default());
         world.insert_resource(SsaoSettings::default());
         world.insert_resource(SsrSettings::default());
+        world.insert_resource(TransparencySettings::default());
+        world.insert_resource(RefractionSettings::default());
         world.insert_resource(ShadowSettings::default());
         world.insert_resource(ContactShadowSettings::default());
         world.insert_resource(HdrSettings::default());
@@ -588,6 +591,8 @@ impl ApplicationHandler for App {
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let contact_shadows = *self.world.resource::<ContactShadowSettings>();
                 let ssr = *self.world.resource::<SsrSettings>();
+                let transparency = *self.world.resource::<TransparencySettings>();
+                let refraction = *self.world.resource::<RefractionSettings>();
                 let taa = *self.world.resource::<TaaSettings>();
                 let motion_blur = *self.world.resource::<MotionBlurSettings>();
                 let dof = *self.world.resource::<DofSettings>();
@@ -628,11 +633,15 @@ impl ApplicationHandler for App {
                         std::array::from_fn(|i| self.geometry.punctual(i));
                     renderer.render_with_overlay(
                         self.geometry.visible(),
+                        self.geometry.transparent(),
+                        self.geometry.refractive(),
                         &self.lighting,
                         &camera,
                         &ssao,
                         &contact_shadows,
                         &ssr,
+                        &transparency,
+                        &refraction,
                         &taa,
                         &motion_blur,
                         &dof,

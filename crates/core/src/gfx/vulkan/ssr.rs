@@ -539,7 +539,7 @@ mod hiz_cs {
 }
 
 mod source_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/ssr_source.comp" }
+    vulkano_shaders::shader! { ty: "compute", path: "shaders/color_pyramid.comp" }
 }
 
 mod trace_cs {

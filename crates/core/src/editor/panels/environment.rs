@@ -5,8 +5,8 @@ use crate::gfx::shadows::MAX_CASCADES;
 use super::{color_row, vec3_row};
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, ContactShadowSettings, DofSettings, EnvironmentSettings,
-    FogSettings, HdrSettings, MotionBlurSettings, ShadowSettings, SsaoSettings, SsrSettings,
-    TaaSettings,
+    FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings,
+    SsrSettings, TaaSettings, TransparencySettings,
 };
 
 type Column = fn(&mut egui::Ui, &World);
@@ -107,6 +107,29 @@ fn screen_space_column(ui: &mut egui::Ui, world: &World) {
         );
         ui.add(egui::Slider::new(&mut ssr.max_steps, 8..=128).text("Steps"))
             .on_hover_text("A step crosses a whole cell of the depth pyramid, not a texel");
+    }
+    ui.add_space(6.0);
+    ui.strong("Transparency")
+        .on_hover_text("Weighted-blended order-independent transparency (McGuire & Bavoil)");
+    {
+        let mut transparency = world.resource_mut::<TransparencySettings>();
+        // Frame structure like the rest: it registers the accumulation and
+        // composite nodes, and it is one more thing that keeps the prepass
+        // alive — the accumulation depth-tests against what that pass wrote.
+        ui.checkbox(&mut transparency.enabled, "Enabled")
+            .on_hover_text("Off draws nothing at all where a blended material is used");
+    }
+    ui.add_space(6.0);
+    ui.strong("Refraction").on_hover_text(
+        "Screen-space refraction: a transmissive material samples the frame behind it",
+    );
+    {
+        let mut refraction = world.resource_mut::<RefractionSettings>();
+        // Beside transparency rather than under it: the two queues answer to
+        // opposite rules about ordering, and each is its own A/B when a
+        // non-opaque surface looks wrong.
+        ui.checkbox(&mut refraction.enabled, "Enabled")
+            .on_hover_text("Off draws nothing at all where a transmissive material is used");
     }
 }
 

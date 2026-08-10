@@ -339,6 +339,8 @@ mod tests {
             ssao: true,
             contact_shadows: true,
             ssr: true,
+            transparency: false,
+            refraction: false,
             taa: true,
             auto_exposure: true,
             motion_blur: true,

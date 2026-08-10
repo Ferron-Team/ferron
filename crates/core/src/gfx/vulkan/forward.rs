@@ -30,7 +30,8 @@ use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, MAX_SHADOW_LIGHTS, Shadow
 use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
 use crate::gfx::{
-    DrawList, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, MAX_TEXTURES, Material, SceneLighting, Vertex,
+    BlendMode, DrawList, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, MAX_TEXTURES, Material, SceneLighting,
+    Vertex,
 };
 use crate::scene::{Camera, EnvironmentSettings};
 
@@ -57,11 +58,23 @@ pub struct GpuMesh {
 /// run covers many models, so the model half has to be applied in the shader.
 #[derive(vulkano::buffer::BufferContents, Clone, Copy)]
 #[repr(C)]
-struct PushConstants {
+pub(super) struct PushConstants {
     view_proj: [[f32; 4]; 4],
     material_index: u32,
     /// First set-4 object row of this run; the shader adds `gl_InstanceIndex`.
     object_base: u32,
+}
+
+impl PushConstants {
+    /// Also what the transparency pass pushes: it draws the same geometry
+    /// through the same pipeline layout, so it pushes the same range.
+    pub(super) fn new(view_proj: Mat4, material_index: u32, object_base: u32) -> Self {
+        Self {
+            view_proj: view_proj.to_cols_array_2d(),
+            material_index,
+            object_base,
+        }
+    }
 }
 
 /// Per-object transforms, indexed by [`PushConstants::object_index`] from a
@@ -86,21 +99,52 @@ pub(super) struct GpuObject {
 /// Where `forward.frag` declares the cascade comparison sampler. It is bound
 /// immutably at pipeline-layout construction, so these have to match the shader
 /// by hand rather than being derived from it.
-const SHADOW_SET: usize = 3;
-const SHADOW_SAMPLER_BINDING: u32 = 2;
+///
+/// Shared with the refraction pass, which builds a layout of its own — the
+/// immutable sampler is part of the set layout, so a pipeline that patched it
+/// differently would no longer be set-compatible with this one and could not be
+/// handed the same five descriptor sets.
+pub(super) const SHADOW_SET: usize = 3;
+pub(super) const SHADOW_SAMPLER_BINDING: u32 = 2;
 
 /// Default texture indices, matching the order `VulkanRenderer::new` seeds them.
 const WHITE_TEXTURE: u32 = 0;
 const FLAT_NORMAL_TEXTURE: u32 = 1;
 
+/// Feature bits in [`GpuMaterial::flags`], mirrored by `shading.glsl`.
+///
+/// The whole point of the word: `push.material_index` is dynamically uniform, so
+/// a draw either takes a lobe's branch or does not, and the cost of a feature a
+/// material never asked for is one coherent test. Set from whether the block was
+/// actually authored rather than from a separate toggle, so a material cannot
+/// claim a lobe and supply nothing to it.
+pub(crate) mod material_flags {
+    pub const CLEARCOAT: u32 = 1 << 0;
+    pub const SHEEN: u32 = 1 << 1;
+    pub const ANISOTROPY: u32 = 1 << 2;
+    pub const TRANSMISSION: u32 = 1 << 3;
+}
+
 #[derive(vulkano::buffer::BufferContents, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct GpuMaterial {
+    /// `rgb` = albedo, `a` = opacity.
     base_color: [f32; 4],
     emissive: [f32; 4],
-    params: [f32; 4], // metallic, roughness, reflectance
+    params: [f32; 4], // metallic, roughness, reflectance, ior
     /// Indices into the set-2 texture array: [albedo, normal, metal-rough, emissive].
     tex_indices: [u32; 4],
+    clearcoat: [f32; 4],    // strength, roughness
+    sheen: [f32; 4],        // rgb = colour, a = roughness
+    anisotropy: [f32; 4],   // strength, cos(rotation), sin(rotation)
+    transmission: [f32; 4], // transmission, thickness, attenuation distance
+    /// `rgb` = what the volume absorbs over `transmission[2]`.
+    attenuation: [f32; 4],
+    /// [clearcoat, clearcoat normal, sheen, anisotropy].
+    tex_indices_ext: [u32; 4],
+    /// [transmission, feature flags, -, -]. The flags ride here rather than in a
+    /// float field so the shader can test them without `floatBitsToUint`.
+    tex_flags: [u32; 4],
 }
 
 /// Pack the engine's [`SceneLighting`] into the std140 layout the shader expects.
@@ -371,6 +415,37 @@ impl GpuShadowFace {
     };
 }
 
+/// This frame's per-object rows, and where each list's block begins in them.
+///
+/// One buffer for every geometry pass in the frame, which is what
+/// `object_transforms` says in the graph. The opaque camera list indexes from
+/// zero and needs no base.
+pub(super) struct ObjectRows {
+    pub buffer: Subbuffer<[GpuObject]>,
+    /// Where the blended items' rows start.
+    pub transparent_base: u32,
+    /// Where the refractive items' rows start.
+    pub refractive_base: u32,
+    pub cascade_bases: [u32; MAX_CASCADES],
+    pub punctual_bases: [u32; MAX_SHADOW_LIGHTS],
+}
+
+/// The five descriptor sets a pass shading into the lit frame binds, in bind
+/// order.
+///
+/// Both such passes bind the same five — the transparency pass draws through
+/// this pass's own pipeline layout, so it can and must. Bundling them is what
+/// keeps that from being a comment somebody has to keep true.
+pub(super) struct ForwardSets {
+    sets: Vec<Arc<DescriptorSet>>,
+}
+
+impl ForwardSets {
+    pub(super) fn as_vec(&self) -> Vec<Arc<DescriptorSet>> {
+        self.sets.clone()
+    }
+}
+
 pub struct ForwardPass {
     pub render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
@@ -493,6 +568,13 @@ impl ForwardPass {
         }
     }
 
+    /// The layout the transparency pass builds its own pipeline with. Shared
+    /// rather than derived a second time, so the two pipelines cannot disagree
+    /// about a binding — see `oit.rs`.
+    pub(super) fn pipeline_layout(&self) -> &Arc<PipelineLayout> {
+        self.pipeline.layout()
+    }
+
     /// The set-4 per-object descriptor set for this frame's object buffer.
     ///
     /// Built once per frame by the executor rather than once per pass: the
@@ -562,22 +644,22 @@ impl ForwardPass {
     /// One row per item, including items whose mesh is missing, so a run's
     /// object rows stay contiguous and a run's base is just its start.
     ///
-    /// `items` goes first so the forward and SSAO passes keep indexing from
-    /// zero; each cascade's casters follow, then each punctual light's, and the
-    /// returned bases say where. One buffer rather than one per list is what
-    /// keeps `object_transforms` a single resource in the graph rather than a
-    /// convenient fiction.
+    /// The opaque `visible` items go first so the forward and prepass passes
+    /// keep indexing from zero; the blended ones follow, then each cascade's
+    /// casters, then each punctual light's, and the returned bases say where.
+    /// One buffer rather than one per list is what keeps `object_transforms` a
+    /// single resource in the graph rather than a convenient fiction.
     pub(super) fn upload_objects(
         &self,
         visible: DrawList<'_>,
+        transparent: DrawList<'_>,
+        refractive: DrawList<'_>,
         casters: &[DrawList<'_>],
         punctual: &[DrawList<'_>],
-    ) -> (
-        Subbuffer<[GpuObject]>,
-        [u32; MAX_CASCADES],
-        [u32; MAX_SHADOW_LIGHTS],
-    ) {
+    ) -> ObjectRows {
         let total: usize = visible.len()
+            + transparent.len()
+            + refractive.len()
             + casters.iter().map(DrawList::len).sum::<usize>()
             + punctual.iter().map(DrawList::len).sum::<usize>();
         // allocate_slice rejects length 0; an empty scene still needs a bindable
@@ -587,7 +669,9 @@ impl ForwardPass {
             .allocate_slice::<GpuObject>(total.max(1) as u64)
             .unwrap();
 
-        let mut bases = [0u32; MAX_CASCADES];
+        let transparent_base;
+        let refractive_base;
+        let mut cascade_bases = [0u32; MAX_CASCADES];
         let mut punctual_bases = [0u32; MAX_SHADOW_LIGHTS];
         {
             let mut rows = buffer.write().unwrap();
@@ -604,7 +688,11 @@ impl ForwardPass {
                 }
             };
             write(&visible, &mut next);
-            for (base, list) in bases.iter_mut().zip(casters) {
+            transparent_base = next as u32;
+            write(&transparent, &mut next);
+            refractive_base = next as u32;
+            write(&refractive, &mut next);
+            for (base, list) in cascade_bases.iter_mut().zip(casters) {
                 *base = next as u32;
                 write(list, &mut next);
             }
@@ -613,17 +701,28 @@ impl ForwardPass {
                 write(list, &mut next);
             }
         }
-        (buffer, bases, punctual_bases)
+        ObjectRows {
+            buffer,
+            transparent_base,
+            refractive_base,
+            cascade_bases,
+            punctual_bases,
+        }
     }
 
-    pub fn draw(
+    /// Build the five descriptor sets both passes into the lit frame bind, and
+    /// upload the per-frame blocks two of them point at.
+    ///
+    /// Once per frame rather than once per pass, and *before* the executor walks
+    /// the schedule rather than inside the forward pass's body: the transparency
+    /// pass binds the same five, and where the compiler chose to put it relative
+    /// to this one is not something either pass may depend on.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn begin_frame(
         &self,
-        builder: &mut AutoCommandBufferBuilder<vulkano::command_buffer::PrimaryAutoCommandBuffer>,
         renderer: &VulkanRenderer,
-        draws: DrawList<'_>,
         lighting: &SceneLighting,
         camera: &Camera,
-        view: &FrameView,
         extent: [u32; 2],
         ao_view: Arc<ImageView>,
         contact_shadow_view: Arc<ImageView>,
@@ -635,11 +734,7 @@ impl ForwardPass {
         texture_set: Arc<DescriptorSet>,
         object_set: Arc<DescriptorSet>,
         environment: &EnvironmentSettings,
-    ) {
-        // The jittered one, from the frame's shared view: every pass that
-        // rasterises geometry has to agree on it to a subpixel.
-        let view_proj = view.view_proj;
-
+    ) -> ForwardSets {
         let lighting_buffer = self
             .uniform_buffer_allocator
             .allocate_sized::<GpuLighting>()
@@ -719,6 +814,26 @@ impl ForwardPass {
         )
         .unwrap();
 
+        ForwardSets {
+            sets: vec![lighting_set, material_set, texture_set, ao_set, object_set],
+        }
+    }
+
+    /// Draw the opaque geometry. `sets` is what
+    /// [`begin_frame`](Self::begin_frame) built.
+    pub(super) fn draw(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<vulkano::command_buffer::PrimaryAutoCommandBuffer>,
+        renderer: &VulkanRenderer,
+        draws: DrawList<'_>,
+        view: &FrameView,
+        extent: [u32; 2],
+        sets: &ForwardSets,
+    ) {
+        // The jittered one, from the frame's shared view: every pass that
+        // rasterises geometry has to agree on it to a subpixel.
+        let view_proj = view.view_proj;
+
         builder
             .set_viewport(
                 0,
@@ -737,7 +852,7 @@ impl ForwardPass {
                 PipelineBindPoint::Graphics,
                 self.pipeline.layout().clone(),
                 0,
-                vec![lighting_set, material_set, texture_set, ao_set, object_set],
+                sets.as_vec(),
             )
             .unwrap();
 
@@ -749,11 +864,7 @@ impl ForwardPass {
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
-            let push = PushConstants {
-                view_proj: view_proj.to_cols_array_2d(),
-                material_index: item.material.0,
-                object_base: run.start as u32,
-            };
+            let push = PushConstants::new(view_proj, item.material.0, run.start as u32);
 
             builder
                 .push_constants(self.pipeline.layout().clone(), 0, push)
@@ -840,26 +951,118 @@ pub fn upload_mesh(
 }
 
 pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
+    // Derived from what was authored, never from a separate switch: a lobe is on
+    // exactly when it would change a pixel. `clearcoat_texture` alone turns the
+    // coat on because a map that modulates a zero would otherwise be silently
+    // dead, and `transmission` only counts on the queue that owns a pass able to
+    // fetch what is behind the surface.
+    let mut flags = 0u32;
+    if m.clearcoat > 0.0 || m.clearcoat_texture.is_some() {
+        flags |= material_flags::CLEARCOAT;
+    }
+    if m.sheen_color != Vec3::ZERO || m.sheen_texture.is_some() {
+        flags |= material_flags::SHEEN;
+    }
+    if m.anisotropy != 0.0 || m.anisotropy_texture.is_some() {
+        flags |= material_flags::ANISOTROPY;
+    }
+    if m.blend == BlendMode::Transmissive
+        && (m.transmission > 0.0 || m.transmission_texture.is_some())
+    {
+        flags |= material_flags::TRANSMISSION;
+    }
+
+    // Beer-Lambert wants an extinction coefficient per unit distance, and an
+    // infinite attenuation distance is the "absorbs nothing" case the shader
+    // would otherwise reach by dividing by infinity. Zero is that same case
+    // expressed as a coefficient, so both collapse to one path there.
+    let attenuation_distance = if m.attenuation_distance.is_finite() {
+        m.attenuation_distance.max(0.0)
+    } else {
+        0.0
+    };
+
     // Missing maps fall back to the default textures, which make the sample a
     // no-op (white = ×1, flat normal = unchanged geometric normal).
     GpuMaterial {
-        base_color: [m.base_color.x, m.base_color.y, m.base_color.z, 1.0],
+        // Opacity rides in `w` because that is where a base colour's alpha
+        // belongs and because it costs nothing: the field was already a `vec4`
+        // for std430's sake. The opaque pipeline ignores it.
+        base_color: [
+            m.base_color.x,
+            m.base_color.y,
+            m.base_color.z,
+            m.alpha.clamp(0.0, 1.0),
+        ],
         emissive: [m.emissive.x, m.emissive.y, m.emissive.z, 0.0],
-        params: [m.metallic, m.roughness, m.reflectance, 0.0],
+        params: [m.metallic, m.roughness, m.reflectance, m.ior.max(1.0)],
         tex_indices: [
             m.albedo_texture.map_or(WHITE_TEXTURE, |h| h.0),
             m.normal_texture.map_or(FLAT_NORMAL_TEXTURE, |h| h.0),
             m.metallic_roughness_texture.map_or(WHITE_TEXTURE, |h| h.0),
             m.emissive_texture.map_or(WHITE_TEXTURE, |h| h.0),
         ],
+        clearcoat: [m.clearcoat, m.clearcoat_roughness, 0.0, 0.0],
+        sheen: [
+            m.sheen_color.x,
+            m.sheen_color.y,
+            m.sheen_color.z,
+            m.sheen_roughness,
+        ],
+        // The rotation resolves to its sine and cosine here rather than in the
+        // shader: it is per material, not per fragment, and a transcendental per
+        // pixel to rotate a constant frame is the kind of cost that never shows
+        // up in a profile as itself.
+        anisotropy: [
+            m.anisotropy.clamp(-1.0, 1.0),
+            m.anisotropy_rotation.cos(),
+            m.anisotropy_rotation.sin(),
+            0.0,
+        ],
+        transmission: [
+            m.transmission.clamp(0.0, 1.0),
+            m.thickness.max(0.0),
+            attenuation_distance,
+            0.0,
+        ],
+        attenuation: [
+            m.attenuation_color.x,
+            m.attenuation_color.y,
+            m.attenuation_color.z,
+            0.0,
+        ],
+        tex_indices_ext: [
+            m.clearcoat_texture.map_or(WHITE_TEXTURE, |h| h.0),
+            m.clearcoat_normal_texture
+                .map_or(FLAT_NORMAL_TEXTURE, |h| h.0),
+            m.sheen_texture.map_or(WHITE_TEXTURE, |h| h.0),
+            // The direction half of this map is signed and decoded as
+            // `rg * 2 - 1`, so the neutral fill is the flat normal's (0.5, 0.5)
+            // rather than white — which would read as a 45-degree rotation.
+            m.anisotropy_texture.map_or(FLAT_NORMAL_TEXTURE, |h| h.0),
+        ],
+        tex_flags: [
+            m.transmission_texture.map_or(WHITE_TEXTURE, |h| h.0),
+            flags,
+            0,
+            0,
+        ],
     }
 }
 
-fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
-    let vs = vs::load(device.clone())
+/// The vertex shader both passes into the lit frame rasterise with. A blended
+/// surface is the same geometry read from the same per-object rows, and
+/// `shading.glsl` reads the same varyings out of it whichever fragment shader
+/// includes it.
+pub(super) fn vertex_shader(device: &Arc<Device>) -> vulkano::shader::EntryPoint {
+    vs::load(device.clone())
         .unwrap()
         .entry_point("main")
-        .unwrap();
+        .unwrap()
+}
+
+fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+    let vs = vertex_shader(device);
     let fs = fs::load(device.clone())
         .unwrap()
         .entry_point("main")

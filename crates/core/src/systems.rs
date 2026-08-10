@@ -6,11 +6,12 @@ use crate::geom::Aabb;
 use crate::gfx::punctual::{MAX_SHADOW_LIGHTS, ShadowAtlas};
 use crate::gfx::shadows::{Cascade, CascadeSet, MAX_CASCADES};
 use crate::gfx::{
-    DrawList, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, PointLight, RenderItem, SceneLighting, SpotLight,
+    BlendMode, DrawList, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, PointLight, RenderItem, SceneLighting,
+    SpotLight,
 };
 use crate::scene::{
-    AmbientLight, Camera, Culling, FogSettings, Light, LocalTransform, MaterialHandle, MeshBounds,
-    MeshHandle, Spin, WorldTransform,
+    AmbientLight, Camera, Culling, FogSettings, Light, LocalTransform, MaterialBlends,
+    MaterialHandle, MeshBounds, MeshHandle, Spin, WorldTransform,
 };
 
 pub fn spin(world: &World, dt: f32) {
@@ -31,8 +32,17 @@ pub struct FrameGeometry {
     /// Every renderable in the world, with its model, bounds and
     /// inverse-transpose derived exactly once this frame.
     items: Vec<RenderItem>,
-    /// What the camera frustum kept, in draw order.
+    /// What the camera frustum kept and shades opaquely, in draw order.
     visible: Vec<u32>,
+    /// What the camera frustum kept and blends. Kept apart rather than tagged,
+    /// because every consumer wants one or the other whole: the prepass and the
+    /// forward pass draw the first, the accumulation pass draws the second, and
+    /// a run in either is still one instanced draw.
+    transparent: Vec<u32>,
+    /// What the camera frustum kept and refracts. A third list rather than a
+    /// share of the second because the two disagree about order: the blended
+    /// list must not be sorted and this one must be.
+    refractive: Vec<u32>,
     /// What casts into each active cascade, in draw order.
     cascades: [Vec<u32>; MAX_CASCADES],
     /// What casts for each punctual light that got atlas tiles, indexed like
@@ -92,6 +102,22 @@ impl FrameGeometry {
         DrawList::new(&self.items, &self.visible)
     }
 
+    /// What the weighted-blended pass accumulates. Empty when nothing on screen
+    /// uses a [`BlendMode::Blend`](crate::gfx::BlendMode::Blend) material, which
+    /// is the frame where that pass clears its two targets and draws nothing.
+    pub fn transparent(&self) -> DrawList<'_> {
+        DrawList::new(&self.items, &self.transparent)
+    }
+
+    /// What the refraction pass draws, ordered back to front. Empty when nothing
+    /// on screen uses a
+    /// [`BlendMode::Transmissive`](crate::gfx::BlendMode::Transmissive)
+    /// material, which is the frame where that pass clears its target and draws
+    /// nothing.
+    pub fn refractive(&self) -> DrawList<'_> {
+        DrawList::new(&self.items, &self.refractive)
+    }
+
     /// What cascade `index` draws. Empty for a cascade the last extraction did
     /// not fill, which is what shadows-off produces.
     pub fn cascade(&self, index: usize) -> DrawList<'_> {
@@ -131,6 +157,8 @@ pub fn extract_geometry(
 ) {
     out.items.clear();
     out.visible.clear();
+    out.transparent.clear();
+    out.refractive.clear();
     for list in out.cascades.iter_mut() {
         list.clear();
     }
@@ -145,6 +173,7 @@ pub fn extract_geometry(
     let camera = world.get_resource::<Camera>();
     let frustum = camera.as_ref().map(|c| c.frustum(aspect));
     let bounds = world.get_resource::<MeshBounds>();
+    let blends = world.get_resource::<MaterialBlends>();
     let active = &cascades.cascades[..cascades.count];
     // Truncated rather than asserted: the atlas cannot produce more than
     // `MAX_SHADOW_LIGHTS` casters, and a slice keeps that from being something
@@ -166,23 +195,37 @@ pub fn extract_geometry(
                 .unwrap_or(Aabb::EMPTY)
                 .transformed(&model);
 
+            let material = material.copied().unwrap_or(MaterialHandle(0));
+            // A blended or refractive surface leaves no depth for anything to
+            // test against, and a shadow map is nothing but depth — so it casts
+            // none. Which also keeps a pane of glass out of the caster lists
+            // entirely, and out of the prepass through `visible` below: nothing
+            // screen-space may treat it as a surface.
+            let mode = blends
+                .as_ref()
+                .map_or(BlendMode::Opaque, |table| table.get(material));
+            let blended = !mode.is_opaque();
+
             let visible = !cull
                 || frustum
                     .as_ref()
                     .is_none_or(|frustum| frustum.intersects(&world_bounds));
             let casts: [bool; MAX_CASCADES] = std::array::from_fn(|i| {
-                active
-                    .get(i)
-                    .is_some_and(|cascade| casts_into(&world_bounds, cascade))
+                !blended
+                    && active
+                        .get(i)
+                        .is_some_and(|cascade| casts_into(&world_bounds, cascade))
             });
             // A punctual light reaches a sphere, so anything outside it cannot
             // shadow anything it lights. Distance to the *box* rather than to
             // its centre, or a long wall through a light's volume would be
             // culled out of the shadow it plainly casts.
             let lights: [bool; MAX_SHADOW_LIGHTS] = std::array::from_fn(|i| {
-                punctual.get(i).is_some_and(|caster| {
-                    world_bounds.distance_squared_to(caster.center) <= caster.radius * caster.radius
-                })
+                !blended
+                    && punctual.get(i).is_some_and(|caster| {
+                        world_bounds.distance_squared_to(caster.center)
+                            <= caster.radius * caster.radius
+                    })
             });
 
             // An object no list wants still costs the sweep, but it must not
@@ -199,11 +242,15 @@ pub fn extract_geometry(
                 normal_matrix: normal_matrix(&model),
                 bounds: world_bounds,
                 mesh: *mesh,
-                material: material.copied().unwrap_or(MaterialHandle(0)),
+                material,
             });
 
             if visible {
-                out.visible.push(index);
+                match mode {
+                    BlendMode::Opaque => out.visible.push(index),
+                    BlendMode::Blend => out.transparent.push(index),
+                    BlendMode::Transmissive => out.refractive.push(index),
+                }
             }
             for (list, casts) in out.cascades.iter_mut().zip(casts) {
                 if casts {
@@ -225,6 +272,12 @@ pub fn extract_geometry(
         (item.mesh.0, item.material.0)
     };
     out.visible.sort_unstable_by_key(|i| key(&out.items, i));
+    // Grouped, and then deliberately left alone. Weighted-blended
+    // transparency's whole claim is that the composite is commutative, so this
+    // list has no back-to-front pass to go with it — and the popping a sort
+    // produces when two surfaces cross is exactly what its absence buys.
+    out.transparent.sort_unstable_by_key(|i| key(&out.items, i));
+    out.refractive.sort_unstable_by_key(|i| key(&out.items, i));
     for list in out.cascades.iter_mut() {
         list.sort_unstable_by_key(|i| key(&out.items, i));
     }
@@ -239,12 +292,22 @@ pub fn extract_geometry(
     // still one instanced draw.
     if let Some(camera) = camera.as_ref() {
         order_runs_front_to_back(&out.items, &mut out.visible, camera.position);
+        // The opposite order, and for the opposite reason. Front to back above
+        // is an optimisation over geometry the depth test already resolves; back
+        // to front here is *correctness*, because a refractive surface samples
+        // the frame behind it and the near one has to find the far one already
+        // composited there.
+        order_runs_front_to_back(&out.items, &mut out.refractive, camera.position);
+        out.refractive.reverse();
     }
 
     out.motion.end();
 
     if let Some(mut culling) = world.get_resource_mut::<Culling>() {
-        culling.record(out.visible.len(), total);
+        culling.record(
+            out.visible.len() + out.transparent.len() + out.refractive.len(),
+            total,
+        );
     }
 }
 

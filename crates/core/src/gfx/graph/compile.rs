@@ -446,7 +446,19 @@ fn step(
             && state.visible_access.contains(access.flags());
         (transition || (state.has_write && !already_visible)).then(|| Barrier {
             resource,
-            src_stages: nonempty(state.write_stages),
+            // A layout transition rewrites the image, so a reader that moves one
+            // out from under an earlier reader has to wait for that reader as
+            // well as for the last write — a write-after-read on the transition
+            // itself. Only the *stages* need widening: a read dirties nothing,
+            // so there is nothing of it to make available, which is why
+            // `src_access` stays the write's alone. The frame's closing
+            // barriers already source themselves this way; this is the same
+            // rule inside it.
+            //
+            // Unreachable until a resource was read in two different layouts.
+            // The prepass depth is the first: five passes sample it and the
+            // transparency accumulation attaches it read-only between them.
+            src_stages: nonempty(state.write_stages | state.read_stages),
             src_access: state.write_access,
             dst_stages: access.stages(),
             dst_access: access.flags(),

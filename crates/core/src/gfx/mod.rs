@@ -10,8 +10,8 @@ pub use headless::HeadlessBackend;
 use crate::geom::Aabb;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
-    HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, SsaoSettings, SsrSettings,
-    TaaSettings,
+    HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, RefractionSettings, SsaoSettings,
+    SsrSettings, TaaSettings, TransparencySettings,
 };
 use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
@@ -213,9 +213,64 @@ pub struct SceneLighting {
     pub fog_height: f32,
 }
 
+/// Which queue a material draws in.
+///
+/// A property of the material rather than of the entity, as it is in glTF and in
+/// every engine that reads glTF: opacity is authored with the base colour and
+/// the maps, so it belongs with them. Extraction reads it through
+/// [`MaterialBlends`](crate::scene::MaterialBlends) to split the frame's draw
+/// order in two.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum BlendMode {
+    /// Depth-tested, depth-writing, and shaded straight into the frame's colour.
+    /// [`Material::alpha`] is ignored.
+    #[default]
+    Opaque,
+    /// Accumulated by the weighted-blended pass instead: depth-tested against
+    /// the opaque scene but writing no depth, and composited afterwards. Never
+    /// written into the geometry prepass, so nothing screen-space — occlusion,
+    /// reflections, defocus, the shutter — treats it as a surface.
+    Blend,
+    /// Refracted rather than blended: drawn by its own pass, which samples the
+    /// already-composited frame through the surface instead of mixing with what
+    /// the framebuffer happens to hold.
+    ///
+    /// A queue of its own rather than a flag on [`Blend`](BlendMode::Blend)
+    /// because the two disagree about ordering. Weighted-blended transparency is
+    /// commutative and must not be sorted; a surface that *fetches* its own
+    /// background has to be drawn back to front, since the second one to sample
+    /// the same pixel would otherwise double-count what is behind it. Kept out
+    /// of the prepass and the caster lists exactly as `Blend` is.
+    Transmissive,
+}
+
+impl BlendMode {
+    /// Whether this mode leaves the opaque queue — out of the prepass, out of
+    /// every caster list, and therefore invisible to everything screen-space.
+    ///
+    /// One predicate rather than two comparisons at each site, so adding a third
+    /// non-opaque mode cannot half-land: extraction, `MaterialBlends` and the
+    /// demo scene all ask this question and none of them cares *which* non-opaque
+    /// queue the material ends up in.
+    pub fn is_opaque(self) -> bool {
+        matches!(self, BlendMode::Opaque)
+    }
+}
+
+/// Named for the glTF extensions each block mirrors — `KHR_materials_clearcoat`,
+/// `_sheen`, `_anisotropy`, `_transmission` and `_volume` — so a loader has one
+/// obvious place to put what it read and no translation table to get wrong.
+///
+/// Every block is inert at its default: the shader gates each lobe on a flag
+/// derived from whether the block was actually set, so a plain metallic-roughness
+/// material costs exactly what it did before any of this existed.
 #[derive(Copy, Clone, Debug)]
 pub struct Material {
     pub base_color: Vec3,
+    /// Opacity, multiplied by the albedo map's alpha. Only read for
+    /// [`BlendMode::Blend`].
+    pub alpha: f32,
+    pub blend: BlendMode,
     pub metallic: f32,
     pub roughness: f32,
     pub reflectance: f32,
@@ -224,12 +279,68 @@ pub struct Material {
     pub normal_texture: Option<TextureHandle>,
     pub metallic_roughness_texture: Option<TextureHandle>,
     pub emissive_texture: Option<TextureHandle>,
+
+    /// Strength of the second specular lobe, `0` for none. The coat is a thin
+    /// dielectric film over everything else: it adds its own reflection and
+    /// attenuates the layers beneath by what it reflected away.
+    pub clearcoat: f32,
+    /// Perceptual roughness of that lobe, independent of the base's — a scuffed
+    /// coat over polished metal is the whole reason the two are separate.
+    pub clearcoat_roughness: f32,
+    /// `r` = strength, `g` = roughness, multiplying the two scalars above.
+    pub clearcoat_texture: Option<TextureHandle>,
+    /// Tangent-space normals for the coat alone. Absent, the coat uses the
+    /// *geometric* normal rather than the base layer's normal-mapped one, which
+    /// is glTF's rule and the physical one: an orange-peel coat and the grain
+    /// under it are different surfaces.
+    pub clearcoat_normal_texture: Option<TextureHandle>,
+
+    /// Retroreflective rim lobe for cloth. Black for none; this is a colour
+    /// rather than a scalar because velvet and satin owe their look to a sheen
+    /// tinted away from the base.
+    pub sheen_color: Vec3,
+    /// Width of that lobe. Low is a tight satin edge, high a broad velvet bloom.
+    pub sheen_roughness: f32,
+    /// `rgb` = colour, `a` = roughness, multiplying the two above.
+    pub sheen_texture: Option<TextureHandle>,
+
+    /// How far the specular highlight is stretched, in `[-1, 1]`. Positive
+    /// stretches along the tangent (brushed metal, hair), negative across it;
+    /// `0` is the isotropic GGX everything else uses.
+    pub anisotropy: f32,
+    /// Rotation of the stretch within the tangent plane, in radians. What lets a
+    /// brushed disc have circular grain under a UV set that does not.
+    pub anisotropy_rotation: f32,
+    /// `rg` = direction as a signed tangent-space vector, `b` = strength.
+    pub anisotropy_texture: Option<TextureHandle>,
+
+    /// How much light passes *through* rather than being diffusely reflected.
+    /// Non-zero only means anything for [`BlendMode::Transmissive`], which is
+    /// the queue that owns the pass able to fetch what is behind the surface.
+    pub transmission: f32,
+    /// Index of refraction, `1.5` for glass. Drives both the Fresnel term and
+    /// how far the refraction pass bends its lookup.
+    pub ior: f32,
+    /// Thickness of the volume behind the surface, in local units. Zero makes it
+    /// a *thin* surface — a window pane, refracting but with no interior to
+    /// travel through — which is why it is the default.
+    pub thickness: f32,
+    /// What the volume absorbs, Beer-Lambert, over `attenuation_distance`. White
+    /// is a clear medium.
+    pub attenuation_color: Vec3,
+    /// The distance at which `attenuation_color` is reached. Infinite for a
+    /// medium that never absorbs.
+    pub attenuation_distance: f32,
+    /// `r` = transmission, `g` = thickness, multiplying the two above.
+    pub transmission_texture: Option<TextureHandle>,
 }
 
 impl Default for Material {
     fn default() -> Self {
         Self {
             base_color: Vec3::splat(0.8),
+            alpha: 1.0,
+            blend: BlendMode::Opaque,
             metallic: 0.0,
             roughness: 0.5,
             reflectance: 0.5,
@@ -238,6 +349,30 @@ impl Default for Material {
             normal_texture: None,
             metallic_roughness_texture: None,
             emissive_texture: None,
+
+            clearcoat: 0.0,
+            // Only read when `clearcoat` is non-zero, so this is what a coat
+            // looks like the moment one is switched on rather than a value that
+            // does nothing: a mirror-smooth film, which is what a coat is unless
+            // it was authored otherwise.
+            clearcoat_roughness: 0.03,
+            clearcoat_texture: None,
+            clearcoat_normal_texture: None,
+
+            sheen_color: Vec3::ZERO,
+            sheen_roughness: 0.3,
+            sheen_texture: None,
+
+            anisotropy: 0.0,
+            anisotropy_rotation: 0.0,
+            anisotropy_texture: None,
+
+            transmission: 0.0,
+            ior: 1.5,
+            thickness: 0.0,
+            attenuation_color: Vec3::ONE,
+            attenuation_distance: f32::INFINITY,
+            transmission_texture: None,
         }
     }
 }
@@ -289,11 +424,19 @@ pub trait RenderBackend {
     fn render(
         &mut self,
         draws: DrawList<'_>,
+        // What the weighted-blended transparency pass accumulates, grouped by
+        // (mesh, material) and deliberately not ordered by depth.
+        transparent: DrawList<'_>,
+        // What the refraction pass draws, grouped the same way and then ordered
+        // back to front — which the list above must not be, and this one must.
+        refractive: DrawList<'_>,
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
         contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
+        transparency: &TransparencySettings,
+        refraction: &RefractionSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
         dof: &DofSettings,

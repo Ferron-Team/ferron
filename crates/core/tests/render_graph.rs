@@ -50,6 +50,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: true,
                 auto_exposure: true,
                 motion_blur: false,
@@ -74,6 +76,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: false,
@@ -97,6 +101,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: false,
@@ -118,6 +124,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: true,
                 auto_exposure: true,
                 motion_blur: false,
@@ -141,6 +149,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: false,
                 auto_exposure: false,
                 motion_blur: false,
@@ -163,6 +173,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: false,
@@ -186,6 +198,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: true,
                 auto_exposure: true,
                 motion_blur: true,
@@ -209,6 +223,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: true,
@@ -232,6 +248,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: true,
+                transparency: false,
+                refraction: false,
                 taa: true,
                 auto_exposure: true,
                 motion_blur: false,
@@ -253,6 +271,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: true,
+                transparency: false,
+                refraction: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: false,
@@ -276,6 +296,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: true,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: true,
                 auto_exposure: true,
                 motion_blur: false,
@@ -297,6 +319,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: true,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: false,
                 auto_exposure: false,
                 motion_blur: false,
@@ -319,6 +343,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: true,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: true,
                 auto_exposure: true,
                 motion_blur: false,
@@ -341,6 +367,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: false,
@@ -352,6 +380,104 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 2048,
             },
         ),
+        // What ships: transparency accumulates after the reflections and before
+        // the temporal resolve, and it attaches the prepass depth read-only
+        // while five other passes sample the same image. Depth ping-ponging
+        // between `DepthStencilReadOnlyOptimal` and `ShaderReadOnlyOptimal` is
+        // the visible cost of that, and it belongs in the baseline so that
+        // narrowing it later is a diff rather than a claim.
+        (
+            "editor frame, transparency",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                contact_shadows: true,
+                ssr: true,
+                transparency: true,
+                refraction: false,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: true,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 4,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
+        // And transparency on its own, which is the shape that proves it keeps
+        // the geometry prepass in the frame by itself: nothing else here wants
+        // depth, normals or motion, and the prepass still runs — because the
+        // accumulation has nothing else to depth-test against.
+        (
+            "editor frame, transparency alone",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: false,
+                contact_shadows: false,
+                ssr: false,
+                transparency: true,
+                refraction: false,
+                taa: false,
+                auto_exposure: false,
+                motion_blur: false,
+                dof: false,
+                bloom_mips: 0,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
+        // Both non-opaque queues at once, which is the shape that pins the
+        // order between them: the refraction pass reads the frame the
+        // transparency composite produced, so a change that moved it ahead of
+        // that composite would show up here as glass refracting a frame with no
+        // blended geometry in it.
+        (
+            "editor frame, transparency and refraction",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                contact_shadows: true,
+                ssr: true,
+                transparency: true,
+                refraction: true,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: true,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 4,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
+        // And refraction on its own, which proves it keeps the geometry prepass
+        // in the frame by itself for the same reason transparency does: the draw
+        // has nothing else to depth-test against.
+        (
+            "editor frame, refraction alone",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: false,
+                contact_shadows: false,
+                ssr: false,
+                transparency: false,
+                refraction: true,
+                taa: false,
+                auto_exposure: false,
+                motion_blur: false,
+                dof: false,
+                bloom_mips: 0,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
         (
             "headless frame, no overlay",
             FrameConfig {
@@ -359,6 +485,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                transparency: false,
+                refraction: false,
                 taa: false,
                 auto_exposure: true,
                 motion_blur: false,
@@ -458,6 +586,8 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             ssao: true,
             contact_shadows: false,
             ssr: false,
+            transparency: false,
+            refraction: false,
             taa: false,
             auto_exposure: true,
             motion_blur: false,
@@ -500,6 +630,8 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         ssao: true,
         contact_shadows: false,
         ssr: false,
+        transparency: false,
+        refraction: false,
         taa: true,
         auto_exposure: true,
         motion_blur: false,
@@ -533,6 +665,207 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
     assert!(closing.is_empty(), "{closing:?}");
 }
 
+/// Transparency's two nodes have to land between the reflections and the
+/// temporal resolve, and neither half is a preference.
+///
+/// After the reflections, because the prepass records only opaque surfaces: a
+/// ray traces the depth and normals of the world *behind* the glass, so
+/// compositing first would put the glass into a source the trace then reflects
+/// as though it were a wall. Before the resolve, because the accumulation
+/// rasterises with the frame's jitter like everything else, and a subpixel
+/// offset nothing averages is a shimmer rather than an antialiased edge.
+///
+/// `compile` knows none of that — the placement is a consequence of where
+/// `declare` rebinds `shaded`, so moving that block would silently reorder the
+/// frame. Asserted against the derived schedule for the reason the optical
+/// chain's order is.
+#[test]
+fn transparency_composites_after_the_reflections_and_before_the_resolve() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        ssao: true,
+        contact_shadows: false,
+        ssr: true,
+        transparency: true,
+        refraction: false,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+    })
+    .unwrap();
+
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&id| frame.graph.pass_name(id))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} is not in the frame: {order:?}"))
+    };
+
+    assert!(at("oit_accumulate") < at("oit_composite"), "{order:?}");
+    assert!(at("ssr_resolve") < at("oit_composite"), "{order:?}");
+    assert!(at("oit_composite") < at("taa_resolve"), "{order:?}");
+}
+
+/// The accumulation pass *attaches* the prepass depth rather than sampling it,
+/// and read-only at that. Both halves are load-bearing.
+///
+/// Attached, because a fixed-function depth test is what makes a transparent
+/// surface disappear behind a wall. Read-only, because the prepass must stay the
+/// image's only writer — declaring a writing depth attachment would put this
+/// pass ahead of every other reader of the same depth, and would fire the
+/// write-after-read assertion the schedule is built to make impossible.
+///
+/// It also has to stay a depth *attachment* and not become a second sampled
+/// read: `oit.rs` builds its render pass by hand precisely so the attachment
+/// reference says `DepthStencilReadOnlyOptimal`, and that hand-written render
+/// pass is only correct while this declaration is what it says it is.
+#[test]
+fn transparency_attaches_the_prepass_depth_read_only() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        ssao: false,
+        contact_shadows: false,
+        ssr: false,
+        transparency: true,
+        refraction: false,
+        taa: false,
+        auto_exposure: false,
+        motion_blur: false,
+        dof: false,
+        bloom_mips: 0,
+        overlay: true,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+    })
+    .unwrap();
+
+    let plan = format!("{}", frame.graph);
+    assert!(
+        plan.contains("prepass_depth DepthAttachmentRead"),
+        "the accumulation must attach the prepass depth read-only:\n{plan}",
+    );
+    // Nothing but the prepass may write it, and the plan says so by listing
+    // exactly one `DepthAttachment` line for it.
+    assert_eq!(
+        plan.matches("prepass_depth DepthAttachment\n").count(),
+        1,
+        "the geometry prepass must remain the only writer of the depth:\n{plan}",
+    );
+}
+
+/// Refraction's three nodes have to land after the transparency composite and
+/// before the temporal resolve, and both halves matter for the same reasons
+/// transparency's placement does — with one more on top.
+///
+/// After the transparency composite, because the pyramid a refractive surface
+/// samples its background out of is built from whatever `shaded` names at that
+/// point: build it earlier and glass would refract a frame with the blended
+/// geometry missing from it. Before the resolve, because the draw rasterises
+/// with the frame's jitter like every other geometry pass.
+///
+/// The order inside the block is not a preference either: the pyramid is the
+/// draw's input and the draw is the composite's, so a schedule that ran them in
+/// any other order would be reading a target nothing had written.
+#[test]
+fn refraction_composites_after_the_transparency_and_before_the_resolve() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        ssao: true,
+        contact_shadows: false,
+        ssr: true,
+        transparency: true,
+        refraction: true,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+    })
+    .unwrap();
+
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&id| frame.graph.pass_name(id))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} is not in the frame: {order:?}"))
+    };
+
+    assert!(at("oit_composite") < at("refraction_scene"), "{order:?}");
+    assert!(at("refraction_scene") < at("refraction_draw"), "{order:?}");
+    assert!(
+        at("refraction_draw") < at("refraction_composite"),
+        "{order:?}"
+    );
+    assert!(at("refraction_composite") < at("taa_resolve"), "{order:?}");
+}
+
+/// The refraction draw attaches the prepass depth read-only, exactly as the
+/// transparency accumulation does, and for the same two reasons: a
+/// fixed-function depth test is what puts a pane of glass behind a wall, and
+/// `refraction.rs` builds its render pass by hand precisely so the attachment
+/// reference says `DepthStencilReadOnlyOptimal`.
+///
+/// With both queues on, the prepass depth is now attached read-only by *two*
+/// passes and sampled by others — which is the case the widened write-after-read
+/// barrier in `step` exists for. The single-writer assertion below is what says
+/// neither of them started writing it.
+#[test]
+fn refraction_attaches_the_prepass_depth_read_only() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        ssao: false,
+        contact_shadows: false,
+        ssr: false,
+        transparency: true,
+        refraction: true,
+        taa: false,
+        auto_exposure: false,
+        motion_blur: false,
+        dof: false,
+        bloom_mips: 0,
+        overlay: true,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+    })
+    .unwrap();
+
+    let plan = format!("{}", frame.graph);
+    assert_eq!(
+        plan.matches("prepass_depth DepthAttachmentRead").count(),
+        2,
+        "both non-opaque queues must attach the prepass depth read-only:\n{plan}",
+    );
+    assert_eq!(
+        plan.matches("prepass_depth DepthAttachment\n").count(),
+        1,
+        "the geometry prepass must remain the only writer of the depth:\n{plan}",
+    );
+}
+
 /// Light meets a lens, then a shutter, then a sensor, and the frame has to run
 /// them in that order — it is what Unity and Unreal both settled on, and it is
 /// not arbitrary: defocus before the shutter means the streak smears an image
@@ -551,6 +884,8 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         ssao: true,
         contact_shadows: false,
         ssr: false,
+        transparency: false,
+        refraction: false,
         taa: true,
         auto_exposure: true,
         motion_blur: true,
@@ -613,6 +948,8 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         ssao: false,
         contact_shadows: false,
         ssr: false,
+        transparency: false,
+        refraction: false,
         taa: false,
         auto_exposure: true,
         motion_blur: false,
@@ -624,13 +961,15 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         shadow_atlas: 0,
     };
 
-    let consumers: [(&str, fn(&mut FrameConfig)); 6] = [
+    let consumers: [(&str, fn(&mut FrameConfig)); 8] = [
         ("ssao", |c| c.ssao = true),
         ("contact shadows", |c| c.contact_shadows = true),
         ("taa", |c| c.taa = true),
         ("motion blur", |c| c.motion_blur = true),
         ("depth of field", |c| c.dof = true),
         ("reflections", |c| c.ssr = true),
+        ("transparency", |c| c.transparency = true),
+        ("refraction", |c| c.refraction = true),
     ];
     for (label, enable) in consumers {
         let mut config = base;

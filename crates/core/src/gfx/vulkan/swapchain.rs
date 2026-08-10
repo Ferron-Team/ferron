@@ -3,7 +3,8 @@ use std::sync::Arc;
 use super::context::VkContext;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageUsage};
+use vulkano::image::{Image, ImageCreateInfo, ImageUsage};
+use vulkano::memory::allocator::AllocationCreateInfo;
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
 use vulkano::swapchain::{PresentMode, Surface, Swapchain, SwapchainCreateInfo};
 
@@ -17,8 +18,26 @@ pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
 /// Falls back to `Fifo` automatically if the surface doesn't support the choice.
 pub const PRESENT_MODE: PresentMode = PresentMode::Fifo;
 
+/// What the frame's last pass draws into: a real swapchain, or — offscreen — a
+/// single ordinary image nobody presents.
+///
+/// One type rather than two because everything between the tonemap pass and this
+/// point must not be able to tell the difference. An offscreen render exists to
+/// be *evidence* about the windowed one, and it stops being that the moment the
+/// two take different paths through the renderer. So `swapchain` is an option
+/// and the rest of the struct is shared: the frame acquires index 0 instead of
+/// waiting on a presentation engine, and skips the present at the end.
 pub struct SwapchainState {
-    pub swapchain: Arc<Swapchain>,
+    /// `None` offscreen. The only two places that branch on it are the acquire
+    /// and the present.
+    pub swapchain: Option<Arc<Swapchain>>,
+    /// The images behind `framebuffers`, kept so an offscreen render can copy
+    /// the finished frame back out. Empty for a windowed target, which has
+    /// nothing to read back.
+    pub readback: Vec<Arc<Image>>,
+    /// Carried rather than read off the swapchain, because offscreen there is no
+    /// swapchain to read it off.
+    pub format: Format,
     pub framebuffers: Vec<Arc<Framebuffer>>,
     /// One view per swapchain image, parallel to `framebuffers`. An overlay
     /// (e.g. the editor UI) draws onto these directly, after the tonemap pass
@@ -83,7 +102,47 @@ impl SwapchainState {
         let (framebuffers, image_views) = build_framebuffers(render_pass, &images);
 
         Self {
-            swapchain,
+            swapchain: Some(swapchain),
+            readback: Vec::new(),
+            format,
+            framebuffers,
+            image_views,
+            extent,
+        }
+    }
+
+    /// A single image the frame renders into and nobody presents.
+    ///
+    /// `TRANSFER_SRC` is the one usage a windowed target does not need: it is
+    /// what lets the finished frame be copied back to host memory and written
+    /// out as a PNG.
+    pub fn offscreen(
+        ctx: &VkContext,
+        render_pass: &Arc<RenderPass>,
+        format: Format,
+        extent: [u32; 2],
+    ) -> Self {
+        let image = Image::new(
+            ctx.memory_allocator.clone(),
+            ImageCreateInfo {
+                format,
+                extent: [extent[0], extent[1], 1],
+                usage: ImageUsage::COLOR_ATTACHMENT
+                    | ImageUsage::TRANSFER_DST
+                    | ImageUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .expect("failed to allocate the offscreen target");
+
+        let images = [image];
+        let (framebuffers, image_views) = build_framebuffers(render_pass, &images);
+
+        Self {
+            swapchain: None,
+            readback: images.to_vec(),
+            format,
             framebuffers,
             image_views,
             extent,
@@ -95,16 +154,20 @@ impl SwapchainState {
         if extent[0] == 0 || extent[1] == 0 {
             return false;
         }
+        // An offscreen target has a fixed extent decided by whoever asked for
+        // the render; nothing can resize it out from under the frame.
+        let Some(current) = self.swapchain.as_ref() else {
+            return false;
+        };
 
-        let (swapchain, images) = self
-            .swapchain
+        let (swapchain, images) = current
             .recreate(SwapchainCreateInfo {
                 image_extent: extent,
-                ..self.swapchain.create_info()
+                ..current.create_info()
             })
             .expect("failed to recreate swapchain");
 
-        self.swapchain = swapchain;
+        self.swapchain = Some(swapchain);
         let (framebuffers, image_views) = build_framebuffers(render_pass, &images);
         self.framebuffers = framebuffers;
         self.image_views = image_views;

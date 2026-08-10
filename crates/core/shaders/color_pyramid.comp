@@ -1,7 +1,7 @@
 #version 460
 
-// A mip pyramid of the lit frame, for the trace to sample a reflection *cone*
-// out of rather than a single texel.
+// A mip pyramid of the lit frame, for a *cone* to be sampled out of rather than
+// a single texel.
 //
 // This is what makes a rough reflection affordable. The lobe a ray was sampled
 // from has an angular width, so by the time the ray has travelled any distance
@@ -9,6 +9,14 @@
 // that patch is precisely the variance that shows up as grain on everything
 // that is not a mirror. Reading the level of this pyramid whose texel *is* the
 // patch costs the same fetch and carries the average instead of a sample.
+//
+// Two passes build one of these, from the same source and to the same shape and
+// both at half resolution: the reflection trace, whose rays are stochastic and
+// denoised temporally anyway, and screen-space refraction, whose consumers are
+// all rough enough to be averaging over a cone. The one thing that genuinely
+// wants the frame sharp — a clear pane of glass — reads the frame itself rather
+// than this chain, which is what lets this stay half. Neither pass owns this
+// file, which is why it is not named for either.
 //
 // The tile shape is `hiz_build.comp`'s exactly: one workgroup owns a 64x64 tile
 // and reduces it alone, because the render graph's unversioned resources forbid
@@ -54,32 +62,45 @@ void main() {
     ivec2 lid = ivec2(gl_LocalInvocationID.xy);
     ivec2 base = tile + lid * 8;
 
-    vec4 d[64];
-    for (int j = 0; j < 8; ++j) {
-        for (int i = 0; i < 8; ++i) {
-            vec4 v = load(base + ivec2(i, j));
-            d[j * 8 + i] = v;
-            STORE(0, base + ivec2(i, j), v)
-        }
-    }
-
-    vec4 m1[16];
-    for (int j = 0; j < 4; ++j) {
-        for (int i = 0; i < 4; ++i) {
-            vec4 v = mean4(d[(2 * j) * 8 + 2 * i], d[(2 * j) * 8 + 2 * i + 1],
-                           d[(2 * j + 1) * 8 + 2 * i], d[(2 * j + 1) * 8 + 2 * i + 1]);
-            m1[j * 4 + i] = v;
-            STORE(1, (base >> 1) + ivec2(i, j), v)
-        }
-    }
-
+    // Levels 0 to 3 stream through in 2x2 blocks rather than being gathered
+    // whole, and that shape is the difference between this pass costing what its
+    // memory traffic costs and costing several times more.
+    //
+    // The obvious version keeps the thread's entire 8x8 sub-tile live — 64
+    // `vec4`s, 256 32-bit registers — before reducing any of it. A GPU that
+    // allots a thread around 128 spills the rest to device memory and then
+    // reloads it, so a pass whose real work is one read and one write per texel
+    // does several of each, and occupancy collapses on top of that. Reducing
+    // each block the moment its four texels are in hand keeps at most a dozen
+    // `vec4`s live and never spills.
+    //
+    // The reduction tree is unchanged, so every level is bit-identical to the
+    // gathered version: `bi`/`bj` select the same 4x4 block the old `i`/`j` pair
+    // did, and each level's store lands on the same coordinate.
     vec4 m2[4];
-    for (int j = 0; j < 2; ++j) {
-        for (int i = 0; i < 2; ++i) {
-            vec4 v = mean4(m1[(2 * j) * 4 + 2 * i], m1[(2 * j) * 4 + 2 * i + 1],
-                           m1[(2 * j + 1) * 4 + 2 * i], m1[(2 * j + 1) * 4 + 2 * i + 1]);
-            m2[j * 2 + i] = v;
-            STORE(2, (base >> 2) + ivec2(i, j), v)
+    for (int bj = 0; bj < 2; ++bj) {
+        for (int bi = 0; bi < 2; ++bi) {
+            vec4 m1[4];
+            for (int j = 0; j < 2; ++j) {
+                for (int i = 0; i < 2; ++i) {
+                    ivec2 p = base + ivec2(bi * 4 + i * 2, bj * 4 + j * 2);
+                    vec4 a = load(p);
+                    vec4 b = load(p + ivec2(1, 0));
+                    vec4 c = load(p + ivec2(0, 1));
+                    vec4 d = load(p + ivec2(1, 1));
+                    STORE(0, p, a)
+                    STORE(0, p + ivec2(1, 0), b)
+                    STORE(0, p + ivec2(0, 1), c)
+                    STORE(0, p + ivec2(1, 1), d)
+
+                    vec4 v = mean4(a, b, c, d);
+                    STORE(1, p >> 1, v)
+                    m1[j * 2 + i] = v;
+                }
+            }
+            vec4 v = mean4(m1[0], m1[1], m1[2], m1[3]);
+            STORE(2, (base >> 2) + ivec2(bi, bj), v)
+            m2[bj * 2 + bi] = v;
         }
     }
 

@@ -12,6 +12,7 @@ mod fog;
 mod hdr;
 mod hierarchy;
 mod input;
+mod material;
 mod mesh;
 mod motion_blur;
 mod persist;
@@ -22,6 +23,7 @@ mod ssr;
 mod taa;
 mod time;
 mod transform;
+mod transparency;
 
 pub use assets::Assets;
 pub use bloom::BloomSettings;
@@ -44,6 +46,7 @@ pub use hierarchy::{
     parent_world_matrix, propagate_transforms, reparent,
 };
 pub use input::InputState;
+pub use material::MaterialBlends;
 pub use mesh::{CpuMesh, MeshBounds};
 pub use motion_blur::MotionBlurSettings;
 pub use persist::{LoadIssue, instantiate, load, save, to_document};
@@ -54,3 +57,4 @@ pub use ssr::SsrSettings;
 pub use taa::TaaSettings;
 pub use time::Time;
 pub use transform::Transform;
+pub use transparency::{RefractionSettings, TransparencySettings};

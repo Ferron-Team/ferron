@@ -19,11 +19,26 @@ layout(push_constant) uniform Push {
 
 // Mirrors GpuMaterial in forward.rs, field for field: the two passes read the
 // same buffer through their own layouts, so a change here is a change there.
+//
+// The trailing blocks are declared but unread, and both halves of that are
+// deliberate. Declared, because std430 derives the array stride from the struct
+// and a short mirror would step through the table at the wrong pitch — every
+// material past the first would be read out of the middle of its neighbour.
+// Unread, because this pass writes the *base* layer's f0 and roughness and
+// `ssr_resolve.comp` subtracts exactly that: the clear coat's own reflection
+// stays image-based, so nothing here has a second lobe to describe.
 struct GpuMaterial {
     vec4 base_color;
     vec4 emissive;
-    vec4 params;      // x = metallic, y = roughness, z = reflectance
+    vec4 params;      // x = metallic, y = roughness, z = reflectance, w = ior
     uvec4 tex_indices; // [albedo, normal, metal-rough, emissive]
+    vec4 clearcoat;
+    vec4 sheen;
+    vec4 anisotropy;
+    vec4 transmission;
+    vec4 attenuation;
+    uvec4 tex_indices_ext;
+    uvec4 tex_flags;
 };
 layout(set = 2, binding = 0, std430) readonly buffer Materials {
     GpuMaterial materials[];

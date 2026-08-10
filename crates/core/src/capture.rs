@@ -1,0 +1,171 @@
+//! Rendering a frame to a PNG with no window.
+//!
+//! This exists because until it did, the only way to check that a change had not
+//! broken the picture was to look at the running editor — which means a person,
+//! a display, and a screenshot, none of which a test has. The render graph's
+//! golden pins synchronisation and says nothing at all about pixels; a lighting
+//! term that silently went dark passes it.
+//!
+//! What it renders is deliberately the whole real path: the same
+//! [`VulkanRenderer`], the same passes, the same scene the editor opens with.
+//! Only the target differs — see [`VulkanRenderer::offscreen`] — because a
+//! capture taken through a simpler path would be evidence about that path rather
+//! than about the frame anyone actually sees.
+//!
+//! It needs a GPU, so nothing here runs in CI. `tests/offscreen.rs` is the entry
+//! point and is `#[ignore]`d for that reason.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use orrin_ecs::World;
+use vulkano::VulkanLibrary;
+use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
+
+use crate::gfx::punctual::ShadowAtlas;
+use crate::gfx::shadows::CascadeSet;
+use crate::gfx::vulkan::VulkanRenderer;
+use crate::gfx::{RenderBackend, SceneLighting};
+use crate::scene::entities::build_default_scene;
+use crate::scene::{
+    BloomSettings, Camera, ContactShadowSettings, DofSettings, EnvironmentSettings, HdrSettings,
+    MotionBlurSettings, RefractionSettings, SsaoSettings, SsrSettings, TaaSettings,
+    TransparencySettings,
+};
+use crate::systems::{self, FrameGeometry};
+
+/// Frames to render before reading one back.
+///
+/// One is not enough and the reason is structural rather than a fudge: the
+/// temporal resolve has no history on its first frame and says so, auto-exposure
+/// adapts over several, and the motion vectors want a previous transform to
+/// reproject through. Capturing frame zero would photograph the engine's
+/// startup transient rather than its output.
+pub const WARMUP_FRAMES: u32 = 12;
+
+/// What the capture renders, so the caller does not have to assemble a world.
+pub struct CaptureSettings {
+    pub extent: [u32; 2],
+    pub frames: u32,
+    /// Overridden after the scene is built, so a capture can look at one feature
+    /// without the rest of the frame moving under it.
+    pub transparency: bool,
+    pub refraction: bool,
+    pub taa: bool,
+}
+
+impl Default for CaptureSettings {
+    fn default() -> Self {
+        Self {
+            extent: [1280, 720],
+            frames: WARMUP_FRAMES,
+            transparency: true,
+            refraction: true,
+            taa: true,
+        }
+    }
+}
+
+/// Render the engine's default scene and write it to `path` as a PNG.
+///
+/// Panics rather than returning an error on a device that cannot be reached: it
+/// is a developer tool driven from a test, and a `Result` nobody can act on
+/// would only push the same panic one frame up the stack.
+pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
+    let instance = headless_instance();
+    let mut renderer = VulkanRenderer::offscreen(&instance, settings.extent);
+
+    let mut world = World::new();
+    build_default_scene(&mut world, &mut renderer);
+
+    world.insert_resource(SsaoSettings::default());
+    world.insert_resource(ContactShadowSettings::default());
+    world.insert_resource(SsrSettings::default());
+    world.insert_resource(TransparencySettings {
+        enabled: settings.transparency,
+    });
+    world.insert_resource(RefractionSettings {
+        enabled: settings.refraction,
+    });
+    world.insert_resource(TaaSettings {
+        enabled: settings.taa,
+        ..TaaSettings::default()
+    });
+    world.insert_resource(MotionBlurSettings::default());
+    world.insert_resource(DofSettings::default());
+    world.insert_resource(BloomSettings::default());
+    world.insert_resource(HdrSettings::default());
+    world.insert_resource(EnvironmentSettings::default());
+
+    let mut lighting = SceneLighting::default();
+    let mut geometry = FrameGeometry::default();
+    // No cascades and no atlas: shadows are a second whole extraction and a
+    // caster list per light, and this is a picture of the shading. A capture
+    // that wants them can grow a `ShadowFrame` the way `app.rs` builds one.
+    let cascades = CascadeSet::default();
+    let atlas = ShadowAtlas::default();
+    let aspect = settings.extent[0] as f32 / settings.extent[1] as f32;
+
+    for _ in 0..settings.frames.max(1) {
+        // Extraction reads *world* transforms, and a freshly built scene has
+        // only local ones — the propagation that derives them is a system, not
+        // something spawning does. Without it every renderable fails the query
+        // and the frame is a skybox with nothing in front of it.
+        crate::scene::propagate_transforms(&mut world);
+        systems::extract_lighting(&world, &mut lighting);
+        systems::extract_geometry(&world, aspect, &cascades, &atlas, &mut geometry);
+
+        let camera = *world.resource::<Camera>();
+        renderer.render(
+            geometry.visible(),
+            geometry.transparent(),
+            geometry.refractive(),
+            &lighting,
+            &camera,
+            &world.resource::<SsaoSettings>().clone(),
+            &world.resource::<ContactShadowSettings>().clone(),
+            &world.resource::<SsrSettings>().clone(),
+            &world.resource::<TransparencySettings>().clone(),
+            &world.resource::<RefractionSettings>().clone(),
+            &world.resource::<TaaSettings>().clone(),
+            &world.resource::<MotionBlurSettings>().clone(),
+            &world.resource::<DofSettings>().clone(),
+            &world.resource::<BloomSettings>().clone(),
+            &world.resource::<HdrSettings>().clone(),
+            &world.resource::<EnvironmentSettings>().clone(),
+            // A fixed step rather than a real clock, so two runs of this produce
+            // the same picture: auto-exposure adapts over time, and a capture
+            // that depended on how fast the host was would be useless to diff.
+            1.0 / 60.0,
+        );
+    }
+
+    let (pixels, extent) = renderer
+        .capture()
+        .expect("an offscreen renderer must have a readable target");
+    image::save_buffer(
+        path.as_ref(),
+        &pixels,
+        extent[0],
+        extent[1],
+        image::ColorType::Rgba8,
+    )
+    .expect("failed to write the capture");
+}
+
+/// An instance with no surface extensions.
+///
+/// `ENUMERATE_PORTABILITY` is the one flag that still matters without a window:
+/// MoltenVK is a portability driver, and an instance that does not enumerate
+/// those finds no device at all on macOS.
+fn headless_instance() -> Arc<Instance> {
+    let library = VulkanLibrary::new().expect("failed to load vulkan library");
+    Instance::new(
+        library,
+        InstanceCreateInfo {
+            flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            ..Default::default()
+        },
+    )
+    .expect("failed to create a headless instance")
+}

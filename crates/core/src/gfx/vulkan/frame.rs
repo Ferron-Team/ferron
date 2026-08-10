@@ -25,7 +25,9 @@ use super::contact_shadows::MASK_FORMAT;
 use super::dof::COC_TILE_SHIFT;
 use super::hdr::HDR_FORMAT;
 use super::motion_blur::TILE_SHIFT;
+use super::oit::{ACCUM_FORMAT, REVEAL_FORMAT};
 use super::prepass::{MATERIAL_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT};
+use super::refraction::{ACCUM_FORMAT as REFRACTION_ACCUM_FORMAT, SCENE_LEVELS};
 use super::ssao::AO_FORMAT;
 use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
 use super::swapchain::DEPTH_FORMAT;
@@ -65,6 +67,21 @@ pub struct FrameConfig {
     /// and the other consumer that can keep the prepass alive on its own —
     /// depth is all it needs from it.
     pub dof: bool,
+    /// Whether the frame draws blended geometry. Structural like the rest: it
+    /// registers the accumulation and composite nodes, and it is one more thing
+    /// that keeps the geometry prepass alive — the accumulation depth-tests
+    /// against the depth that pass writes, because the forward pass's own is a
+    /// memoryless attachment that does not survive its render pass.
+    pub transparency: bool,
+    /// Whether the frame draws refractive geometry. Structural like the rest,
+    /// and it keeps the geometry prepass alive for the reason transparency
+    /// does — the draw depth-tests against the depth that pass writes.
+    ///
+    /// Independent of `transparency` rather than folded into it: the two queues
+    /// answer to opposite rules about ordering, so a frame may reasonably want
+    /// one without the other, and each is its own A/B for "is this a
+    /// transparency bug or a refraction bug?".
+    pub refraction: bool,
     /// Levels in the bloom chain, zero for none. Derived from the frame's extent
     /// rather than set, so the number of passes registered cannot disagree with
     /// the number of levels there is room for — the same reason
@@ -107,6 +124,18 @@ pub enum PassBody {
     SsrTrace,
     /// Upsamples those rays and swaps the environment's reflection for them.
     SsrResolve,
+    /// Every blended surface, into the two targets whose blend equations
+    /// commute — which is what makes the draw order irrelevant.
+    OitAccumulate,
+    /// Divides that accumulation by its own coverage and mixes it over the lit
+    /// frame by the transmittance beside it.
+    OitComposite,
+    /// The lit frame as a mip pyramid, so a rough refraction reads a cone.
+    RefractionScene,
+    /// Every refractive surface, back to front, into a premultiplied target.
+    RefractionDraw,
+    /// Puts that target over the lit frame.
+    RefractionComposite,
     /// Reprojects the history onto this frame and accumulates into it.
     TaaResolve,
     /// Half the frame, carrying its own circle of confusion.
@@ -174,6 +203,8 @@ pub struct FrameIds {
     /// else to name.
     pub contact_shadows: Option<ResourceId>,
     pub ssr: Option<SsrIds>,
+    pub transparency: Option<TransparencyIds>,
+    pub refraction: Option<RefractionIds>,
     pub taa: Option<TaaIds>,
     pub dof: Option<DofIds>,
     pub motion_blur: Option<MotionBlurIds>,
@@ -257,6 +288,43 @@ pub struct SsrIds {
     /// Half the frame: the radiance each ray found, with its confidence in
     /// alpha.
     pub rays: ResourceId,
+    pub output: ResourceId,
+}
+
+/// Weighted-blended transparency's two targets, and what it was handed.
+///
+/// `source` is recorded rather than re-derived for the reason depth of field
+/// records its own: this pass sits in a chain — it composites over the
+/// reflections' output in a frame that has them and the forward pass's target in
+/// a frame that does not — and the executor must bind exactly what `declare`
+/// said it would read.
+#[derive(Clone, Copy, Debug)]
+pub struct TransparencyIds {
+    pub source: ResourceId,
+    /// `rgb` = weighted premultiplied radiance summed, `a` = weighted coverage
+    /// summed.
+    pub accum: ResourceId,
+    /// The product of `1 - alpha` over everything that covered the pixel. One
+    /// channel, and cleared to 1.0 rather than 0 because it is a product.
+    pub reveal: ResourceId,
+    pub output: ResourceId,
+}
+
+/// Screen-space refraction's three images, and what it was handed.
+///
+/// `source` is recorded rather than re-derived for the reason the transparency
+/// ids record theirs: this pass sits in a chain, and the executor must bind
+/// exactly what `declare` said it would read.
+#[derive(Clone, Copy, Debug)]
+pub struct RefractionIds {
+    pub source: ResourceId,
+    /// The lit frame reduced to a mip chain, at full resolution: a clear pane
+    /// of glass shows the world behind it as sharply as the frame recorded it,
+    /// and only a rough one reads a coarser level.
+    pub scene: ResourceId,
+    /// `rgb` = premultiplied radiance, `a` = coverage. Cleared to zero, so a
+    /// pixel nothing refractive covered leaves the frame as it found it.
+    pub accum: ResourceId,
     pub output: ResourceId,
 }
 
@@ -418,16 +486,20 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // all three targets whichever consumer asked for it — a second pipeline that
     // dropped the normal attachment for a TAA-without-SSAO frame would buy a
     // target's bandwidth at the price of a second render pass to keep in step.
-    // Six readers now want different parts of it: SSAO and contact shadows take
-    // depth and normals, TAA and motion blur take depth and motion, depth of
-    // field takes depth alone, reflections take depth, normals and the material
-    // target.
+    // Seven readers now want different parts of it: SSAO and contact shadows
+    // take depth and normals, TAA and motion blur take depth and motion, depth
+    // of field takes depth alone, reflections take depth, normals and the
+    // material target — and transparency and refraction both attach the depth
+    // read-only, the two readers that want it as an attachment rather than as a
+    // texture.
     let prepass = (config.ssao
         || config.contact_shadows
         || config.taa
         || config.motion_blur
         || config.dof
-        || config.ssr)
+        || config.ssr
+        || config.transparency
+        || config.refraction)
         .then(|| PrepassIds {
             normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
             velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
@@ -610,7 +682,174 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // What the temporal resolve accumulates, and what the optical chain starts
     // from in a frame with no resolve: the reflections' output where they ran,
     // and the forward pass's own target where they did not.
-    let shaded = ssr.map_or(hdr_color, |ssr| ssr.output);
+    let mut shaded = ssr.map_or(hdr_color, |ssr| ssr.output);
+
+    // After the reflections and before the resolve, and both halves matter.
+    //
+    // After, because the prepass records only opaque surfaces: a reflection
+    // traces the depth and normals of the world *behind* the glass, and
+    // compositing first would put the glass into a source the trace then
+    // reflects as though it were a wall.
+    //
+    // Before, because the accumulation rasterises with the frame's jitter like
+    // everything else, and a subpixel offset nothing averages is a shimmer. The
+    // cost is that a moving transparent surface reprojects along the *opaque*
+    // motion vectors under it and ghosts; the neighbourhood clamp takes most of
+    // it, and the alternative is transparency with no antialiasing at all.
+    let transparency = config.transparency.then(|| {
+        let prepass = prepass.expect("transparency depth-tests the geometry prepass");
+        let source = shaded;
+
+        let accum = builder.create_image("oit_accum", ImageDesc::new(ACCUM_FORMAT));
+        let reveal = builder.create_image("oit_reveal", ImageDesc::new(REVEAL_FORMAT));
+        let output = builder.create_image("oit_color", ImageDesc::new(HDR_FORMAT));
+
+        // The depth is *attached*, not sampled: a fixed-function depth test is
+        // what makes a transparent surface disappear behind a wall, and a test
+        // in the shader would need the depth in a second layout and a discard
+        // per fragment. `DepthAttachmentRead` is the declaration that keeps it
+        // read-only — the prepass is still its only writer, so every other
+        // reader of it is unaffected.
+        //
+        // The same screen-space and shadow inputs the forward pass declares,
+        // because it shades with the same `shading.glsl` and therefore samples
+        // the same set.
+        let mut accumulate = builder
+            .pass("oit_accumulate", PassKind::Inline)
+            .access(object_transforms, Access::StorageRead);
+        if let Some(ssao) = ssao {
+            accumulate = accumulate.access(ssao.ao, Access::Sampled);
+        }
+        if let Some(mask) = contact_shadows {
+            accumulate = accumulate.access(mask, Access::Sampled);
+        }
+        if let Some(shadows) = shadows {
+            accumulate = accumulate.access(shadows, Access::Sampled);
+        }
+        if let Some(atlas) = shadow_atlas {
+            accumulate = accumulate.access(atlas, Access::Sampled);
+        }
+        let id = accumulate
+            .access(accum, Access::ColorAttachment)
+            .access(reveal, Access::ColorAttachment)
+            .access(prepass.depth, Access::DepthAttachmentRead)
+            .build();
+        record(id, PassBody::OitAccumulate, &mut bodies);
+
+        // Reads `source` again rather than accumulating into it, for the reason
+        // the reflection and depth-of-field composites do: resources are
+        // unversioned, so a pass that both read and wrote the frame's colour
+        // would make "readers after all writers" point in two directions and
+        // `compile` would report a cycle.
+        let id = builder
+            .pass("oit_composite", PassKind::Compute)
+            .access(source, Access::Sampled)
+            .access(accum, Access::Sampled)
+            .access(reveal, Access::Sampled)
+            .access(output, Access::StorageWrite)
+            .build();
+        record(id, PassBody::OitComposite, &mut bodies);
+
+        TransparencyIds {
+            source,
+            accum,
+            reveal,
+            output,
+        }
+    });
+    if let Some(transparency) = transparency {
+        shaded = transparency.output;
+    }
+
+    // After the blended queue, so glass refracts what that queue composited, and
+    // before the temporal resolve, so it rasterises with the frame's jitter like
+    // every other geometry pass.
+    //
+    // The ordering between the two queues is a choice with no correct answer:
+    // neither writes depth, so nothing sorts one against the other. Refraction
+    // last means a blended surface *behind* glass is correctly refracted through
+    // it, and one in front of glass is not — the commoner case wins, and the
+    // uncommon one is what a screen-space technique cannot represent at all.
+    let refraction = config.refraction.then(|| {
+        let prepass = prepass.expect("refraction depth-tests the geometry prepass");
+        let source = shaded;
+
+        // Half the frame, the same base the reflection trace's pyramid of this
+        // shape uses. Building it is the most expensive thing this feature does,
+        // and every consumer of it is a surface rough enough to be averaging
+        // over a cone anyway — the one consumer that is not, a clear pane, reads
+        // `source` directly through the draw's second binding below.
+        let scene = builder.create_image(
+            "refraction_scene",
+            ImageDesc::new(HDR_FORMAT)
+                .extent(Extent::FrameDiv(1))
+                .mip_levels(SCENE_LEVELS),
+        );
+        let accum =
+            builder.create_image("refraction_accum", ImageDesc::new(REFRACTION_ACCUM_FORMAT));
+        let output = builder.create_image("refraction_color", ImageDesc::new(HDR_FORMAT));
+
+        let id = builder
+            .pass("refraction_scene", PassKind::Compute)
+            .access(source, Access::Sampled)
+            .access(scene, Access::StorageWrite)
+            .build();
+        record(id, PassBody::RefractionScene, &mut bodies);
+
+        // The depth is *attached*, not sampled, for the reason the transparency
+        // accumulation attaches it: a fixed-function depth test is what makes a
+        // refractive surface disappear behind a wall. `DepthAttachmentRead` is
+        // the declaration that keeps it read-only.
+        //
+        // The same screen-space and shadow inputs the forward pass declares,
+        // because it shades with the same `shading.glsl` — plus the pyramid
+        // above, which is the one input no other geometry pass has.
+        let mut draw = builder
+            .pass("refraction_draw", PassKind::Inline)
+            .access(object_transforms, Access::StorageRead)
+            .access(scene, Access::Sampled)
+            .access(source, Access::Sampled);
+        if let Some(ssao) = ssao {
+            draw = draw.access(ssao.ao, Access::Sampled);
+        }
+        if let Some(mask) = contact_shadows {
+            draw = draw.access(mask, Access::Sampled);
+        }
+        if let Some(shadows) = shadows {
+            draw = draw.access(shadows, Access::Sampled);
+        }
+        if let Some(atlas) = shadow_atlas {
+            draw = draw.access(atlas, Access::Sampled);
+        }
+        let id = draw
+            .access(accum, Access::ColorAttachment)
+            .access(prepass.depth, Access::DepthAttachmentRead)
+            .build();
+        record(id, PassBody::RefractionDraw, &mut bodies);
+
+        // Reads `source` again rather than accumulating into it, for the reason
+        // every other composite in this frame does: resources are unversioned,
+        // so a pass that both read and wrote the frame's colour would make
+        // "readers after all writers" point in two directions and `compile`
+        // would report a cycle.
+        let id = builder
+            .pass("refraction_composite", PassKind::Compute)
+            .access(source, Access::Sampled)
+            .access(accum, Access::Sampled)
+            .access(output, Access::StorageWrite)
+            .build();
+        record(id, PassBody::RefractionComposite, &mut bodies);
+
+        RefractionIds {
+            source,
+            scene,
+            accum,
+            output,
+        }
+    });
+    if let Some(refraction) = refraction {
+        shaded = refraction.output;
+    }
 
     let taa = config.taa.then(|| {
         let prepass = prepass.expect("TAA reads the geometry prepass");
@@ -949,6 +1188,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             ssao,
             contact_shadows,
             ssr,
+            transparency,
+            refraction,
             taa,
             dof,
             motion_blur,

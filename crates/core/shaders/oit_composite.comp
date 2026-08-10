@@ -1,0 +1,62 @@
+#version 460
+
+// Weighted-blended OIT, resolve half: put the accumulated transparency over the
+// lit frame.
+//
+// Reads the frame's colour rather than accumulating into it, for the reason the
+// depth-of-field composite does: graph resources are unversioned, so a pass
+// that both read and wrote the frame's colour would make "readers after all
+// writers" point in two directions and the compiler would report a cycle.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_scene;
+// rgb = sum of weighted premultiplied radiance, a = sum of weighted coverage.
+layout(set = 0, binding = 1) uniform sampler2D u_accum;
+// The product of (1 - alpha) over every surface that covered this pixel: 1.0
+// where nothing transparent was drawn.
+layout(set = 0, binding = 2) uniform sampler2D u_reveal;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D u_output;
+
+// How close to fully revealed counts as "nothing was drawn here". One step of
+// the 8-bit revealage target, so the early-out cannot skip a surface the target
+// could still represent.
+const float FULLY_REVEALED = 1.0 - (0.5 / 255.0);
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_output);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+
+    vec3 opaque = texelFetch(u_scene, pixel, 0).rgb;
+    float reveal = texelFetch(u_reveal, pixel, 0).r;
+
+    // The common case by a wide margin — most of a frame has no glass over it —
+    // and skipping it keeps this pass close to a copy where nothing is
+    // transparent.
+    if (reveal >= FULLY_REVEALED) {
+        imageStore(u_output, pixel, vec4(opaque, 1.0));
+        return;
+    }
+
+    vec4 accum = texelFetch(u_accum, pixel, 0);
+
+    // A 16-bit float target saturates at 65504, and the weight in `oit.frag` is
+    // bounded but its *sum* over many layers is not. An overflowed channel is
+    // recovered from the largest finite one rather than left to propagate a NaN
+    // through tonemapping — the result is wrong by a shade, not by a hole.
+    if (isinf(accum.a) || isnan(accum.a)) {
+        accum.a = max(max(accum.r, accum.g), accum.b);
+    }
+    accum.rgb = mix(vec3(accum.a), accum.rgb, not(isinf(accum.rgb)));
+
+    // The coverage-weighted mean colour: the weight applied in `oit.frag`
+    // divides out here, which is the whole trick.
+    vec3 average = accum.rgb / max(accum.a, 1e-5);
+
+    // `reveal` is the fraction of the pixel the transparent surfaces let
+    // through, so it is exactly the opaque frame's share.
+    imageStore(u_output, pixel, vec4(mix(average, opaque, reveal), 1.0));
+}

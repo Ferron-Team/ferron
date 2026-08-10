@@ -22,7 +22,9 @@ use crate::gfx::graph::{FrameGraph, ResourceId};
 use super::contact_shadows::ContactShadowPass;
 use super::forward::ForwardPass;
 use super::frame::{Frame, PassBody};
+use super::oit::OitPass;
 use super::prepass::GeometryPrepass;
+use super::refraction::RefractionPass;
 use super::shadow::ShadowPass;
 use super::ssao::SsaoPass;
 
@@ -191,6 +193,7 @@ pub(super) struct PassFramebuffers {
 }
 
 impl PassFramebuffers {
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         frame: &Frame,
         images: &GraphImages,
@@ -198,6 +201,8 @@ impl PassFramebuffers {
         prepass: &GeometryPrepass,
         ssao: &SsaoPass,
         contact_shadows: &ContactShadowPass,
+        oit: &OitPass,
+        refraction: &RefractionPass,
         shadow: &ShadowPass,
     ) -> Self {
         let ids = frame.ids;
@@ -246,6 +251,42 @@ impl PassFramebuffers {
                             images.view(ids.hdr_color),
                         ],
                     ),
+                    // The prepass depth as the third attachment, read-only —
+                    // the one image in this frame two render passes attach.
+                    PassBody::OitAccumulate => {
+                        let oit_ids = ids
+                            .transparency
+                            .expect("transparency pass without its targets");
+                        let prepass_ids = ids
+                            .prepass
+                            .expect("the graph scheduled transparency with no prepass");
+                        (
+                            oit.render_pass.clone(),
+                            vec![
+                                images.view(oit_ids.accum),
+                                images.view(oit_ids.reveal),
+                                images.view(prepass_ids.depth),
+                            ],
+                        )
+                    }
+                    // The prepass depth read-only again, in the same shape and
+                    // for the same reason — one colour target instead of two,
+                    // because a refractive surface composites its own
+                    // background rather than accumulating a weight beside it.
+                    PassBody::RefractionDraw => {
+                        let refraction_ids =
+                            ids.refraction.expect("refraction pass without its targets");
+                        let prepass_ids = ids
+                            .prepass
+                            .expect("the graph scheduled refraction with no prepass");
+                        (
+                            refraction.render_pass.clone(),
+                            vec![
+                                images.view(refraction_ids.accum),
+                                images.view(prepass_ids.depth),
+                            ],
+                        )
+                    }
                     // One layer of the cascade array, not the array view: a
                     // framebuffer attachment is a single layer, and handing it
                     // the whole array would make every cascade clear and
@@ -280,6 +321,9 @@ impl PassFramebuffers {
                     | PassBody::SsrSource
                     | PassBody::SsrTrace
                     | PassBody::SsrResolve
+                    | PassBody::OitComposite
+                    | PassBody::RefractionScene
+                    | PassBody::RefractionComposite
                     | PassBody::TaaResolve
                     | PassBody::DofPrefilter
                     | PassBody::DofTileMax
@@ -338,6 +382,19 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         // this only decides what a pixel would be if it somehow did not.
         PassBody::ContactShadows => vec![Some([1.0, 0.0, 0.0, 0.0].into())],
         PassBody::Forward => vec![Some([0.02, 0.02, 0.03, 1.0].into()), Some(1.0.into()), None],
+        // Nothing accumulated, and everything revealed. The second is the one
+        // that matters: revealage is a running *product* of `1 - alpha`, so a
+        // clear of zero would hide the opaque frame everywhere rather than
+        // nowhere. The depth attachment is read-only and carries no clear.
+        PassBody::OitAccumulate => vec![
+            Some([0.0, 0.0, 0.0, 0.0].into()),
+            Some([1.0, 0.0, 0.0, 0.0].into()),
+            None,
+        ],
+        // Nothing covered, so nothing replaced: the composite reads this as the
+        // frame's own colour showing through in full. Zero rather than one is
+        // what makes it an `over` of nothing instead of a black wall.
+        PassBody::RefractionDraw => vec![Some([0.0, 0.0, 0.0, 0.0].into()), None],
         PassBody::Tonemap => vec![None],
         // No render pass, so nothing to clear.
         PassBody::Overlay
@@ -345,6 +402,9 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         | PassBody::SsrSource
         | PassBody::SsrTrace
         | PassBody::SsrResolve
+        | PassBody::OitComposite
+        | PassBody::RefractionScene
+        | PassBody::RefractionComposite
         | PassBody::TaaResolve
         | PassBody::DofPrefilter
         | PassBody::DofTileMax

@@ -9,7 +9,9 @@ pub mod frame;
 mod hdr;
 mod line;
 mod motion_blur;
+mod oit;
 mod prepass;
+mod refraction;
 mod resources;
 mod shadow;
 mod ssao;
@@ -21,15 +23,18 @@ mod timestamps;
 
 use std::sync::Arc;
 
+use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer, SubpassBeginInfo,
-    SubpassContents,
+    AutoCommandBufferBuilder, CommandBufferUsage, CopyImageToBufferInfo, PrimaryAutoCommandBuffer,
+    SubpassBeginInfo, SubpassContents,
 };
 use vulkano::descriptor_set::DescriptorSet;
 use vulkano::device::Queue;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::instance::Instance;
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
+use vulkano::render_pass::RenderPass;
 use vulkano::swapchain::{Surface, SwapchainPresentInfo, acquire_next_image};
 use vulkano::sync::GpuFuture;
 use vulkano::sync::{self, future::FenceSignalFuture};
@@ -40,14 +45,16 @@ use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::shadows::CascadeSet;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
-    HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, ShadowSettings, SsaoSettings,
-    SsrSettings, TaaSettings,
+    HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, RefractionSettings,
+    ShadowSettings, SsaoSettings, SsrSettings, TaaSettings, TransparencySettings,
 };
 
 use self::contact_shadows::ContactShadowPass;
 use self::context::VkContext;
 use self::environment::EnvironmentPass;
 use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
+use self::oit::OitPass;
+use self::refraction::RefractionPass;
 use crate::gfx::graph::{PassKind, ResourceId};
 
 use self::bloom::BloomPass;
@@ -77,6 +84,16 @@ type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
 /// pipeline, its render pass attachments, and the graph's declaration of the
 /// MSAA targets all have to agree or framebuffer creation fails at startup.
 pub(crate) const MSAA_SAMPLES: vulkano::image::SampleCount = vulkano::image::SampleCount::Sample4;
+
+/// What an offscreen render targets.
+///
+/// `R8G8B8A8_SRGB` rather than the `B8G8R8A8_SRGB` a macOS surface usually hands
+/// back: both are universally supported as colour attachments, and this one
+/// comes out of the readback in the byte order a PNG wants, so the capture path
+/// has no channel swap in it to get backwards. The `_SRGB` half matters more —
+/// the tonemap pass writes linear values and relies on the format to encode
+/// them, exactly as it does on a window.
+pub(crate) const OFFSCREEN_FORMAT: Format = Format::R8G8B8A8_SRGB;
 
 /// A hook that draws over the final swapchain image between the tonemap pass and
 /// present (the editor UI). Given the future to wait on and that image's view, it
@@ -128,6 +145,14 @@ pub struct VulkanRenderer {
     /// environment's reflection for them. Holds only pipelines and the resolved
     /// settings; every image it works over is graph-owned.
     ssr: SsrPass,
+    /// Weighted-blended transparency: the accumulation pass and the composite
+    /// that puts what it gathered over the lit frame. Draws through the forward
+    /// pass's own pipeline layout, so it is constructed after it.
+    oit: OitPass,
+    /// Screen-space refraction: the scene pyramid, the sorted draw, and the
+    /// composite. Built with a layout of its own — the same five descriptor sets
+    /// the forward pass binds, plus a sixth for that pyramid.
+    refraction: RefractionPass,
     /// Owns the ping-ponged history the graph imports, and decides the frame's
     /// subpixel jitter — which is why it is consulted before any pass records.
     taa: TaaPass,
@@ -175,8 +200,34 @@ pub struct VulkanRenderer {
 
 impl VulkanRenderer {
     pub fn new(instance: &Arc<Instance>, surface: Arc<Surface>, extent: [u32; 2]) -> Self {
-        let ctx = VkContext::new(instance, &surface);
+        let ctx = VkContext::new(instance, Some(&surface));
         let format = swapchain_color_format(&ctx, &surface);
+        Self::build(ctx, format, extent, |ctx, render_pass, format, extent| {
+            SwapchainState::new(ctx, &surface, render_pass, format, extent)
+        })
+    }
+
+    /// A renderer that draws into an image instead of a window.
+    ///
+    /// Every pass, every pipeline and every descriptor set is the one the
+    /// windowed renderer builds — the target is the only difference, and it has
+    /// to be, because the point of rendering offscreen is to have evidence about
+    /// what the window shows. A capture taken through a second, simpler path
+    /// would only be evidence about that path.
+    pub fn offscreen(instance: &Arc<Instance>, extent: [u32; 2]) -> Self {
+        let ctx = VkContext::new(instance, None);
+        Self::build(ctx, OFFSCREEN_FORMAT, extent, SwapchainState::offscreen)
+    }
+
+    /// The half of construction that does not know where the frame ends up.
+    /// `make_target` is handed the tonemap render pass because a framebuffer
+    /// needs it, and it is built partway through.
+    fn build(
+        ctx: VkContext,
+        format: Format,
+        extent: [u32; 2],
+        make_target: impl FnOnce(&VkContext, &Arc<RenderPass>, Format, [u32; 2]) -> SwapchainState,
+    ) -> Self {
         let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, hdr::HDR_FORMAT);
         let hdr = HdrPass::new(&ctx, format);
         let exposure = ExposurePass::new(&ctx);
@@ -185,13 +236,15 @@ impl VulkanRenderer {
         let ssao = SsaoPass::new(&ctx);
         let contact_shadows = ContactShadowPass::new(&ctx);
         let ssr = SsrPass::new(&ctx);
+        let oit = OitPass::new(&ctx, forward.pipeline_layout());
+        let refraction = RefractionPass::new(&ctx, forward.pipeline_layout());
         let taa = TaaPass::new(&ctx);
         let dof = DofPass::new(&ctx);
         let motion_blur = MotionBlurPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx);
         let line = LinePass::new(&ctx.device, &ctx.memory_allocator, &forward.render_pass);
         let environment = EnvironmentPass::new(&ctx, &forward.render_pass);
-        let swapchain = SwapchainState::new(&ctx, &surface, &hdr.tonemap_rp, format, extent);
+        let swapchain = make_target(&ctx, &hdr.tonemap_rp, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
 
         // Default textures so every material slot resolves to a valid view:
@@ -220,6 +273,8 @@ impl VulkanRenderer {
             ssao: true,
             contact_shadows: true,
             ssr: false,
+            transparency: true,
+            refraction: true,
             taa: true,
             auto_exposure: true,
             motion_blur: false,
@@ -239,6 +294,8 @@ impl VulkanRenderer {
             &prepass,
             &ssao,
             &contact_shadows,
+            &oit,
+            &refraction,
             &shadow,
         );
 
@@ -253,6 +310,8 @@ impl VulkanRenderer {
             ssao,
             contact_shadows,
             ssr,
+            oit,
+            refraction,
             taa,
             dof,
             motion_blur,
@@ -289,6 +348,57 @@ impl VulkanRenderer {
             return;
         }
         self.reallocate();
+    }
+
+    /// Copy the last rendered frame back to host memory as tightly packed
+    /// `R8G8B8A8_SRGB`, with the extent it was rendered at.
+    ///
+    /// `None` for a windowed renderer, which has no readable target: a swapchain
+    /// image belongs to the presentation engine, and this exists to look at what
+    /// the passes produced rather than at what a compositor did with it.
+    ///
+    /// Waits for the frame first. That is the whole synchronisation story —
+    /// `render_frame` already signalled a fence, and the copy is submitted after
+    /// it has been reached, so nothing here can read a half-written image.
+    pub fn capture(&mut self) -> Option<(Vec<u8>, [u32; 2])> {
+        let image = self.swapchain.readback.first()?.clone();
+
+        if let Some(previous) = self.previous_frame_end.as_mut() {
+            previous
+                .wait(None)
+                .expect("the offscreen frame never completed");
+        }
+
+        let extent = self.swapchain.extent;
+        let buffer = Buffer::new_slice::<u8>(
+            self.ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                ..Default::default()
+            },
+            u64::from(extent[0]) * u64::from(extent[1]) * 4,
+        )
+        .expect("failed to allocate the capture buffer");
+
+        let mut builder = self.new_command_buffer();
+        builder
+            .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(image, buffer.clone()))
+            .unwrap();
+        sync::now(self.ctx.device.clone())
+            .then_execute(self.ctx.queue.clone(), builder.build().unwrap())
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap();
+
+        let pixels = buffer.read().unwrap().to_vec();
+        Some((pixels, extent))
     }
 
     fn new_command_buffer(&self) -> AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> {
@@ -328,6 +438,8 @@ impl VulkanRenderer {
             &self.prepass,
             &self.ssao,
             &self.contact_shadows,
+            &self.oit,
+            &self.refraction,
             &self.shadow,
         );
     }
@@ -407,11 +519,15 @@ impl RenderBackend for VulkanRenderer {
     fn render(
         &mut self,
         draws: DrawList<'_>,
+        transparent: DrawList<'_>,
+        refractive: DrawList<'_>,
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
         contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
+        transparency: &TransparencySettings,
+        refraction: &RefractionSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
         dof: &DofSettings,
@@ -425,11 +541,15 @@ impl RenderBackend for VulkanRenderer {
         // and no matrices, only the depth buffer, so they run here too.
         self.render_frame(
             draws,
+            transparent,
+            refractive,
             lighting,
             camera,
             ssao,
             contact_shadows,
             ssr,
+            transparency,
+            refraction,
             taa,
             motion_blur,
             dof,
@@ -451,7 +571,7 @@ impl VulkanRenderer {
     }
 
     pub fn color_format(&self) -> Format {
-        self.swapchain.swapchain.image_format()
+        self.swapchain.format
     }
 
     /// The extent the next frame will be drawn at — the swapchain's, not the
@@ -488,11 +608,15 @@ impl VulkanRenderer {
     pub fn render_with_overlay(
         &mut self,
         draws: DrawList<'_>,
+        transparent: DrawList<'_>,
+        refractive: DrawList<'_>,
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
         contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
+        transparency: &TransparencySettings,
+        refraction: &RefractionSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
         dof: &DofSettings,
@@ -507,11 +631,15 @@ impl VulkanRenderer {
     ) {
         self.render_frame(
             draws,
+            transparent,
+            refractive,
             lighting,
             camera,
             ssao,
             contact_shadows,
             ssr,
+            transparency,
+            refraction,
             taa,
             motion_blur,
             dof,
@@ -530,11 +658,15 @@ impl VulkanRenderer {
     fn render_frame(
         &mut self,
         draws: DrawList<'_>,
+        transparent: DrawList<'_>,
+        refractive: DrawList<'_>,
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
         contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
+        transparency: &TransparencySettings,
+        refraction: &RefractionSettings,
         taa: &TaaSettings,
         motion_blur: &MotionBlurSettings,
         dof: &DofSettings,
@@ -568,10 +700,12 @@ impl VulkanRenderer {
         // Everything else about this call — how many objects, which camera, what
         // exposure — flows through the same compiled schedule.
         self.ensure_graph(FrameConfig {
-            color_format: self.swapchain.swapchain.image_format(),
+            color_format: self.swapchain.format,
             ssao: ssao.enabled,
             contact_shadows: contact_shadows.enabled,
             ssr: ssr.enabled,
+            transparency: transparency.enabled,
+            refraction: refraction.enabled,
             taa: taa.enabled,
             auto_exposure: hdr.auto_exposure,
             motion_blur: motion_blur.enabled,
@@ -606,18 +740,21 @@ impl VulkanRenderer {
         // Split out because under Fifo this blocks until the presentation engine
         // hands back an image — a vsync wait, not work. Folded into a single
         // "render" scope it swamps the numbers and hides real regressions.
-        let (image_index, suboptimal, acquire_future) = {
-            profile_scope!("acquire");
-            match acquire_next_image(self.swapchain.swapchain.clone(), None)
-                .map_err(Validated::unwrap)
-            {
-                Ok(r) => r,
-                Err(VulkanError::OutOfDate) => {
-                    self.recreate_swapchain = true;
-                    return;
+        let (image_index, suboptimal, acquire_future) = match self.swapchain.swapchain.clone() {
+            Some(swapchain) => {
+                profile_scope!("acquire");
+                match acquire_next_image(swapchain, None).map_err(Validated::unwrap) {
+                    Ok((index, suboptimal, future)) => (index, suboptimal, Some(future)),
+                    Err(VulkanError::OutOfDate) => {
+                        self.recreate_swapchain = true;
+                        return;
+                    }
+                    Err(e) => panic!("failed to acquire next image: {e}"),
                 }
-                Err(e) => panic!("failed to acquire next image: {e}"),
             }
+            // Offscreen: one image, always available, and nothing to wait on —
+            // no presentation engine owns it, so there is no hand-back to time.
+            None => (0, false, None),
         };
         if suboptimal {
             self.recreate_swapchain = true;
@@ -731,10 +868,12 @@ impl VulkanRenderer {
         // prepass, the forward pass, and each cascade — because the per-object
         // inverse-transpose is too expensive to compute more than once. The
         // camera-visible items come first, so the two screen-space passes still
-        // index from zero and the cascades index from `caster_bases`.
+        // index from zero and the cascades index from `objects.cascade_bases`.
         let no_casters: [DrawList<'_>; 0] = [];
-        let (object_buffer, caster_bases, punctual_bases) = self.forward.upload_objects(
+        let objects = self.forward.upload_objects(
             draws,
+            transparent,
+            refractive,
             shadows.map_or(&no_casters, |s| s.casters),
             shadows.map_or(&no_casters, |s| s.punctual_casters),
         );
@@ -746,15 +885,15 @@ impl VulkanRenderer {
         // cascade, which is where the duplication actually was. They are kept
         // separate rather than shared because set compatibility is a property of
         // the layout each pipeline declares, not of the buffer written into it.
-        let forward_object_set = self.forward.build_object_set(&self.ctx, &object_buffer);
+        let forward_object_set = self.forward.build_object_set(&self.ctx, &objects.buffer);
         let shadow_object_set = shadows
             .is_some()
-            .then(|| self.shadow.build_object_set(&self.ctx, &object_buffer));
+            .then(|| self.shadow.build_object_set(&self.ctx, &objects.buffer));
         let prepass_object_set = self
             .frame
             .ids
             .prepass
-            .map(|_| self.prepass.build_object_set(&self.ctx, &object_buffer));
+            .map(|_| self.prepass.build_object_set(&self.ctx, &objects.buffer));
 
         // Uploaded once even though the prepass and the SSAO resolve both read
         // it — which is what the shared `object_transforms` declaration in
@@ -831,6 +970,28 @@ impl VulkanRenderer {
         // every pass in the chain recorded what it was handed, so nothing here
         // re-derives an order.
         let scene_color = self.view_of(self.frame.ids.scene_color);
+
+        // Built before the walk rather than inside the forward pass's body,
+        // because two passes bind these five: the forward pass and the
+        // transparency accumulation, which draws through the same pipeline
+        // layout. Which of them the compiler scheduled first is not something
+        // either may depend on.
+        let forward_sets = self.forward.begin_frame(
+            self,
+            lighting,
+            camera,
+            self.swapchain.extent,
+            ao_view.clone(),
+            contact_shadow_view.clone(),
+            shadow_view.clone(),
+            atlas_view.clone(),
+            shadows,
+            atlas,
+            material_set.clone(),
+            texture_set.clone(),
+            forward_object_set.clone(),
+            environment,
+        );
 
         // The whole frame, in the order the compiler derived. Nothing below
         // decides what runs next, what an image's layout is, or what has to
@@ -946,6 +1107,51 @@ impl VulkanRenderer {
                             self.images.view(prepass.material),
                             self.environment.specular_view(),
                             self.environment.sampler(),
+                            self.images.view(ids.output),
+                        );
+                    }
+                    PassBody::OitComposite => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .transparency
+                            .expect("transparency without its targets");
+                        self.oit.record_composite(
+                            &mut builder,
+                            &self.ctx,
+                            self.view_of(ids.source),
+                            self.images.view(ids.accum),
+                            self.images.view(ids.reveal),
+                            self.images.view(ids.output),
+                        );
+                    }
+                    PassBody::RefractionScene => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .refraction
+                            .expect("refraction without its images");
+                        let mips: Vec<_> = (0..self.images.mip_levels(ids.scene))
+                            .map(|level| self.images.mip_view(ids.scene, level))
+                            .collect();
+                        self.refraction.record_pyramid(
+                            &mut builder,
+                            &self.ctx,
+                            self.view_of(ids.source),
+                            &mips,
+                        );
+                    }
+                    PassBody::RefractionComposite => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .refraction
+                            .expect("refraction without its images");
+                        self.refraction.record_composite(
+                            &mut builder,
+                            &self.ctx,
+                            self.view_of(ids.source),
+                            self.images.view(ids.accum),
                             self.images.view(ids.output),
                         );
                     }
@@ -1168,7 +1374,7 @@ impl VulkanRenderer {
                         self,
                         shadows.casters[cascade_index],
                         shadows.cascades.cascades[cascade_index].view_proj,
-                        caster_bases[cascade_index],
+                        objects.cascade_bases[cascade_index],
                         self.config.shadow_resolution,
                         shadow_object_set
                             .clone()
@@ -1183,7 +1389,7 @@ impl VulkanRenderer {
                         self,
                         shadows.atlas,
                         shadows.punctual_casters,
-                        &punctual_bases,
+                        &objects.punctual_bases,
                         shadow_object_set
                             .clone()
                             .expect("the graph scheduled the atlas with no shadow frame"),
@@ -1233,25 +1439,8 @@ impl VulkanRenderer {
                     );
                 }
                 PassBody::Forward => {
-                    self.forward.draw(
-                        &mut builder,
-                        self,
-                        draws,
-                        lighting,
-                        camera,
-                        &view,
-                        extent,
-                        ao_view.clone(),
-                        contact_shadow_view.clone(),
-                        shadow_view.clone(),
-                        atlas_view.clone(),
-                        shadows,
-                        atlas,
-                        material_set.clone(),
-                        texture_set.clone(),
-                        forward_object_set.clone(),
-                        environment,
-                    );
+                    self.forward
+                        .draw(&mut builder, self, draws, &view, extent, &forward_sets);
                     // Between the geometry and the lines, and it has to be:
                     // after the geometry so the depth test rejects the sky
                     // wherever something was drawn, and before the lines
@@ -1267,6 +1456,33 @@ impl VulkanRenderer {
                     // Debug lines share the forward subpass: depth-tested against
                     // the scene, drawn on top of it, before the pass ends.
                     self.line.record(&mut builder, debug_lines, &view, extent);
+                }
+                PassBody::OitAccumulate => self.oit.record(
+                    &mut builder,
+                    self,
+                    transparent,
+                    &forward_sets,
+                    &view,
+                    extent,
+                    objects.transparent_base,
+                ),
+                PassBody::RefractionDraw => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .refraction
+                        .expect("refraction without its images");
+                    self.refraction.record(
+                        &mut builder,
+                        self,
+                        refractive,
+                        &forward_sets,
+                        self.images.view(ids.scene),
+                        self.view_of(ids.source),
+                        &view,
+                        extent,
+                        objects.refractive_base,
+                    );
                 }
                 PassBody::Tonemap => self.hdr.record_tonemap(
                     &mut builder,
@@ -1287,6 +1503,9 @@ impl VulkanRenderer {
                 | PassBody::SsrSource
                 | PassBody::SsrTrace
                 | PassBody::SsrResolve
+                | PassBody::OitComposite
+                | PassBody::RefractionScene
+                | PassBody::RefractionComposite
                 | PassBody::TaaResolve
                 | PassBody::DofPrefilter
                 | PassBody::DofTileMax
@@ -1326,8 +1545,11 @@ impl VulkanRenderer {
             .previous_frame_end
             .take()
             .map(|f| f.boxed())
-            .unwrap_or_else(|| sync::now(self.ctx.device.clone()).boxed())
-            .join(acquire_future)
+            .unwrap_or_else(|| sync::now(self.ctx.device.clone()).boxed());
+        if let Some(acquired) = acquire_future {
+            future = future.join(acquired).boxed();
+        }
+        let mut future = future
             .then_execute(self.ctx.queue.clone(), command_buffer)
             .unwrap()
             .boxed();
@@ -1351,16 +1573,18 @@ impl VulkanRenderer {
         let before_present = future;
 
         let submitting = crate::profile::scope("submit");
-        let future = before_present
-            .then_swapchain_present(
-                self.ctx.queue.clone(),
-                SwapchainPresentInfo::swapchain_image_index(
-                    self.swapchain.swapchain.clone(),
-                    image_index,
-                ),
-            )
-            .boxed()
-            .then_signal_fence_and_flush();
+        let future = match self.swapchain.swapchain.clone() {
+            Some(swapchain) => before_present
+                .then_swapchain_present(
+                    self.ctx.queue.clone(),
+                    SwapchainPresentInfo::swapchain_image_index(swapchain, image_index),
+                )
+                .boxed()
+                .then_signal_fence_and_flush(),
+            // Nothing to present to. The fence is still what `capture` waits on
+            // before reading the image back.
+            None => before_present.then_signal_fence_and_flush(),
+        };
 
         match future.map_err(Validated::unwrap) {
             Ok(f) => self.previous_frame_end = Some(f),

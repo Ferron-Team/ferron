@@ -361,6 +361,65 @@ fn a_second_reader_in_the_same_layout_needs_no_barrier() {
     );
 }
 
+/// A layout transition rewrites the image, so a reader that moves one out from
+/// under an earlier reader has to wait for that reader too — a write-after-read
+/// on the transition itself, and the one hazard `dependency_edges` cannot rule
+/// out, because both passes really are readers.
+///
+/// The frame that made this reachable is transparency's: five passes sample the
+/// prepass depth, and the accumulation attaches it read-only between them. A
+/// barrier sourced from the prepass's write alone would let the transition run
+/// while SSAO was still sampling.
+#[test]
+fn a_transition_waits_for_the_readers_it_moves_the_layout_out_from_under() {
+    let mut builder = GraphBuilder::new();
+    let present = builder.import_image(
+        "present",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    // Imported so the sampling pass is observed and survives culling — a
+    // culled reader is not in the schedule and has no layout to be moved out
+    // from under.
+    let probe = builder.import_buffer("probe");
+    let depth = builder.create_image("depth", ImageDesc::new(Format::D32_SFLOAT));
+    builder
+        .pass("write_depth", PassKind::Inline)
+        .access(depth, Access::DepthAttachment)
+        .build();
+    builder
+        .pass("sample_depth", PassKind::Compute)
+        .access(depth, Access::Sampled)
+        .access(probe, Access::StorageWrite)
+        .build();
+    builder
+        .pass("attach_depth", PassKind::Inline)
+        .access(depth, Access::DepthAttachmentRead)
+        .access(present, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    let slot = graph
+        .order()
+        .iter()
+        .position(|&id| graph.pass_name(id) == "attach_depth")
+        .unwrap();
+    let barrier = graph
+        .barriers_before(slot)
+        .iter()
+        .find(|barrier| graph.resource_name(barrier.resource) == "depth")
+        .expect("moving to a read-only depth layout needs a barrier");
+
+    assert_eq!(barrier.old_layout, ImageLayout::ShaderReadOnlyOptimal);
+    assert_eq!(barrier.new_layout, ImageLayout::DepthStencilReadOnlyOptimal);
+    assert!(
+        barrier.src_stages.contains(PipelineStages::COMPUTE_SHADER),
+        "the transition must wait for the sampling pass: {:?}",
+        barrier.src_stages,
+    );
+}
+
 /// An acquired swapchain image arrives `Undefined` and must be handed back as
 /// `PresentSrc`; nothing in the frame declares that, so the compiler owes it.
 #[test]

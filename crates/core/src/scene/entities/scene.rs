@@ -4,8 +4,8 @@ use orrin_ecs::World;
 
 use super::textures::{bump_normals, checkerboard, load_rgba, metallic_roughness, sky_equirect};
 use super::{spawn_directional_light, spawn_mesh, spawn_point_light, spawn_spot_light};
-use crate::gfx::{Material, RenderBackend};
-use crate::scene::{Assets, Camera, CpuMesh, MeshBounds, Spin, Transform};
+use crate::gfx::{BlendMode, Material, RenderBackend};
+use crate::scene::{Assets, Camera, CpuMesh, MaterialBlends, MeshBounds, Spin, Transform};
 
 const GRID: i32 = 10;
 const SPACING: f32 = 2.0;
@@ -16,13 +16,14 @@ const SPACING: f32 = 2.0;
 const SWEEP: usize = 5;
 
 pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) {
-    let (assets, mesh_bounds) = load_assets(backend);
+    let (assets, mesh_bounds, material_blends) = load_assets(backend);
 
     let cube = assets.mesh("cube").unwrap();
     let plane = assets.mesh("plane").unwrap();
     let textured = assets.material("textured").unwrap();
     let rock = assets.material("rock").unwrap();
     let ground_material = assets.material("ground").unwrap();
+    let glass = assets.material("glass").unwrap();
     let palette: Vec<_> = ["gold", "copper", "glossy", "clay", "neon"]
         .into_iter()
         .map(|name| assets.material(name).unwrap())
@@ -42,6 +43,7 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
 
     world.insert_resource(assets);
     world.insert_resource(mesh_bounds);
+    world.insert_resource(material_blends);
 
     let half = (GRID - 1) as f32 * SPACING * 0.5;
     let mut index = 0;
@@ -114,6 +116,59 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
         }
     }
 
+    // Three panes at different depths, deliberately intersecting. Two things to
+    // look for: the crossings have no seam, because nothing sorted them; and
+    // nothing pops as the camera orbits, because there is no order to flip.
+    for (index, (x, z, yaw)) in [
+        (-3.0f32, 6.0f32, 0.0f32),
+        (0.0, 7.5, 25.0),
+        (3.0, 6.5, -20.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        spawn_mesh(
+            world,
+            format!("Glass {index}"),
+            Transform {
+                translation: Vec3::new(x, 2.5, z),
+                rotation: glam::Quat::from_rotation_y(yaw.to_radians()),
+                scale: Vec3::new(4.0, 4.0, 0.1),
+            },
+            cube,
+            glass,
+        );
+    }
+
+    // A row of the four extra lobes. Spheres, for the reason the roughness sweep
+    // uses them: a lobe is a shape in angle, and a flat face samples one angle.
+    //
+    // Floating above the sweep rather than beside them, and that is not
+    // decoration. At ground level this row sat behind two rows of
+    // radius-2 spheres and was almost entirely hidden — a readout nobody can see
+    // is not a readout. Up here each one is against the cube grid, which is what
+    // the two refractive ones need behind them to refract at all, and clear of
+    // the sweep's spheres by more than the two radii so nothing intersects.
+    let stride = 2.9;
+    let offset = 2.0 * stride;
+    for (index, name) in ["clearcoat", "velvet", "brushed", "crystal", "frosted"]
+        .into_iter()
+        .enumerate()
+    {
+        let material = world.resource::<Assets>().material(name).unwrap();
+        spawn_mesh(
+            world,
+            name,
+            Transform {
+                translation: Vec3::new(index as f32 * stride - offset, 6.0, 13.0),
+                rotation: glam::Quat::IDENTITY,
+                scale: Vec3::splat(1.2),
+            },
+            sphere,
+            material,
+        );
+    }
+
     let sun_dir = Vec3::new(-0.4, -1.0, -0.6).normalize();
     spawn_directional_light(world, "Sun", sun_dir, Vec3::new(1.0, 0.97, 0.92), 1.0);
 
@@ -163,9 +218,10 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
     });
 }
 
-fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
+fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, MaterialBlends) {
     let mut assets = Assets::new();
     let mut bounds = MeshBounds::default();
+    let mut blends = MaterialBlends::default();
 
     load_mesh(backend, &mut assets, &mut bounds, "cube", &CpuMesh::cube());
     load_mesh(
@@ -235,7 +291,7 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
         ),
     ];
     for (name, material) in palette {
-        assets.insert_material(name, backend.load_material(&material));
+        load_material(backend, &mut assets, &mut blends, name, &material);
     }
 
     // A roughness sweep at both ends of the metallic range: the readout for
@@ -248,24 +304,30 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
         let roughness = step as f32 / (SWEEP - 1) as f32;
         let percent = step * 100 / (SWEEP - 1);
 
-        assets.insert_material(
+        load_material(
+            backend,
+            &mut assets,
+            &mut blends,
             format!("metal_{percent:03}"),
-            backend.load_material(&Material {
+            &Material {
                 base_color: Vec3::new(0.95, 0.93, 0.88),
                 metallic: 1.0,
                 roughness,
                 ..Material::default()
-            }),
+            },
         );
-        assets.insert_material(
+        load_material(
+            backend,
+            &mut assets,
+            &mut blends,
             format!("dielectric_{percent:03}"),
-            backend.load_material(&Material {
+            &Material {
                 base_color: Vec3::splat(0.5),
                 metallic: 0.0,
                 roughness,
                 reflectance: 0.5,
                 ..Material::default()
-            }),
+            },
         );
     }
 
@@ -281,9 +343,12 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
     assets.insert_texture("proc_albedo", albedo);
     assets.insert_texture("proc_normal", normal);
     assets.insert_texture("proc_metal_rough", metal_rough);
-    assets.insert_material(
+    load_material(
+        backend,
+        &mut assets,
+        &mut blends,
         "textured",
-        backend.load_material(&Material {
+        &Material {
             base_color: Vec3::ONE,
             metallic: 1.0,
             roughness: 1.0, // both scaled by the metallic-roughness map
@@ -291,7 +356,7 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
             normal_texture: Some(normal),
             metallic_roughness_texture: Some(metal_rough),
             ..Material::default()
-        }),
+        },
     );
 
     let (px, w, h) = load_rgba(include_bytes!("../../assets/Rocks016_1K-JPG_Color.jpg"));
@@ -303,9 +368,12 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
     assets.insert_texture("rock_albedo", rock_albedo);
     assets.insert_texture("rock_normal", rock_normal);
     assets.insert_texture("rock_rough", rock_rough);
-    assets.insert_material(
+    load_material(
+        backend,
+        &mut assets,
+        &mut blends,
         "rock",
-        backend.load_material(&Material {
+        &Material {
             base_color: Vec3::ONE,
             metallic: 0.0,  // no metallic map; rock is a dielectric
             roughness: 1.0, // driven by the roughness map (green channel)
@@ -313,20 +381,146 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
             normal_texture: Some(rock_normal),
             metallic_roughness_texture: Some(rock_rough),
             ..Material::default()
-        }),
+        },
     );
 
-    assets.insert_material(
+    load_material(
+        backend,
+        &mut assets,
+        &mut blends,
         "ground",
-        backend.load_material(&Material {
+        &Material {
             base_color: Vec3::splat(0.7),
             metallic: 0.0,
             roughness: 0.9,
             ..Material::default()
-        }),
+        },
     );
 
-    (assets, bounds)
+    // Three panes of the same glass, stacked in front of the camera below, so
+    // the overlap is the readout: weighted-blended transparency is
+    // order-independent, and where they cross there must be no seam and no
+    // flicker as the camera moves around them.
+    load_material(
+        backend,
+        &mut assets,
+        &mut blends,
+        "glass",
+        &Material {
+            base_color: Vec3::new(0.6, 0.85, 0.9),
+            alpha: 0.35,
+            blend: BlendMode::Blend,
+            metallic: 0.0,
+            roughness: 0.05,
+            reflectance: 0.9,
+            ..Material::default()
+        },
+    );
+
+    // One material per extra lobe, each authored so the lobe is the only thing
+    // it shows. A material that switched on two of them at once would be a
+    // prettier sphere and a worse test — when it looked wrong there would be
+    // nothing to say which lobe was wrong.
+    for (name, material) in [
+        // Car paint: a rough, dark base under a mirror film. The readout is that
+        // the highlight is *two* highlights of different widths — a coat over a
+        // base of the same roughness is just a brighter base.
+        (
+            "clearcoat",
+            Material {
+                base_color: Vec3::new(0.55, 0.05, 0.08),
+                metallic: 0.0,
+                roughness: 0.6,
+                clearcoat: 1.0,
+                clearcoat_roughness: 0.03,
+                ..Material::default()
+            },
+        ),
+        // Velvet. The readout is the rim: a sheen lobe peaks away from the
+        // normal, so the silhouette is brighter than the centre — which no
+        // amount of roughness on the base lobe can produce.
+        (
+            "velvet",
+            Material {
+                base_color: Vec3::new(0.14, 0.03, 0.10),
+                metallic: 0.0,
+                roughness: 0.95,
+                sheen_color: Vec3::new(0.7, 0.25, 0.45),
+                sheen_roughness: 0.25,
+                ..Material::default()
+            },
+        ),
+        // Brushed metal. The readout is that the highlight is a *streak* along
+        // the tangent rather than a disc, and that it stays a streak in the
+        // environment reflection — the bent normal in `ibl_reflection` is what
+        // that second half tests.
+        (
+            "brushed",
+            Material {
+                base_color: Vec3::new(0.91, 0.92, 0.94),
+                metallic: 1.0,
+                roughness: 0.35,
+                anisotropy: 0.85,
+                ..Material::default()
+            },
+        ),
+        // Solid glass, with a volume rather than a pane: thickness is what bends
+        // the lookup at all, so a zero-thickness version of this refracts
+        // nothing and only proves the queue runs. The green tint arrives through
+        // Beer-Lambert over that thickness rather than through the base colour,
+        // which is what makes the edges of the sphere darker than its middle.
+        (
+            "crystal",
+            Material {
+                base_color: Vec3::ONE,
+                blend: BlendMode::Transmissive,
+                metallic: 0.0,
+                roughness: 0.05,
+                transmission: 1.0,
+                ior: 1.52,
+                thickness: 0.9,
+                attenuation_color: Vec3::new(0.72, 0.94, 0.82),
+                attenuation_distance: 1.5,
+                ..Material::default()
+            },
+        ),
+        // The same glass roughened. Its background comes from a coarser level of
+        // the scene pyramid, so this is the material that says whether that
+        // chain was built at all — a frosted sphere with a sharp world behind it
+        // means the roughness never reached the lookup.
+        (
+            "frosted",
+            Material {
+                base_color: Vec3::ONE,
+                blend: BlendMode::Transmissive,
+                metallic: 0.0,
+                roughness: 0.45,
+                transmission: 1.0,
+                ior: 1.45,
+                thickness: 0.6,
+                ..Material::default()
+            },
+        ),
+    ] {
+        load_material(backend, &mut assets, &mut blends, name, &material);
+    }
+
+    (assets, bounds, blends)
+}
+
+/// Upload a material and register it in both world-side tables at once, so a
+/// material can never reach a draw list without the blend mode extraction sorts
+/// it by — a blended one registered nowhere would draw as an opaque wall.
+fn load_material(
+    backend: &mut impl RenderBackend,
+    assets: &mut Assets,
+    blends: &mut MaterialBlends,
+    name: impl Into<String>,
+    material: &Material,
+) {
+    let handle = backend.load_material(material);
+    assets.insert_material(name, handle);
+    blends.insert(handle, material.blend);
 }
 
 /// Upload a mesh and register it in both world-side tables at once, so a mesh
