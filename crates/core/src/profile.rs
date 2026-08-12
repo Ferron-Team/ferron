@@ -32,6 +32,8 @@ static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
+static GPU_PASSES: AtomicBool = AtomicBool::new(true);
+
 /// Nanoseconds since the profiler's epoch. Also the conversion target for GPU
 /// timestamps, which arrive in device ticks.
 pub fn now_ns() -> u64 {
@@ -46,6 +48,27 @@ pub fn is_enabled() -> bool {
 /// scope. Toggling mid-frame is safe but produces one frame of ragged nesting.
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the *named* GPU passes are timed, as opposed to the frame as a whole.
+///
+/// A second switch because the two costs are nothing alike. The whole-frame pair
+/// is two timestamps and measures the thing anybody actually wants. Per-pass
+/// timing is two more around every node — sixty of them in a full frame — and
+/// each is a `BottomOfPipe` write, which means adjacent independent passes that
+/// the GPU would otherwise overlap are made to drain in sequence. So the
+/// per-pass numbers can be individually right and sum to more than the frame
+/// they came from, and the difference between the whole-frame time with this on
+/// and with it off *is* the overlap the schedule is currently getting.
+///
+/// Gated under [`is_enabled`], not beside it: this narrows GPU collection rather
+/// than replacing it, so switching profiling off switches this off too.
+pub fn gpu_passes_enabled() -> bool {
+    GPU_PASSES.load(Ordering::Relaxed)
+}
+
+pub fn set_gpu_passes_enabled(enabled: bool) {
+    GPU_PASSES.store(enabled, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -3,7 +3,7 @@ use orrin_ecs::World;
 use super::figures;
 use crate::editor::theme;
 use crate::profile::{self, Lane, Profiler, Row};
-use crate::scene::Culling;
+use crate::scene::{Culling, Diagnostics, PresentSettings, VsyncMode};
 use crate::stats::FrameStats;
 
 pub fn body(ui: &mut egui::Ui, world: &World) {
@@ -62,10 +62,88 @@ pub fn body(ui: &mut egui::Ui, world: &World) {
             profile::set_enabled(enabled);
         }
         if enabled {
+            // `vertical` and not `indent`: a tool body draws into whatever `Ui` it
+            // is handed, and egui refuses to indent a horizontal one — which is
+            // exactly the `Ui` `every_tool_body_draws_without_its_own_container`
+            // hands it.
+            ui.vertical(|ui| {
+                let mut passes = profile::gpu_passes_enabled();
+                if ui.checkbox(&mut passes, "Time each GPU pass").changed() {
+                    profile::set_gpu_passes_enabled(passes);
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Off leaves the whole-frame GPU time and drops the table. \
+                         The difference between the two whole-frame numbers is the \
+                         pass overlap the per-pass timestamps prevent.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
             phases(ui, &profiler, Lane::Cpu, "CPU phases", theme::CPU);
             phases(ui, &profiler, Lane::Gpu, "GPU passes", theme::GPU);
         }
     }
+
+    measurement(ui, world);
+}
+
+/// The knobs that move a frame-time number without moving a pixel.
+///
+/// Grouped, and grouped *here* rather than beside the effects they sit next to in
+/// the frame, because they are read together: a figure from this panel means
+/// nothing without them, which is also why the startup banner prints the same
+/// list.
+fn measurement(ui: &mut egui::Ui, world: &World) {
+    ui.add_space(6.0);
+    ui.separator();
+
+    // Open by default, unlike most sections that could be: these are the controls
+    // a frame-time figure has to be read against, and a collapsed one is a value
+    // nobody checked before writing the number down.
+    egui::CollapsingHeader::new("Measurement")
+        .default_open(true)
+        .show(ui, |ui| {
+            if let Some(mut present) = world.get_resource_mut::<PresentSettings>() {
+                let label = |mode: VsyncMode| match mode {
+                    VsyncMode::Fifo => "Fifo (vsync)",
+                    VsyncMode::Mailbox => "Mailbox (uncapped)",
+                    VsyncMode::Immediate => "Immediate (uncapped, tears)",
+                };
+                egui::ComboBox::from_label("Present mode")
+                    .selected_text(label(present.vsync))
+                    .show_ui(ui, |ui| {
+                        for mode in [VsyncMode::Fifo, VsyncMode::Mailbox, VsyncMode::Immediate] {
+                            ui.selectable_value(&mut present.vsync, mode, label(mode));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Immediate is the one to measure in: it never withholds an image, \
+                         so the frame time is the renderer's own rather than a queue depth. \
+                         A mode the surface doesn't support falls back to Fifo.",
+                    );
+
+                ui.add(
+                    egui::Slider::new(&mut present.images, 2..=4).text("Swapchain images"),
+                )
+                .on_hover_text(
+                    "Three is what an uncapped mode wants — with two, the CPU blocks in \
+                     the acquire as soon as one image is queued and the other is being \
+                     drawn. Clamped to what the surface advertises.",
+                );
+            }
+
+            if let Some(mut diagnostics) = world.get_resource_mut::<Diagnostics>() {
+                ui.checkbox(&mut diagnostics.overlay, "Editor overlay (F1)")
+                    .on_hover_text(
+                        "Off takes the editor out of the frame entirely — no UI run, no \
+                         egui input, no overlay pass — so what remains is the scene's own \
+                         cost. F1 brings it back, since this checkbox goes with it.",
+                    );
+            }
+        });
 }
 
 /// One lane's phase table, slowest first.

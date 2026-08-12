@@ -36,6 +36,7 @@ use crate::gfx::{
 use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
+use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 use super::{ShadowFrame, VulkanRenderer};
@@ -123,6 +124,7 @@ pub(crate) mod material_flags {
     pub const SHEEN: u32 = 1 << 1;
     pub const ANISOTROPY: u32 = 1 << 2;
     pub const TRANSMISSION: u32 = 1 << 3;
+    pub const SUBSURFACE: u32 = 1 << 4;
 }
 
 #[derive(vulkano::buffer::BufferContents, Clone, Copy)]
@@ -140,10 +142,17 @@ pub(crate) struct GpuMaterial {
     transmission: [f32; 4], // transmission, thickness, attenuation distance
     /// `rgb` = what the volume absorbs over `transmission[2]`.
     attenuation: [f32; 4],
+    subsurface: [f32; 4], // rgb = scattering tint, a = forward-scatter power
+    /// `rgb` = per-channel mean free path in metres. Separate from the block
+    /// above because the shader wants the tint and the distances at different
+    /// points — the tint weights what comes back, the distances decide how far
+    /// across the image it is allowed to come back from.
+    subsurface_radius: [f32; 4],
     /// [clearcoat, clearcoat normal, sheen, anisotropy].
     tex_indices_ext: [u32; 4],
-    /// [transmission, feature flags, -, -]. The flags ride here rather than in a
-    /// float field so the shader can test them without `floatBitsToUint`.
+    /// [transmission, feature flags, subsurface, -]. The flags ride here rather
+    /// than in a float field so the shader can test them without
+    /// `floatBitsToUint`.
     tex_flags: [u32; 4],
 }
 
@@ -449,7 +458,19 @@ impl ForwardSets {
 
 pub struct ForwardPass {
     pub render_pass: Arc<RenderPass>,
+    /// The same pass with a second colour target and a second resolve, for the
+    /// frame that diffuses subsurface light.
+    ///
+    /// Built alongside the first rather than in place of it, and both kept for
+    /// the whole session. Which one a frame uses is structural — it comes out of
+    /// `FrameConfig` — but a render pass is not something the graph owns, and
+    /// rebuilding this one on a toggle would mean rebuilding every pipeline that
+    /// shares it: this pass's, the skybox's and the debug lines'. Two of each,
+    /// made once, costs three extra pipelines at startup and nothing at all
+    /// afterwards.
+    pub subsurface_render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
+    subsurface_pipeline: Arc<GraphicsPipeline>,
     uniform_buffer_allocator: SubbufferAllocator,
     /// Per-frame storage for the atlas face table. A storage buffer rather than
     /// more of the lighting uniform: forty-eight matrices is three kilobytes,
@@ -498,7 +519,69 @@ impl ForwardPass {
         )
         .unwrap();
 
-        let pipeline = build_pipeline(device, &render_pass);
+        // The second target is `DontCare`/resolve in exactly the shape the first
+        // is, and cleared for one reason: every other pipeline that shares this
+        // render pass — the skybox, the debug lines — masks the channel off rather
+        // than writing to it, so the clear is what a pixel they covered is left
+        // holding. Zero there reads as "nothing scattered here", which is the only
+        // mask the diffusion passes need.
+        let subsurface_render_pass = vulkano::single_pass_renderpass!(
+            device.clone(),
+            attachments: {
+                msaa_color: {
+                    format: color_format,
+                    samples: 4,
+                    load_op: Clear,
+                    store_op: DontCare,
+                },
+                msaa_subsurface: {
+                    format: SUBSURFACE_FORMAT,
+                    samples: 4,
+                    load_op: Clear,
+                    store_op: DontCare,
+                },
+                depth: {
+                    format: DEPTH_FORMAT,
+                    samples: 4,
+                    load_op: Clear,
+                    store_op: DontCare,
+                },
+
+                color: {
+                    format: color_format,
+                    samples: 1,
+                    load_op: DontCare,
+                    store_op: Store,
+                },
+                subsurface: {
+                    format: SUBSURFACE_FORMAT,
+                    samples: 1,
+                    load_op: DontCare,
+                    store_op: Store,
+                },
+            },
+            pass: {
+                color: [msaa_color, msaa_subsurface],
+                color_resolve: [color, subsurface],
+                depth_stencil: {depth},
+            },
+        )
+        .unwrap();
+
+        // One sampler for both pipelines. See `build_pipeline`.
+        let shadow_sampler = super::shadow::comparison_sampler(device);
+        let pipeline = build_pipeline(
+            device,
+            &render_pass,
+            fs::load(device.clone()).unwrap(),
+            &shadow_sampler,
+        );
+        let subsurface_pipeline = build_pipeline(
+            device,
+            &subsurface_render_pass,
+            fs_sss::load(device.clone()).unwrap(),
+            &shadow_sampler,
+        );
 
         let uniform_buffer_allocator = SubbufferAllocator::new(
             memory_allocator.clone(),
@@ -560,7 +643,9 @@ impl ForwardPass {
 
         Self {
             render_pass,
+            subsurface_render_pass,
             pipeline,
+            subsurface_pipeline,
             uniform_buffer_allocator,
             object_buffer_allocator,
             shadow_face_allocator,
@@ -822,6 +907,12 @@ impl ForwardPass {
 
     /// Draw the opaque geometry. `sets` is what
     /// [`begin_frame`](Self::begin_frame) built.
+    /// `subsurface` picks the variant that splits the diffusible radiance into a
+    /// second target. It is the graph's answer, not this pass's — the executor
+    /// reads it off the frame's ids, so the pipeline bound here and the
+    /// framebuffer already bound around it cannot disagree about how many
+    /// attachments there are.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &self,
         builder: &mut AutoCommandBufferBuilder<vulkano::command_buffer::PrimaryAutoCommandBuffer>,
@@ -830,10 +921,16 @@ impl ForwardPass {
         view: &FrameView,
         extent: [u32; 2],
         sets: &ForwardSets,
+        subsurface: bool,
     ) {
         // The jittered one, from the frame's shared view: every pass that
         // rasterises geometry has to agree on it to a subpixel.
         let view_proj = view.view_proj;
+        let pipeline = if subsurface {
+            &self.subsurface_pipeline
+        } else {
+            &self.pipeline
+        };
 
         builder
             .set_viewport(
@@ -847,11 +944,11 @@ impl ForwardPass {
                 .collect(),
             )
             .unwrap()
-            .bind_pipeline_graphics(self.pipeline.clone())
+            .bind_pipeline_graphics(pipeline.clone())
             .unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.pipeline.layout().clone(),
+                pipeline.layout().clone(),
                 0,
                 sets.as_vec(),
             )
@@ -868,7 +965,7 @@ impl ForwardPass {
             let push = PushConstants::new(view_proj, item.material.0, run.start as u32);
 
             builder
-                .push_constants(self.pipeline.layout().clone(), 0, push)
+                .push_constants(pipeline.layout().clone(), 0, push)
                 .unwrap()
                 .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
                 .unwrap()
@@ -972,6 +1069,14 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
     {
         flags |= material_flags::TRANSMISSION;
     }
+    // Deliberately *not* gated on the blend mode, unlike transmission above. The
+    // screen-space diffusion only reaches the opaque queue, but the analytic half
+    // of scattering is a lighting term like any other, so a blended leaf and an
+    // opaque one scatter by the same rule — which is the whole reason
+    // `shading.glsl` is one file.
+    if m.subsurface_color != Vec3::ZERO || m.subsurface_texture.is_some() {
+        flags |= material_flags::SUBSURFACE;
+    }
 
     // Beer-Lambert wants an extinction coefficient per unit distance, and an
     // infinite attenuation distance is the "absorbs nothing" case the shader
@@ -1032,6 +1137,25 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
             m.attenuation_color.z,
             0.0,
         ],
+        subsurface: [
+            m.subsurface_color.x,
+            m.subsurface_color.y,
+            m.subsurface_color.z,
+            // Floored: the lobe is `exp2(power * (cos - 1))`, and a zero power is
+            // a lobe that is one in every direction — forward scattering that
+            // does not fall off is a uniform glow rather than a halo.
+            m.subsurface_forward_scatter.max(1e-3),
+        ],
+        // Clamped away from zero rather than allowed to reach it: every consumer
+        // divides by a mean free path, and a channel that scatters over no
+        // distance at all is the "no scattering" case already expressed by a
+        // black `subsurface_color`.
+        subsurface_radius: [
+            m.subsurface_radius.x.max(1e-6),
+            m.subsurface_radius.y.max(1e-6),
+            m.subsurface_radius.z.max(1e-6),
+            0.0,
+        ],
         tex_indices_ext: [
             m.clearcoat_texture.map_or(WHITE_TEXTURE, |h| h.0),
             m.clearcoat_normal_texture
@@ -1045,10 +1169,34 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
         tex_flags: [
             m.transmission_texture.map_or(WHITE_TEXTURE, |h| h.0),
             flags,
-            0,
+            m.subsurface_texture.map_or(WHITE_TEXTURE, |h| h.0),
             0,
         ],
     }
+}
+
+/// Blend states for a pipeline sharing the forward render pass but writing only
+/// its colour target — the skybox and the debug lines.
+///
+/// The subsurface variant of that render pass has a second colour attachment
+/// those two shaders know nothing about, and Vulkan requires a blend state per
+/// attachment regardless. Leaving the extra one at its default would let them
+/// write whatever their fragment shader happened to leave in an output it never
+/// declared, which is undefined — and the sky covers most of the frame, so the
+/// undefined value would be sitting in the scatter target under every blur tap
+/// near a silhouette. An empty write mask is the whole fix, and unlike disabling
+/// the write it needs no device feature: the attachment keeps its clear, and a
+/// clear of zero is exactly "nothing scattered here".
+pub(super) fn co_tenant_blend_states(subpass: &Subpass) -> ColorBlendState {
+    let mut state = ColorBlendState::with_attachment_states(
+        subpass.num_color_attachments(),
+        ColorBlendAttachmentState::default(),
+    );
+    for attachment in state.attachments.iter_mut().skip(1) {
+        attachment.color_write_mask =
+            vulkano::pipeline::graphics::color_blend::ColorComponents::empty();
+    }
+    state
 }
 
 /// The vertex shader both passes into the lit frame rasterise with. A blended
@@ -1062,12 +1210,28 @@ pub(super) fn vertex_shader(device: &Arc<Device>) -> vulkano::shader::EntryPoint
         .unwrap()
 }
 
-fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+/// Both opaque pipelines, differing only in the fragment shader and the render
+/// pass it targets.
+///
+/// The layout is derived from the stages, so the two come out identical — which is
+/// what has to be true: `oit.rs` and `refraction.rs` build their pipelines from
+/// [`ForwardPass::pipeline_layout`], and the five descriptor sets the executor
+/// binds are bound once for whichever opaque variant ran.
+fn build_pipeline(
+    device: &Arc<Device>,
+    render_pass: &Arc<RenderPass>,
+    fragment: Arc<vulkano::shader::ShaderModule>,
+    // Passed in rather than made here, and that is the whole reason this parameter
+    // exists: Vulkan compares immutable samplers by *identity*, so two calls to
+    // `comparison_sampler` — identical in every field — produce two set-3 layouts
+    // that are not compatible. The executor binds one set of five descriptor sets
+    // for whichever opaque variant ran, so both pipelines have to have been built
+    // around the same sampler object. The same rule `refraction.rs` obeys by
+    // lifting this layout instead of deriving it.
+    shadow_sampler: &Arc<Sampler>,
+) -> Arc<GraphicsPipeline> {
     let vs = vertex_shader(device);
-    let fs = fs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
+    let fs = fragment.entry_point("main").unwrap();
 
     let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
 
@@ -1085,7 +1249,7 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
         .bindings
         .get_mut(&SHADOW_SAMPLER_BINDING)
         .expect("forward.frag must declare the shadow comparison sampler")
-        .immutable_samplers = vec![super::shadow::comparison_sampler(device)];
+        .immutable_samplers = vec![shadow_sampler.clone()];
 
     let layout = PipelineLayout::new(
         device.clone(),
@@ -1140,6 +1304,14 @@ mod fs {
     vulkano_shaders::shader! {
         ty: "fragment",
         path: "shaders/forward.frag",
+        include: ["shaders"],
+    }
+}
+
+mod fs_sss {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "shaders/forward_sss.frag",
         include: ["shaders"],
     }
 }

@@ -125,6 +125,11 @@ pub struct EnvironmentPass {
     prefilter_pipeline: Arc<GraphicsPipeline>,
     equirect_sampler: Arc<Sampler>,
     skybox_pipeline: Arc<GraphicsPipeline>,
+    /// The skybox against the forward pass's subsurface render pass, which has a
+    /// colour attachment more. Both live for the session, for the reason
+    /// [`ForwardPass::subsurface_render_pass`](super::forward::ForwardPass)
+    /// documents.
+    skybox_subsurface_pipeline: Arc<GraphicsPipeline>,
     cube_sampler: Arc<Sampler>,
     /// Bound in place of the prefiltered chain when nothing is loaded.
     fallback_cube: Arc<ImageView>,
@@ -146,12 +151,17 @@ pub struct EnvironmentPass {
 impl EnvironmentPass {
     /// `forward_rp` is the forward pass's render pass: the skybox draws inside
     /// it, after the geometry.
-    pub fn new(ctx: &VkContext, forward_rp: &Arc<RenderPass>) -> Self {
+    pub fn new(
+        ctx: &VkContext,
+        forward_rp: &Arc<RenderPass>,
+        forward_subsurface_rp: &Arc<RenderPass>,
+    ) -> Self {
         let device = &ctx.device;
         let bake_rp = bake_render_pass(device);
         let bake_pipeline = build_bake_pipeline(device, &bake_rp);
         let prefilter_pipeline = build_prefilter_pipeline(device, &bake_rp);
         let skybox_pipeline = build_skybox_pipeline(device, forward_rp);
+        let skybox_subsurface_pipeline = build_skybox_pipeline(device, forward_subsurface_rp);
 
         // Repeat in u so the seam wraps, clamp in v so the poles do not fold
         // across to the opposite hemisphere.
@@ -185,6 +195,7 @@ impl EnvironmentPass {
             prefilter_pipeline,
             equirect_sampler,
             skybox_pipeline,
+            skybox_subsurface_pipeline,
             fallback_cube: white_cube(ctx),
             cube_sampler,
             cube: None,
@@ -288,6 +299,7 @@ impl EnvironmentPass {
         view: &FrameView,
         extent: [u32; 2],
         settings: &EnvironmentSettings,
+        subsurface: bool,
     ) {
         let Some(cube) = self.cube.clone() else {
             return;
@@ -296,9 +308,16 @@ impl EnvironmentPass {
             return;
         }
 
+        // Whichever render pass the executor opened around this call.
+        let pipeline = if subsurface {
+            &self.skybox_subsurface_pipeline
+        } else {
+            &self.skybox_pipeline
+        };
+
         let set = DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
-            self.skybox_pipeline.layout().set_layouts()[0].clone(),
+            pipeline.layout().set_layouts()[0].clone(),
             [
                 WriteDescriptorSet::image_view(0, cube),
                 WriteDescriptorSet::sampler(1, self.cube_sampler.clone()),
@@ -331,17 +350,17 @@ impl EnvironmentPass {
                 .collect(),
             )
             .unwrap()
-            .bind_pipeline_graphics(self.skybox_pipeline.clone())
+            .bind_pipeline_graphics(pipeline.clone())
             .unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.skybox_pipeline.layout().clone(),
+                pipeline.layout().clone(),
                 0,
                 vec![set],
             )
             .unwrap()
             .push_constants(
-                self.skybox_pipeline.layout().clone(),
+                pipeline.layout().clone(),
                 0,
                 SkyboxPush {
                     inv_view_rot_proj: matrix.to_cols_array_2d(),
@@ -897,10 +916,12 @@ fn build_skybox_pipeline(
                 }),
                 ..Default::default()
             }),
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
-                ColorBlendAttachmentState::default(),
-            )),
+            // Masked past the first attachment: this shader declares one output,
+            // and the subsurface render pass has two. The sky covers most of the
+            // frame, so an undeclared output left unmasked would be undefined data
+            // sitting under every blur tap near a silhouette — see
+            // `co_tenant_blend_states`.
+            color_blend_state: Some(super::forward::co_tenant_blend_states(&subpass)),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
             subpass: Some(subpass.into()),
             ..GraphicsPipelineCreateInfo::layout(layout)

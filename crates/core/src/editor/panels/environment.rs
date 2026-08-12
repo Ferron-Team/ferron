@@ -6,7 +6,7 @@ use super::{color_row, vec3_row};
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, ContactShadowSettings, DofSettings, EnvironmentSettings,
     FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings,
-    SsrSettings, TaaSettings, TransparencySettings,
+    SsrSettings, SubsurfaceSettings, TaaSettings, TransparencySettings,
 };
 
 type Column = fn(&mut egui::Ui, &World);
@@ -107,6 +107,36 @@ fn screen_space_column(ui: &mut egui::Ui, world: &World) {
         );
         ui.add(egui::Slider::new(&mut ssr.max_steps, 8..=128).text("Steps"))
             .on_hover_text("A step crosses a whole cell of the depth pyramid, not a texel");
+    }
+    ui.add_space(6.0);
+    ui.strong("Subsurface scattering")
+        .on_hover_text("Light that enters a surface, scatters inside it and leaves somewhere else");
+    {
+        let mut subsurface = world.resource_mut::<SubsurfaceSettings>();
+        // Frame structure, and more of it than the rest: this switch decides which
+        // of the two forward render passes the frame opens, so it registers three
+        // passes *and* a second colour attachment. It is also one more reason the
+        // prepass exists — the blur weights its taps by depth.
+        ui.checkbox(&mut subsurface.enabled, "Screen-space diffusion")
+            .on_hover_text(
+                "Off keeps scattering: the analytic wrap widens to stand in for these passes",
+            );
+        ui.add(
+            egui::Slider::new(&mut subsurface.max_radius, 4.0..=128.0)
+                .logarithmic(true)
+                .text("Max radius")
+                .suffix(" px"),
+        )
+        .on_hover_text(
+            "A performance clamp. The physical width comes from the material's mean free path",
+        );
+        // Three sliders rather than a colour picker: these are distances, not a
+        // colour, and the widest is pinned at one by construction — only the
+        // ratios reach the shader.
+        ui.add(egui::Slider::new(&mut subsurface.profile.x, 0.0..=1.0).text("Red reach"));
+        ui.add(egui::Slider::new(&mut subsurface.profile.y, 0.0..=1.0).text("Green reach"));
+        ui.add(egui::Slider::new(&mut subsurface.profile.z, 0.0..=1.0).text("Blue reach"))
+            .on_hover_text("How far each channel travels, relative to the furthest");
     }
     ui.add_space(6.0);
     ui.strong("Transparency")

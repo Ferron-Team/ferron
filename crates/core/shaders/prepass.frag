@@ -37,6 +37,8 @@ struct GpuMaterial {
     vec4 anisotropy;
     vec4 transmission;
     vec4 attenuation;
+    vec4 subsurface;
+    vec4 subsurface_radius;
     uvec4 tex_indices_ext;
     uvec4 tex_flags;
 };

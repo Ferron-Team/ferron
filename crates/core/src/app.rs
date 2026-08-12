@@ -26,9 +26,9 @@ use crate::profile_scope;
 use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene};
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, ContactShadowSettings, Culling, DebugLine, DebugLines,
-    DofSettings, EnvironmentSettings, FogSettings, HdrSettings, InputState, LogBuffer, LogLevel,
-    MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, TaaSettings,
-    Time, TransparencySettings, load_hdri,
+    Diagnostics, DofSettings, EnvironmentSettings, FogSettings, HdrSettings, InputState, LogBuffer,
+    LogLevel, MotionBlurSettings, PresentSettings, RefractionSettings, ShadowSettings, SsaoSettings,
+    SsrSettings, SubsurfaceSettings, TaaSettings, Time, TransparencySettings, load_hdri,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -200,6 +200,7 @@ impl App {
         world.insert_resource(AmbientLight::default());
         world.insert_resource(SsaoSettings::default());
         world.insert_resource(SsrSettings::default());
+        world.insert_resource(SubsurfaceSettings::default());
         world.insert_resource(TransparencySettings::default());
         world.insert_resource(RefractionSettings::default());
         world.insert_resource(ShadowSettings::default());
@@ -222,6 +223,8 @@ impl App {
             hdri,
             ..Default::default()
         });
+        world.insert_resource(PresentSettings::default());
+        world.insert_resource(Diagnostics::default());
         world.insert_resource(FrameStats::new());
         world.insert_resource(Profiler::default());
         world.insert_resource(InputState::new());
@@ -363,8 +366,12 @@ impl ApplicationHandler for App {
         );
         let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
         let size = window.inner_size();
-        let mut renderer =
-            VulkanRenderer::new(&self.instance, surface.clone(), [size.width, size.height]);
+        let mut renderer = VulkanRenderer::new(
+            &self.instance,
+            surface.clone(),
+            [size.width, size.height],
+            *self.world.resource::<PresentSettings>(),
+        );
 
         build_default_scene(&mut self.world, &mut renderer);
         if let Some(spec) = self.stress {
@@ -392,6 +399,8 @@ impl ApplicationHandler for App {
             self.project.as_ref(),
         );
 
+        print_run_banner(&self.world, &renderer);
+
         self.active = Some(Active {
             window,
             renderer,
@@ -409,10 +418,30 @@ impl ApplicationHandler for App {
             return;
         };
 
+        // Ahead of egui, and it has to be: the switch this answers is the one that
+        // takes egui out of the frame, so it cannot be a key egui is asked about
+        // first. F1 rather than a checkbox for the same reason — a UI that is off
+        // cannot offer the control that turns it back on.
+        if pressed_overlay_toggle(&event) {
+            let mut diagnostics = self.world.resource_mut::<Diagnostics>();
+            diagnostics.overlay = !diagnostics.overlay;
+        }
+        let overlay_on = self.world.resource::<Diagnostics>().overlay;
+
         // The editor sees events first; when it doesn't want one, the camera
         // controller and the script-facing InputState may. All three apply the
         // same egui gate.
-        let egui_wants = active.editor.on_window_event(&event);
+        //
+        // Skipped entirely with the overlay off, and not merely ignored: egui
+        // accumulates window events into the input it hands over at the start of
+        // each frame, so feeding a UI that never runs one is an unbounded queue as
+        // well as work nobody reads. It also means "overlay off" measures the
+        // editor's absence rather than its silence.
+        let egui_wants = if overlay_on {
+            active.editor.on_window_event(&event)
+        } else {
+            false
+        };
         self.world
             .resource_mut::<InputState>()
             .on_window_event(&event, egui_wants);
@@ -518,7 +547,14 @@ impl ApplicationHandler for App {
                 }
 
                 // Before extraction: the UI may spawn/despawn/edit entities.
-                {
+                //
+                // Not run at all with the overlay off. That is deliberate and it
+                // is the whole measurement: `Editor::run` opens an egui pass that
+                // only `Editor::draw` closes, so running one without drawing it
+                // would leave the pass unbalanced — and the UI's own layout and
+                // tessellation are most of what the editor costs, so skipping the
+                // draw alone would answer a question nobody asked.
+                if overlay_on {
                     profile_scope!("editor");
                     active.editor.run(&mut self.world, &self.registry);
                 }
@@ -591,6 +627,7 @@ impl ApplicationHandler for App {
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let contact_shadows = *self.world.resource::<ContactShadowSettings>();
                 let ssr = *self.world.resource::<SsrSettings>();
+                let subsurface = *self.world.resource::<SubsurfaceSettings>();
                 let transparency = *self.world.resource::<TransparencySettings>();
                 let refraction = *self.world.resource::<RefractionSettings>();
                 let taa = *self.world.resource::<TaaSettings>();
@@ -619,10 +656,20 @@ impl ApplicationHandler for App {
                 let profiler_frame = self.world.resource::<Profiler>().frame_index();
                 let dt = self.world.resource::<Time>().delta_time();
 
+                // Asked for every frame rather than only on a change: the renderer
+                // compares against what it applied and recreates the swapchain
+                // only when the two differ, so this is a comparison and not a
+                // teardown.
+                active
+                    .renderer
+                    .set_present(*self.world.resource::<PresentSettings>());
+
                 let Active {
                     renderer, editor, ..
                 } = active;
-                let mut overlay = |before, image| editor.draw(before, image);
+                let mut draw_overlay = |before, image| editor.draw(before, image);
+                let overlay: Option<crate::gfx::vulkan::Overlay<'_>> =
+                    if overlay_on { Some(&mut draw_overlay) } else { None };
                 {
                     profile_scope!("render submit");
                     // Borrowed once here: `ShadowFrame` holds `DrawList`s into
@@ -640,6 +687,7 @@ impl ApplicationHandler for App {
                         &ssao,
                         &contact_shadows,
                         &ssr,
+                        &subsurface,
                         &transparency,
                         &refraction,
                         &taa,
@@ -664,7 +712,7 @@ impl ApplicationHandler for App {
                                 settings: &shadow_settings,
                             }
                         }),
-                        &mut overlay,
+                        overlay,
                     );
                 }
 
@@ -714,6 +762,66 @@ impl ApplicationHandler for App {
             active.window.request_redraw();
         }
     }
+}
+
+/// Whether this event is the press that toggles the editor overlay.
+///
+/// Read off the raw winit event rather than through [`InputState`], because that
+/// table is the one C# `KeyCode` mirrors field for field — an editor keybind is
+/// no reason to grow a scripting ABI.
+fn pressed_overlay_toggle(event: &WindowEvent) -> bool {
+    use winit::event::{ElementState, KeyEvent};
+    use winit::keyboard::{KeyCode, PhysicalKey};
+
+    matches!(
+        event,
+        WindowEvent::KeyboardInput {
+            event: KeyEvent {
+                physical_key: PhysicalKey::Code(KeyCode::F1),
+                state: ElementState::Pressed,
+                repeat: false,
+                ..
+            },
+            ..
+        }
+    )
+}
+
+/// Print what this run measures with, once, at startup.
+///
+/// Every one of these changes a frame-time number without changing a pixel, so a
+/// figure quoted without them is not reproducible: a debug build with validation
+/// on and a release build with it off differ by more than most of the work in the
+/// renderer. The banner exists so a pasted log is a complete description of the
+/// run it came from.
+fn print_run_banner(world: &World, renderer: &VulkanRenderer) {
+    let present = match renderer.applied_present() {
+        Some((mode, images)) => format!("{mode:?}, {images} images"),
+        None => "offscreen".to_string(),
+    };
+    let extent = renderer.extent();
+
+    println!(
+        "Run config: {} build | debug assertions {} | validation {} | present {} | \
+         {}x{} | MSAA {:?} | overlay {} | GPU pass timings {}",
+        if cfg!(debug_assertions) {
+            "unoptimised"
+        } else {
+            "optimised"
+        },
+        on_off(cfg!(debug_assertions)),
+        on_off(should_validate()),
+        present,
+        extent[0],
+        extent[1],
+        crate::gfx::vulkan::MSAA_SAMPLES,
+        on_off(world.resource::<Diagnostics>().overlay),
+        on_off(crate::profile::gpu_passes_enabled()),
+    );
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
 }
 
 const VALIDATION_LAYER: &str = "VK_LAYER_KHRONOS_validation";

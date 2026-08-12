@@ -11,7 +11,7 @@ use crate::geom::Aabb;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
     HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, RefractionSettings, SsaoSettings,
-    SsrSettings, TaaSettings, TransparencySettings,
+    SsrSettings, SubsurfaceSettings, TaaSettings, TransparencySettings,
 };
 use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
@@ -347,9 +347,16 @@ pub struct Material {
     /// Index of refraction, `1.5` for glass. Drives both the Fresnel term and
     /// how far the refraction pass bends its lookup.
     pub ior: f32,
-    /// Thickness of the volume behind the surface, in local units. Zero makes it
-    /// a *thin* surface — a window pane, refracting but with no interior to
-    /// travel through — which is why it is the default.
+    /// Thickness of the volume behind the surface, in metres. Zero makes it a
+    /// *thin* surface — a window pane, refracting but with no interior to travel
+    /// through — which is why it is the default.
+    ///
+    /// Read by the subsurface block below as well, and it has to be the same
+    /// number: how far light travels inside a wax block before it leaves is the
+    /// question both a refracted ray and a scattered one are asking. That is also
+    /// why an opaque material with subsurface scattering wants this authored —
+    /// the default zero is a surface with no interior, and nothing transmits
+    /// through one.
     pub thickness: f32,
     /// What the volume absorbs, Beer-Lambert, over `attenuation_distance`. White
     /// is a clear medium.
@@ -357,8 +364,36 @@ pub struct Material {
     /// The distance at which `attenuation_color` is reached. Infinite for a
     /// medium that never absorbs.
     pub attenuation_distance: f32,
-    /// `r` = transmission, `g` = thickness, multiplying the two above.
+    /// `r` = transmission, `g` = thickness, multiplying the two above. The green
+    /// channel is the thickness map for the subsurface block too, for the reason
+    /// [`Self::thickness`] is shared.
     pub transmission_texture: Option<TextureHandle>,
+
+    /// Tint of the light that entered the surface, bounced around inside it and
+    /// came back out. Black for none.
+    ///
+    /// A colour rather than a scalar, and that is the whole feature: what returns
+    /// has travelled through a medium that absorbed some wavelengths more than
+    /// others, so an ear lit from behind is red rather than bright. A surface
+    /// without this term reflects everything at the boundary it arrived at, which
+    /// is precisely what makes skin, leaves, wax and marble read as plastic.
+    pub subsurface_color: Vec3,
+    /// How far light travels inside the medium before it has scattered away, per
+    /// channel, in **metres** — one world unit, as everywhere else.
+    ///
+    /// Per channel because it must be: one distance scatters every wavelength the
+    /// same way and produces a grey blur, and the reason skin looks like skin is
+    /// that red reaches several times further than blue. Sets both the width of
+    /// the screen-space diffusion and, where that pass is not running, the width
+    /// of the wrapped diffuse standing in for it.
+    pub subsurface_radius: Vec3,
+    /// Tightness of the forward-scattering lobe — what a leaf or an ear shows
+    /// when the light is behind it and the camera is nearly looking into it.
+    /// Higher is a narrower halo.
+    pub subsurface_forward_scatter: f32,
+    /// `rgb` multiplies `subsurface_color`, so a face can scatter through thin
+    /// skin and not through an eyebrow.
+    pub subsurface_texture: Option<TextureHandle>,
 }
 
 impl Default for Material {
@@ -399,6 +434,17 @@ impl Default for Material {
             attenuation_color: Vec3::ONE,
             attenuation_distance: f32::INFINITY,
             transmission_texture: None,
+
+            subsurface_color: Vec3::ZERO,
+            // Only read once `subsurface_color` is non-black, so — like
+            // `clearcoat_roughness` above — these are what scattering looks like
+            // the moment it is switched on rather than values that do nothing.
+            // Skin's mean free paths, a few millimetres of red down to about one
+            // of blue, which is also close enough to marble and wax to be a
+            // sensible thing to start from and tune.
+            subsurface_radius: Vec3::new(0.0048, 0.0017, 0.0011),
+            subsurface_forward_scatter: 12.0,
+            subsurface_texture: None,
         }
     }
 }
@@ -461,6 +507,7 @@ pub trait RenderBackend {
         ssao: &SsaoSettings,
         contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
+        subsurface: &SubsurfaceSettings,
         transparency: &TransparencySettings,
         refraction: &RefractionSettings,
         taa: &TaaSettings,

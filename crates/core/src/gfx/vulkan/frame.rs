@@ -30,6 +30,7 @@ use super::prepass::{MATERIAL_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT};
 use super::refraction::{ACCUM_FORMAT as REFRACTION_ACCUM_FORMAT, SCENE_LEVELS};
 use super::ssao::AO_FORMAT;
 use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
+use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 
 /// What a frame's structure depends on. A change to any of these recompiles the
@@ -49,6 +50,16 @@ pub struct FrameConfig {
     /// another consumer that can keep the geometry prepass alive on its own —
     /// it reads depth, normals and the material target the prepass writes.
     pub ssr: bool,
+    /// Whether the frame diffuses subsurface light across the image. Structural
+    /// twice over, and more deeply than the rest: it registers three passes, it is
+    /// another consumer that keeps the geometry prepass alive on its own, and it
+    /// decides which of the two forward *render passes* the frame opens — the one
+    /// that resolves a second colour target or the one that does not.
+    ///
+    /// That last part is why the shading is a second fragment shader rather than a
+    /// branch. Off, the analytic wrap in `shading.glsl` widens to stand in for the
+    /// diffusion, so scattering does not disappear with the passes.
+    pub subsurface: bool,
     /// Whether the frame resolves against a reprojected history. Structural
     /// twice over: it registers the resolve node, and it is what makes the
     /// geometry prepass exist in a frame that has SSAO switched off — the
@@ -124,6 +135,14 @@ pub enum PassBody {
     SsrTrace,
     /// Upsamples those rays and swaps the environment's reflection for them.
     SsrResolve,
+    /// One axis of the subsurface diffusion each, sharing a pipeline and differing
+    /// only in the direction they are pushed — the same shape the bloom chain's
+    /// levels take.
+    SubsurfaceBlurHorizontal,
+    SubsurfaceBlurVertical,
+    /// Adds the diffused radiance back into the frame the forward pass withheld it
+    /// from.
+    SubsurfaceComposite,
     /// Every blended surface, into the two targets whose blend equations
     /// commute — which is what makes the draw order irrelevant.
     OitAccumulate,
@@ -203,6 +222,10 @@ pub struct FrameIds {
     /// else to name.
     pub contact_shadows: Option<ResourceId>,
     pub ssr: Option<SsrIds>,
+    /// Present exactly when the frame runs the diffusion — which is also how the
+    /// executor knows to bind the forward pass's second pipeline, so the
+    /// framebuffer and the pipeline cannot disagree about the attachment count.
+    pub subsurface: Option<SubsurfaceIds>,
     pub transparency: Option<TransparencyIds>,
     pub refraction: Option<RefractionIds>,
     pub taa: Option<TaaIds>,
@@ -288,6 +311,30 @@ pub struct SsrIds {
     /// Half the frame: the radiance each ray found, with its confidence in
     /// alpha.
     pub rays: ResourceId,
+    pub output: ResourceId,
+}
+
+/// Subsurface scattering's targets: the one the forward pass resolves into, the
+/// two the separable blur ping-pongs through, and what the composite was handed.
+///
+/// `msaa_diffusible` and `diffusible` are a second colour attachment and a second
+/// resolve on the forward pass, in the same shape as its first pair. That is the
+/// price of the feature and the reason it is structural: a frame without it
+/// declares neither.
+#[derive(Clone, Copy, Debug)]
+pub struct SubsurfaceIds {
+    pub source: ResourceId,
+    pub msaa_diffusible: ResourceId,
+    /// `rgb` = the radiance that left the surface elsewhere, `a` = the widest
+    /// channel's mean free path in metres. The alpha is the only mask the passes
+    /// need, so nothing else carries one.
+    pub diffusible: ResourceId,
+    /// The horizontal axis's result, and the vertical's. Two images rather than
+    /// one, because a resource is unversioned: a pass that read and wrote the same
+    /// one would make "readers after all writers" point both ways and `compile`
+    /// would report a cycle.
+    pub blurred_x: ResourceId,
+    pub blurred_y: ResourceId,
     pub output: ResourceId,
 }
 
@@ -494,6 +541,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // texture.
     let prepass = (config.ssao
         || config.contact_shadows
+        || config.subsurface
         || config.taa
         || config.motion_blur
         || config.dof
@@ -571,6 +619,19 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         mask
     });
 
+    // Declared before the pass that writes them, because the forward pass has to
+    // declare them as attachments: a second colour target and its resolve, in the
+    // same shape as the frame's first pair, and only in a frame that diffuses.
+    let subsurface_targets = config.subsurface.then(|| {
+        (
+            builder.create_image(
+                "msaa_subsurface",
+                ImageDesc::new(SUBSURFACE_FORMAT).samples(MSAA_SAMPLES),
+            ),
+            builder.create_image("subsurface_diffusible", ImageDesc::new(SUBSURFACE_FORMAT)),
+        )
+    });
+
     let mut forward = builder
         .pass("forward", PassKind::Inline)
         .access(object_transforms, Access::StorageRead);
@@ -586,12 +647,74 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     if let Some(atlas) = shadow_atlas {
         forward = forward.access(atlas, Access::Sampled);
     }
-    let id = forward
+    forward = forward
         .access(msaa_hdr, Access::ColorAttachment)
         .access(msaa_depth, Access::DepthAttachment)
-        .access(hdr_color, Access::ResolveAttachment)
-        .build();
+        .access(hdr_color, Access::ResolveAttachment);
+    // Between the first colour attachment and its resolve in the render pass's
+    // own declaration order, but the graph does not care about order — only that
+    // an attachment declared here is one the framebuffer binds. `PassFramebuffers`
+    // is what keeps the two lists in step.
+    if let Some((msaa_diffusible, diffusible)) = subsurface_targets {
+        forward = forward
+            .access(msaa_diffusible, Access::ColorAttachment)
+            .access(diffusible, Access::ResolveAttachment);
+    }
+    let id = forward.build();
     record(id, PassBody::Forward, &mut bodies);
+
+    // Immediately after shading and before everything that reads the lit frame.
+    // Both halves of that placement are load-bearing: there is nothing to diffuse
+    // until the surface has been lit, and the reflections, the blended queue and
+    // the refractive queue all sample the frame's colour — a face that scatters
+    // should scatter in a mirror beside it too, and the only way to get that for
+    // free is to be the frame those passes are handed.
+    let subsurface = subsurface_targets.map(|(msaa_diffusible, diffusible)| {
+        let prepass = prepass.expect("subsurface diffusion reads the geometry prepass");
+        let blurred_x =
+            builder.create_image("subsurface_blur_x", ImageDesc::new(SUBSURFACE_FORMAT));
+        let blurred_y =
+            builder.create_image("subsurface_blur_y", ImageDesc::new(SUBSURFACE_FORMAT));
+        let output = builder.create_image("subsurface_color", ImageDesc::new(HDR_FORMAT));
+
+        let id = builder
+            .pass("subsurface_blur_x", PassKind::Compute)
+            .access(diffusible, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(blurred_x, Access::StorageWrite)
+            .build();
+        record(id, PassBody::SubsurfaceBlurHorizontal, &mut bodies);
+
+        let id = builder
+            .pass("subsurface_blur_y", PassKind::Compute)
+            .access(blurred_x, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(blurred_y, Access::StorageWrite)
+            .build();
+        record(id, PassBody::SubsurfaceBlurVertical, &mut bodies);
+
+        let id = builder
+            .pass("subsurface_composite", PassKind::Compute)
+            .access(hdr_color, Access::Sampled)
+            .access(blurred_y, Access::Sampled)
+            .access(output, Access::StorageWrite)
+            .build();
+        record(id, PassBody::SubsurfaceComposite, &mut bodies);
+
+        SubsurfaceIds {
+            source: hdr_color,
+            msaa_diffusible,
+            diffusible,
+            blurred_x,
+            blurred_y,
+            output,
+        }
+    });
+
+    // What everything downstream treats as the lit frame. Named once, so inserting
+    // a stage here is a change to this binding rather than to every consumer — the
+    // same rule `scene_color` follows at the end of the optical chain.
+    let lit_color = subsurface.map_or(hdr_color, |ids| ids.output);
 
     // Between shading and the temporal resolve, and it has to be both: a ray can
     // only sample radiance that has been lit, and one ray per pixel is noise
@@ -600,7 +723,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // history of its own.
     let ssr = config.ssr.then(|| {
         let prepass = prepass.expect("screen-space reflections read the geometry prepass");
-        let source = hdr_color;
+        let source = lit_color;
 
         // One image carrying the whole pyramid rather than one per level, which
         // is what lets the trace pick a level per step with `textureLod`. The
@@ -682,7 +805,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // What the temporal resolve accumulates, and what the optical chain starts
     // from in a frame with no resolve: the reflections' output where they ran,
     // and the forward pass's own target where they did not.
-    let mut shaded = ssr.map_or(hdr_color, |ssr| ssr.output);
+    let mut shaded = ssr.map_or(lit_color, |ssr| ssr.output);
 
     // After the reflections and before the resolve, and both halves matter.
     //
@@ -1188,6 +1311,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             ssao,
             contact_shadows,
             ssr,
+            subsurface,
             transparency,
             refraction,
             taa,

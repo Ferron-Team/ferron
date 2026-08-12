@@ -243,14 +243,31 @@ impl PassFramebuffers {
                             ),
                         ],
                     ),
-                    PassBody::Forward => (
-                        forward.render_pass.clone(),
-                        vec![
-                            images.view(ids.msaa_hdr),
-                            images.view(ids.msaa_depth),
-                            images.view(ids.hdr_color),
-                        ],
-                    ),
+                    // Two shapes, and which one is a property of the graph: the
+                    // frame that diffuses subsurface light resolves a second
+                    // colour target, so it opens the render pass that has one.
+                    // The attachment order is the order each render pass
+                    // *declares*, not the order the graph accessed them in.
+                    PassBody::Forward => match ids.subsurface {
+                        Some(sss) => (
+                            forward.subsurface_render_pass.clone(),
+                            vec![
+                                images.view(ids.msaa_hdr),
+                                images.view(sss.msaa_diffusible),
+                                images.view(ids.msaa_depth),
+                                images.view(ids.hdr_color),
+                                images.view(sss.diffusible),
+                            ],
+                        ),
+                        None => (
+                            forward.render_pass.clone(),
+                            vec![
+                                images.view(ids.msaa_hdr),
+                                images.view(ids.msaa_depth),
+                                images.view(ids.hdr_color),
+                            ],
+                        ),
+                    },
                     // The prepass depth as the third attachment, read-only —
                     // the one image in this frame two render passes attach.
                     PassBody::OitAccumulate => {
@@ -321,6 +338,9 @@ impl PassFramebuffers {
                     | PassBody::SsrSource
                     | PassBody::SsrTrace
                     | PassBody::SsrResolve
+                    | PassBody::SubsurfaceBlurHorizontal
+                    | PassBody::SubsurfaceBlurVertical
+                    | PassBody::SubsurfaceComposite
                     | PassBody::OitComposite
                     | PassBody::RefractionScene
                     | PassBody::RefractionComposite
@@ -361,7 +381,7 @@ impl PassFramebuffers {
 /// How each pass's attachments start the frame. `None` means "leave it": for the
 /// resolve target and the swapchain image, every pixel is written anyway, so
 /// clearing first is bandwidth spent on values nothing reads.
-pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
+pub(super) fn clear_values(body: PassBody, attachments: usize) -> Vec<Option<ClearValue>> {
     match body {
         // Flat +Z in the normal buffer, no motion in the velocity buffer, far in
         // depth. Zero velocity is what the sky and any unrasterised pixel are
@@ -381,6 +401,22 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         // 1.0 = fully lit, for the same reason: the pass writes every pixel, so
         // this only decides what a pixel would be if it somehow did not.
         PassBody::ContactShadows => vec![Some([1.0, 0.0, 0.0, 0.0].into())],
+        // Two shapes, told apart by the framebuffer rather than by a second pass
+        // body: the two differ in their attachments and in nothing else, so a
+        // variant here would have to be threaded through every exhaustive match
+        // in the executor to say something the framebuffer already says.
+        //
+        // The diffusible target is cleared to zero, and that clear is the feature's
+        // mask: the skybox and the debug lines share this render pass and write
+        // nothing to that attachment, so zero is what a pixel they covered holds —
+        // and a zero radius is exactly "nothing scattered here".
+        PassBody::Forward if attachments == 5 => vec![
+            Some([0.02, 0.02, 0.03, 1.0].into()),
+            Some([0.0, 0.0, 0.0, 0.0].into()),
+            Some(1.0.into()),
+            None,
+            None,
+        ],
         PassBody::Forward => vec![Some([0.02, 0.02, 0.03, 1.0].into()), Some(1.0.into()), None],
         // Nothing accumulated, and everything revealed. The second is the one
         // that matters: revealage is a running *product* of `1 - alpha`, so a
@@ -396,6 +432,10 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         // what makes it an `over` of nothing instead of a black wall.
         PassBody::RefractionDraw => vec![Some([0.0, 0.0, 0.0, 0.0].into()), None],
         PassBody::Tonemap => vec![None],
+        // Dispatches, so there is no render pass to clear anything in.
+        PassBody::SubsurfaceBlurHorizontal
+        | PassBody::SubsurfaceBlurVertical
+        | PassBody::SubsurfaceComposite => Vec::new(),
         // No render pass, so nothing to clear.
         PassBody::Overlay
         | PassBody::SsrHiz
@@ -427,7 +467,7 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
 
 pub(super) fn begin_info(framebuffer: Arc<Framebuffer>, body: PassBody) -> RenderPassBeginInfo {
     RenderPassBeginInfo {
-        clear_values: clear_values(body),
+        clear_values: clear_values(body, framebuffer.attachments().len()),
         ..RenderPassBeginInfo::framebuffer(framebuffer)
     }
 }

@@ -15,7 +15,7 @@ use crate::gfx::{DrawList, Material, RenderBackend, SceneLighting, TextureHandle
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
     HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, RefractionSettings, SsaoSettings,
-    SsrSettings, TaaSettings, TransparencySettings,
+    SsrSettings, SubsurfaceSettings, TaaSettings, TransparencySettings,
 };
 
 /// Counts uploads and derives mesh bounds; does no GPU work of any kind.
@@ -83,6 +83,7 @@ impl RenderBackend for HeadlessBackend {
         _ssao: &SsaoSettings,
         _contact_shadows: &ContactShadowSettings,
         _ssr: &SsrSettings,
+        _subsurface: &SubsurfaceSettings,
         _transparency: &TransparencySettings,
         _refraction: &RefractionSettings,
         _taa: &TaaSettings,

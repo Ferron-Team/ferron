@@ -21,7 +21,11 @@
 layout(location = 0) out vec4 f_color;
 
 void main() {
-    vec4 surface = shade_surface();
+    Shaded shaded = shade_surface();
+    // Summed for the reason `oit.frag` sums: this queue is not in the prepass the
+    // diffusion passes read, so the wrapped diffuse is the whole of the effect
+    // here.
+    vec4 surface = vec4(shaded.color + shaded.diffusible, shaded.alpha);
 
     // Contributes nothing, and a zero-coverage fragment leaves the premultiplied
     // blend below an exact no-op anyway — the same early-out `oit.frag` makes.

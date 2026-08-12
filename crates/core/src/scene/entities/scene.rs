@@ -140,7 +140,7 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
         );
     }
 
-    // A row of the four extra lobes. Spheres, for the reason the roughness sweep
+    // A row of the extra lobes. Spheres, for the reason the roughness sweep
     // uses them: a lobe is a shape in angle, and a flat face samples one angle.
     //
     // Floating above the sweep rather than beside them, and that is not
@@ -149,12 +149,20 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
     // is not a readout. Up here each one is against the cube grid, which is what
     // the two refractive ones need behind them to refract at all, and clear of
     // the sweep's spheres by more than the two radii so nothing intersects.
+    let row = [
+        "clearcoat",
+        "velvet",
+        "brushed",
+        "crystal",
+        "frosted",
+        "marble",
+        "wax",
+    ];
     let stride = 2.9;
-    let offset = 2.0 * stride;
-    for (index, name) in ["clearcoat", "velvet", "brushed", "crystal", "frosted"]
-        .into_iter()
-        .enumerate()
-    {
+    // Centred on the row's own length rather than on a constant, so adding a lobe
+    // is one more name above instead of two numbers that have to agree.
+    let offset = (row.len() - 1) as f32 * 0.5 * stride;
+    for (index, name) in row.into_iter().enumerate() {
         let material = world.resource::<Assets>().material(name).unwrap();
         spawn_mesh(
             world,
@@ -513,6 +521,49 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Materia
                 transmission: 1.0,
                 ior: 1.45,
                 thickness: 0.6,
+                ..Material::default()
+            },
+        ),
+        // Marble: a solid body whose mean free path is millimetres against a
+        // sphere that is metres. So the readout here is *not* light coming
+        // through — `exp(-0.6 / 0.012)` is zero and nothing should glow. It is
+        // the terminator: the line between lit and unlit goes soft and turns
+        // faintly red on the dark side, because the light that crossed it
+        // travelled through a little stone to get there. A hard grey terminator
+        // means the scattering never reached the diffuse lobe.
+        //
+        // The thickness is honest rather than tuned. Authoring a thin marble
+        // sphere to make it glow is exactly the mistake this material exists to
+        // rule out.
+        (
+            "marble",
+            Material {
+                base_color: Vec3::new(0.86, 0.83, 0.78),
+                metallic: 0.0,
+                roughness: 0.22,
+                subsurface_color: Vec3::new(0.92, 0.80, 0.72),
+                subsurface_radius: Vec3::new(0.012, 0.006, 0.004),
+                thickness: 0.6,
+                ..Material::default()
+            },
+        ),
+        // Wax, authored as a shell a few millimetres thick — a candle rather
+        // than a block. Now the mean free path and the thickness are the same
+        // order, so this is the material that shows the other half: the
+        // transmitted lobe, warm and brightest where the surface turns away from
+        // the sun and toward the camera. Beside the marble it is the A/B for
+        // which half of the effect is working, since the two differ in almost
+        // nothing but that one number.
+        (
+            "wax",
+            Material {
+                base_color: Vec3::new(0.93, 0.86, 0.72),
+                metallic: 0.0,
+                roughness: 0.35,
+                subsurface_color: Vec3::new(1.0, 0.72, 0.42),
+                subsurface_radius: Vec3::new(0.010, 0.006, 0.004),
+                subsurface_forward_scatter: 8.0,
+                thickness: 0.003,
                 ..Material::default()
             },
         ),

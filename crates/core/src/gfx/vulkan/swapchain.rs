@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use super::context::VkContext;
+use crate::scene::{PresentSettings, VsyncMode};
+use vulkano::device::{Device, DeviceOwned};
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageUsage};
@@ -10,13 +12,51 @@ use vulkano::swapchain::{PresentMode, Surface, Swapchain, SwapchainCreateInfo};
 
 pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
 
-/// Presentation mode — flip this to toggle vsync:
-/// - `Fifo`: vsync ON, capped to refresh, no tearing (always supported).
-/// - `Mailbox`: uncapped, no tearing (not always supported).
-/// - `Immediate`: uncapped, may tear (not always supported).
+/// The one place a [`VsyncMode`] becomes a Vulkan present mode.
+fn present_mode(vsync: VsyncMode) -> PresentMode {
+    match vsync {
+        VsyncMode::Fifo => PresentMode::Fifo,
+        VsyncMode::Mailbox => PresentMode::Mailbox,
+        VsyncMode::Immediate => PresentMode::Immediate,
+    }
+}
+
+/// What the surface will actually honour of what was asked for.
 ///
-/// Falls back to `Fifo` automatically if the surface doesn't support the choice.
-pub const PRESENT_MODE: PresentMode = PresentMode::Fifo;
+/// Both halves fall back rather than fail: an unsupported present mode becomes
+/// `Fifo`, which every driver has to offer, and an image count outside the
+/// advertised range is clamped into it. A setting the surface cannot meet is a
+/// worse frame, never a dead window — which matters more here than usual,
+/// because these are the two knobs somebody reaches for *while* chasing a
+/// number.
+fn resolve(
+    device: &Arc<Device>,
+    surface: &Arc<Surface>,
+    want: PresentSettings,
+) -> (PresentMode, u32) {
+    let physical = device.physical_device();
+    let wanted = present_mode(want.vsync);
+    let mode = physical
+        .surface_present_modes(surface, Default::default())
+        .map(|modes| {
+            if modes.into_iter().any(|m| m == wanted) {
+                wanted
+            } else {
+                PresentMode::Fifo
+            }
+        })
+        .unwrap_or(PresentMode::Fifo);
+
+    let mut images = want.images.max(1);
+    if let Ok(caps) = physical.surface_capabilities(surface, Default::default()) {
+        images = images.max(caps.min_image_count);
+        if let Some(max) = caps.max_image_count {
+            images = images.min(max);
+        }
+    }
+
+    (mode, images)
+}
 
 /// What the frame's last pass draws into: a real swapchain, or — offscreen — a
 /// single ordinary image nobody presents.
@@ -53,6 +93,7 @@ impl SwapchainState {
         render_pass: &Arc<RenderPass>,
         format: Format,
         extent: [u32; 2],
+        present: PresentSettings,
     ) -> Self {
         let device = &ctx.device;
         let caps = device
@@ -61,28 +102,7 @@ impl SwapchainState {
             .expect("failed to query surface capabilities");
 
         let composite_alpha = caps.supported_composite_alpha.into_iter().next().unwrap();
-
-        let present_mode = device
-            .physical_device()
-            .surface_present_modes(surface, Default::default())
-            .map(|modes| {
-                if modes.into_iter().any(|m| m == PRESENT_MODE) {
-                    PRESENT_MODE
-                } else {
-                    PresentMode::Fifo
-                }
-            })
-            .unwrap_or(PresentMode::Fifo);
-        println!("Present mode: {present_mode:?}");
-
-        // Prefer double-buffering, but stay within the surface's advertised range:
-        // never below its minimum, and never above its maximum when it sets one
-        // (max_image_count == None means unlimited). A surface whose max is 1
-        // would otherwise fail creation against the unconditional `.max(2)`.
-        let mut min_image_count = caps.min_image_count.max(2);
-        if let Some(max) = caps.max_image_count {
-            min_image_count = min_image_count.min(max);
-        }
+        let (present_mode, min_image_count) = resolve(device, surface, present);
 
         let (swapchain, images) = Swapchain::new(
             device.clone(),
@@ -150,7 +170,17 @@ impl SwapchainState {
     }
 
     // Returns false if the surface has zero area (minimized) and recreation is skipped.
-    pub fn recreate(&mut self, render_pass: &Arc<RenderPass>, extent: [u32; 2]) -> bool {
+    //
+    // `present` is re-resolved here rather than carried from construction: this is
+    // the one path a present-mode or image-count change travels, so the two
+    // settings reach the swapchain the same way an extent does and there is no
+    // second place for them to be applied from.
+    pub fn recreate(
+        &mut self,
+        render_pass: &Arc<RenderPass>,
+        extent: [u32; 2],
+        present: PresentSettings,
+    ) -> bool {
         if extent[0] == 0 || extent[1] == 0 {
             return false;
         }
@@ -160,9 +190,13 @@ impl SwapchainState {
             return false;
         };
 
+        let (present_mode, min_image_count) =
+            resolve(current.device(), current.surface(), present);
         let (swapchain, images) = current
             .recreate(SwapchainCreateInfo {
                 image_extent: extent,
+                present_mode,
+                min_image_count,
                 ..current.create_info()
             })
             .expect("failed to recreate swapchain");
@@ -173,6 +207,16 @@ impl SwapchainState {
         self.image_views = image_views;
         self.extent = extent;
         true
+    }
+
+    /// What the surface actually honoured, as opposed to what was asked for.
+    ///
+    /// `None` offscreen, where there is no presentation engine to ask. Reported
+    /// by the run banner and the performance panel for one reason: a present mode
+    /// the driver quietly declined is the last thing a frame-time figure may omit.
+    pub fn applied_present(&self) -> Option<(PresentMode, u32)> {
+        let swapchain = self.swapchain.as_ref()?;
+        Some((swapchain.create_info().present_mode, swapchain.image_count()))
     }
 }
 

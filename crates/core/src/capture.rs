@@ -29,8 +29,8 @@ use crate::gfx::{RenderBackend, SceneLighting};
 use crate::scene::entities::build_default_scene;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, DofSettings, EnvironmentSettings, HdrSettings,
-    MotionBlurSettings, RefractionSettings, SsaoSettings, SsrSettings, TaaSettings,
-    TransparencySettings,
+    MotionBlurSettings, RefractionSettings, SsaoSettings, SsrSettings, SubsurfaceSettings,
+    TaaSettings, TransparencySettings,
 };
 use crate::systems::{self, FrameGeometry};
 
@@ -52,6 +52,11 @@ pub struct CaptureSettings {
     pub transparency: bool,
     pub refraction: bool,
     pub taa: bool,
+    /// The screen-space half of subsurface scattering. Worth its own override for
+    /// the reason the two non-opaque queues have theirs: switching it off does not
+    /// switch scattering off — the analytic wrap widens to stand in — so the A/B
+    /// between the two captures is exactly what the diffusion passes contribute.
+    pub subsurface: bool,
 }
 
 impl Default for CaptureSettings {
@@ -62,6 +67,7 @@ impl Default for CaptureSettings {
             transparency: true,
             refraction: true,
             taa: true,
+            subsurface: true,
         }
     }
 }
@@ -81,6 +87,10 @@ pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings)
     world.insert_resource(SsaoSettings::default());
     world.insert_resource(ContactShadowSettings::default());
     world.insert_resource(SsrSettings::default());
+    world.insert_resource(SubsurfaceSettings {
+        enabled: settings.subsurface,
+        ..SubsurfaceSettings::default()
+    });
     world.insert_resource(TransparencySettings {
         enabled: settings.transparency,
     });
@@ -125,6 +135,7 @@ pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings)
             &world.resource::<SsaoSettings>().clone(),
             &world.resource::<ContactShadowSettings>().clone(),
             &world.resource::<SsrSettings>().clone(),
+            &world.resource::<SubsurfaceSettings>().clone(),
             &world.resource::<TransparencySettings>().clone(),
             &world.resource::<RefractionSettings>().clone(),
             &world.resource::<TaaSettings>().clone(),

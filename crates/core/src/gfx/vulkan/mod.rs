@@ -16,6 +16,7 @@ mod resources;
 mod shadow;
 mod ssao;
 mod ssr;
+mod subsurface;
 mod swapchain;
 mod taa;
 mod texture;
@@ -45,8 +46,9 @@ use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::shadows::CascadeSet;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
-    HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, RefractionSettings,
-    ShadowSettings, SsaoSettings, SsrSettings, TaaSettings, TransparencySettings,
+    HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, PresentSettings,
+    RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
+    TransparencySettings,
 };
 
 use self::contact_shadows::ContactShadowPass;
@@ -69,6 +71,7 @@ use self::resources::{GraphImages, PassFramebuffers, begin_info};
 use self::shadow::ShadowPass;
 use self::ssao::SsaoPass;
 use self::ssr::SsrPass;
+use self::subsurface::SubsurfacePass;
 use self::swapchain::SwapchainState;
 use self::taa::TaaPass;
 use self::timestamps::GpuTimestamps;
@@ -145,6 +148,7 @@ pub struct VulkanRenderer {
     /// environment's reflection for them. Holds only pipelines and the resolved
     /// settings; every image it works over is graph-owned.
     ssr: SsrPass,
+    subsurface: SubsurfacePass,
     /// Weighted-blended transparency: the accumulation pass and the composite
     /// that puts what it gathered over the lit frame. Draws through the forward
     /// pass's own pipeline layout, so it is constructed after it.
@@ -187,6 +191,11 @@ pub struct VulkanRenderer {
     previous_frame_end: Option<FrameFuture>,
     recreate_swapchain: bool,
     pending_extent: [u32; 2],
+    /// What the swapchain should be built with. Changing it takes the same route
+    /// a resize does — flag the recreation and let the next frame perform it —
+    /// because it *is* a recreation, and doing it anywhere else would tear down
+    /// images the frame in flight is still presenting from.
+    present: PresentSettings,
     /// Per-pass GPU timing; `None` if the device lacks timestamp support.
     timestamps: Option<GpuTimestamps>,
     /// The structure this frame's graph was compiled for. A frame whose config
@@ -199,12 +208,23 @@ pub struct VulkanRenderer {
 }
 
 impl VulkanRenderer {
-    pub fn new(instance: &Arc<Instance>, surface: Arc<Surface>, extent: [u32; 2]) -> Self {
+    pub fn new(
+        instance: &Arc<Instance>,
+        surface: Arc<Surface>,
+        extent: [u32; 2],
+        present: PresentSettings,
+    ) -> Self {
         let ctx = VkContext::new(instance, Some(&surface));
         let format = swapchain_color_format(&ctx, &surface);
-        Self::build(ctx, format, extent, |ctx, render_pass, format, extent| {
-            SwapchainState::new(ctx, &surface, render_pass, format, extent)
-        })
+        Self::build(
+            ctx,
+            format,
+            extent,
+            present,
+            |ctx, render_pass, format, extent| {
+                SwapchainState::new(ctx, &surface, render_pass, format, extent, present)
+            },
+        )
     }
 
     /// A renderer that draws into an image instead of a window.
@@ -216,7 +236,15 @@ impl VulkanRenderer {
     /// would only be evidence about that path.
     pub fn offscreen(instance: &Arc<Instance>, extent: [u32; 2]) -> Self {
         let ctx = VkContext::new(instance, None);
-        Self::build(ctx, OFFSCREEN_FORMAT, extent, SwapchainState::offscreen)
+        // Presentation settings are inert here: there is no presentation engine
+        // to hand an image to, so the default stands and nothing reads it.
+        Self::build(
+            ctx,
+            OFFSCREEN_FORMAT,
+            extent,
+            PresentSettings::default(),
+            SwapchainState::offscreen,
+        )
     }
 
     /// The half of construction that does not know where the frame ends up.
@@ -226,6 +254,7 @@ impl VulkanRenderer {
         ctx: VkContext,
         format: Format,
         extent: [u32; 2],
+        present: PresentSettings,
         make_target: impl FnOnce(&VkContext, &Arc<RenderPass>, Format, [u32; 2]) -> SwapchainState,
     ) -> Self {
         let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, hdr::HDR_FORMAT);
@@ -236,14 +265,21 @@ impl VulkanRenderer {
         let ssao = SsaoPass::new(&ctx);
         let contact_shadows = ContactShadowPass::new(&ctx);
         let ssr = SsrPass::new(&ctx);
+        let subsurface = SubsurfacePass::new(&ctx);
         let oit = OitPass::new(&ctx, forward.pipeline_layout());
         let refraction = RefractionPass::new(&ctx, forward.pipeline_layout());
         let taa = TaaPass::new(&ctx);
         let dof = DofPass::new(&ctx);
         let motion_blur = MotionBlurPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx);
-        let line = LinePass::new(&ctx.device, &ctx.memory_allocator, &forward.render_pass);
-        let environment = EnvironmentPass::new(&ctx, &forward.render_pass);
+        let line = LinePass::new(
+            &ctx.device,
+            &ctx.memory_allocator,
+            &forward.render_pass,
+            &forward.subsurface_render_pass,
+        );
+        let environment =
+            EnvironmentPass::new(&ctx, &forward.render_pass, &forward.subsurface_render_pass);
         let swapchain = make_target(&ctx, &hdr.tonemap_rp, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
 
@@ -273,6 +309,7 @@ impl VulkanRenderer {
             ssao: true,
             contact_shadows: true,
             ssr: false,
+            subsurface: false,
             transparency: true,
             refraction: true,
             taa: true,
@@ -310,6 +347,7 @@ impl VulkanRenderer {
             ssao,
             contact_shadows,
             ssr,
+            subsurface,
             oit,
             refraction,
             taa,
@@ -329,6 +367,7 @@ impl VulkanRenderer {
             previous_frame_end: None,
             recreate_swapchain: false,
             pending_extent: extent,
+            present,
             timestamps,
             config,
             frame,
@@ -526,6 +565,7 @@ impl RenderBackend for VulkanRenderer {
         ssao: &SsaoSettings,
         contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
+        subsurface: &SubsurfaceSettings,
         transparency: &TransparencySettings,
         refraction: &RefractionSettings,
         taa: &TaaSettings,
@@ -548,6 +588,7 @@ impl RenderBackend for VulkanRenderer {
             ssao,
             contact_shadows,
             ssr,
+            subsurface,
             transparency,
             refraction,
             taa,
@@ -587,6 +628,26 @@ impl VulkanRenderer {
         self.timestamps.as_ref().map(GpuTimestamps::last_frame_ms)
     }
 
+    /// Ask for a different present mode or image count.
+    ///
+    /// Takes effect on the next frame, through the same recreation path a resize
+    /// takes — a swapchain cannot be replaced while the frame in flight is still
+    /// presenting from its images. A call that changes nothing does nothing, so
+    /// the app may hand over the resource every frame without recreating one.
+    pub fn set_present(&mut self, present: PresentSettings) {
+        if self.present != present {
+            self.present = present;
+            self.recreate_swapchain = true;
+        }
+    }
+
+    /// What the surface honoured of [`set_present`](Self::set_present), or `None`
+    /// offscreen. Not necessarily what was asked for — see
+    /// [`SwapchainState::applied_present`].
+    pub fn applied_present(&self) -> Option<(vulkano::swapchain::PresentMode, u32)> {
+        self.swapchain.applied_present()
+    }
+
     /// File the GPU spans of frames that have completed since the last call.
     /// Separate from rendering because the profiler lives in the world, which
     /// the renderer deliberately can't reach.
@@ -602,8 +663,16 @@ impl VulkanRenderer {
         self.ctx.vram_bytes()
     }
 
-    /// Like [`render`](RenderBackend::render) but composites `overlay` (the
-    /// editor UI) onto the final image before present.
+    /// Like [`render`](RenderBackend::render) but with the editor's inputs:
+    /// shadow cascades, debug lines, GPU timing, and `overlay` — the editor UI,
+    /// composited onto the final image before present.
+    ///
+    /// `overlay` is an `Option` rather than a second entry point because turning
+    /// the editor off must not also turn off everything else this path supplies.
+    /// `None` is a frame with cascades, lines and timing intact and no UI at all:
+    /// the graph drops its `overlay` node, so the cost measured is the scene's
+    /// alone. That is what [`Diagnostics::overlay`](crate::scene::Diagnostics)
+    /// switches, and the reason it can be switched.
     #[allow(clippy::too_many_arguments)]
     pub fn render_with_overlay(
         &mut self,
@@ -615,6 +684,7 @@ impl VulkanRenderer {
         ssao: &SsaoSettings,
         contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
+        subsurface: &SubsurfaceSettings,
         transparency: &TransparencySettings,
         refraction: &RefractionSettings,
         taa: &TaaSettings,
@@ -627,7 +697,7 @@ impl VulkanRenderer {
         debug_lines: &[DebugLine],
         profiler_frame: u64,
         shadows: Option<ShadowFrame<'_>>,
-        overlay: Overlay<'_>,
+        overlay: Option<Overlay<'_>>,
     ) {
         self.render_frame(
             draws,
@@ -638,6 +708,7 @@ impl VulkanRenderer {
             ssao,
             contact_shadows,
             ssr,
+            subsurface,
             transparency,
             refraction,
             taa,
@@ -650,7 +721,7 @@ impl VulkanRenderer {
             debug_lines,
             Some(profiler_frame),
             shadows,
-            Some(overlay),
+            overlay,
         );
     }
 
@@ -665,6 +736,7 @@ impl VulkanRenderer {
         ssao: &SsaoSettings,
         contact_shadows: &ContactShadowSettings,
         ssr: &SsrSettings,
+        subsurface: &SubsurfaceSettings,
         transparency: &TransparencySettings,
         refraction: &RefractionSettings,
         taa: &TaaSettings,
@@ -688,7 +760,7 @@ impl VulkanRenderer {
         if self.recreate_swapchain {
             if self
                 .swapchain
-                .recreate(&self.hdr.tonemap_rp, self.pending_extent)
+                .recreate(&self.hdr.tonemap_rp, self.pending_extent, self.present)
             {
                 self.recreate_swapchain = false;
             } else {
@@ -704,6 +776,7 @@ impl VulkanRenderer {
             ssao: ssao.enabled,
             contact_shadows: contact_shadows.enabled,
             ssr: ssr.enabled,
+            subsurface: subsurface.enabled,
             transparency: transparency.enabled,
             refraction: refraction.enabled,
             taa: taa.enabled,
@@ -804,6 +877,11 @@ impl VulkanRenderer {
         // its focal length from the field of view, and the shutter takes the
         // depth range it linearises with.
         self.dof.begin_frame(dof, camera, self.swapchain.extent);
+        // Resolved against the camera for the reason the lens is: the kernel's
+        // width in pixels is a world length divided by a view depth, so both
+        // dispatches have to be handed one projection and one depth range.
+        self.subsurface
+            .begin_frame(subsurface, camera, self.swapchain.extent);
         // Reflections resolve against the camera *and* the environment: the
         // composite subtracts the environment term the forward pass added, so
         // it has to be handed the same rotation and the same tint that pass
@@ -1107,6 +1185,48 @@ impl VulkanRenderer {
                             self.images.view(prepass.material),
                             self.environment.specular_view(),
                             self.environment.sampler(),
+                            self.images.view(ids.output),
+                        );
+                    }
+                    PassBody::SubsurfaceBlurHorizontal | PassBody::SubsurfaceBlurVertical => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .subsurface
+                            .expect("subsurface diffusion without its targets");
+                        let prepass = self
+                            .frame
+                            .ids
+                            .prepass
+                            .expect("the graph scheduled the diffusion with no prepass");
+                        let vertical = matches!(body, PassBody::SubsurfaceBlurVertical);
+                        // Mirrors what `declare` said each axis reads: the target
+                        // the forward pass resolved, then the other axis's output.
+                        let (source, target) = if vertical {
+                            (ids.blurred_x, ids.blurred_y)
+                        } else {
+                            (ids.diffusible, ids.blurred_x)
+                        };
+                        self.subsurface.record_blur(
+                            &mut builder,
+                            &self.ctx,
+                            self.images.view(source),
+                            self.images.view(prepass.depth),
+                            self.images.view(target),
+                            vertical,
+                        );
+                    }
+                    PassBody::SubsurfaceComposite => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .subsurface
+                            .expect("subsurface diffusion without its targets");
+                        self.subsurface.record_composite(
+                            &mut builder,
+                            &self.ctx,
+                            self.view_of(ids.source),
+                            self.images.view(ids.blurred_y),
                             self.images.view(ids.output),
                         );
                     }
@@ -1439,8 +1559,19 @@ impl VulkanRenderer {
                     );
                 }
                 PassBody::Forward => {
-                    self.forward
-                        .draw(&mut builder, self, draws, &view, extent, &forward_sets);
+                    // One question, asked once: the graph decided which render
+                    // pass this frame opens, so the pipeline every draw inside it
+                    // binds follows from the same answer.
+                    let subsurface = self.frame.ids.subsurface.is_some();
+                    self.forward.draw(
+                        &mut builder,
+                        self,
+                        draws,
+                        &view,
+                        extent,
+                        &forward_sets,
+                        subsurface,
+                    );
                     // Between the geometry and the lines, and it has to be:
                     // after the geometry so the depth test rejects the sky
                     // wherever something was drawn, and before the lines
@@ -1452,10 +1583,12 @@ impl VulkanRenderer {
                         &view,
                         extent,
                         environment,
+                        subsurface,
                     );
                     // Debug lines share the forward subpass: depth-tested against
                     // the scene, drawn on top of it, before the pass ends.
-                    self.line.record(&mut builder, debug_lines, &view, extent);
+                    self.line
+                        .record(&mut builder, debug_lines, &view, extent, subsurface);
                 }
                 PassBody::OitAccumulate => self.oit.record(
                     &mut builder,
@@ -1503,6 +1636,9 @@ impl VulkanRenderer {
                 | PassBody::SsrSource
                 | PassBody::SsrTrace
                 | PassBody::SsrResolve
+                | PassBody::SubsurfaceBlurHorizontal
+                | PassBody::SubsurfaceBlurVertical
+                | PassBody::SubsurfaceComposite
                 | PassBody::OitComposite
                 | PassBody::RefractionScene
                 | PassBody::RefractionComposite

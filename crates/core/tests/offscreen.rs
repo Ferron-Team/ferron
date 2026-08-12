@@ -12,10 +12,10 @@
 //! cargo test -p orrin-core --test offscreen -- --ignored --nocapture
 //! ```
 //!
-//! and look at what lands in `target/capture/`. The three captures are an A/B
-//! set on purpose: the same scene with each non-opaque queue switched off, which
-//! is what turns "this looks wrong" into "this looks wrong because of that
-//! pass".
+//! and look at what lands in `target/capture/`. The captures are an A/B set on
+//! purpose: the same scene with each non-opaque queue switched off, and with the
+//! subsurface diffusion switched off, which is what turns "this looks wrong" into
+//! "this looks wrong because of that pass".
 
 use std::path::PathBuf;
 
@@ -46,6 +46,19 @@ fn captures_the_default_scene() {
             CaptureSettings {
                 transparency: false,
                 refraction: false,
+                ..CaptureSettings::default()
+            },
+        ),
+        // The diffusion off, everything else as it ships. Scattering is still on
+        // in both — `subsurface_wrap` widens to cover the missing passes — so the
+        // difference between this and `scene.png` is what the two blurs and the
+        // composite actually buy, on the marble and wax spheres in the lobe row.
+        // It is also the shape that exercises the *other* forward render pass, so
+        // a break in either variant shows up as one of the two files being wrong.
+        (
+            "no-subsurface-diffusion",
+            CaptureSettings {
+                subsurface: false,
                 ..CaptureSettings::default()
             },
         ),

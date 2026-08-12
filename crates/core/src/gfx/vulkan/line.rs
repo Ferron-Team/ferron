@@ -20,7 +20,6 @@ use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer
 use vulkano::device::Device;
 use vulkano::memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
@@ -46,42 +45,23 @@ pub struct LineVertex {
 
 pub struct LinePass {
     pipeline: Arc<GraphicsPipeline>,
+    /// The same pipeline against the forward pass's subsurface render pass, which
+    /// has a colour attachment more. A pipeline is tied to the render pass it was
+    /// built for, so sharing one across both is not available — see
+    /// [`ForwardPass::subsurface_render_pass`](super::forward::ForwardPass) for why
+    /// both exist for the whole session rather than being rebuilt on the toggle.
+    subsurface_pipeline: Arc<GraphicsPipeline>,
     subbuffer_allocator: SubbufferAllocator,
 }
 
 impl LinePass {
-    /// Build the line pipeline against the forward render pass's subpass 0.
+    /// Build the line pipelines against subpass 0 of each forward render pass.
     pub fn new(
         device: &Arc<Device>,
         memory_allocator: &Arc<StandardMemoryAllocator>,
         render_pass: &Arc<RenderPass>,
+        subsurface_render_pass: &Arc<RenderPass>,
     ) -> Self {
-        let vs = vs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap();
-        let fs = fs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap();
-
-        let vertex_input_state = LineVertex::per_vertex().definition(&vs).unwrap();
-
-        let stages = [
-            PipelineShaderStageCreateInfo::new(vs),
-            PipelineShaderStageCreateInfo::new(fs),
-        ];
-
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .unwrap(),
-        )
-        .unwrap();
-
-        let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-
         let subbuffer_allocator = SubbufferAllocator::new(
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -92,43 +72,9 @@ impl LinePass {
             },
         );
 
-        let pipeline = GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(vertex_input_state),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::LineList,
-                    ..Default::default()
-                }),
-                viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState::default()),
-                multisample_state: Some(MultisampleState {
-                    rasterization_samples: vulkano::image::SampleCount::Sample4,
-                    ..Default::default()
-                }),
-                depth_stencil_state: Some(DepthStencilState {
-                    depth: Some(DepthState {
-                        write_enable: false,
-                        compare_op: CompareOp::Less,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.num_color_attachments(),
-                    ColorBlendAttachmentState::default(),
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(subpass.into()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
-        .unwrap();
-
         Self {
-            pipeline,
+            pipeline: build_pipeline(device, render_pass),
+            subsurface_pipeline: build_pipeline(device, subsurface_render_pass),
             subbuffer_allocator,
         }
     }
@@ -141,10 +87,18 @@ impl LinePass {
         lines: &[DebugLine],
         view: &FrameView,
         extent: [u32; 2],
+        subsurface: bool,
     ) {
         if lines.is_empty() {
             return;
         }
+
+        // Whichever render pass the executor opened around this call.
+        let pipeline = if subsurface {
+            &self.subsurface_pipeline
+        } else {
+            &self.pipeline
+        };
 
         // Flatten each segment into its two endpoints for `LineList` topology.
         let mut vertices: Vec<LineVertex> = Vec::with_capacity(lines.len() * 2);
@@ -181,9 +135,9 @@ impl LinePass {
                 .collect(),
             )
             .unwrap()
-            .bind_pipeline_graphics(self.pipeline.clone())
+            .bind_pipeline_graphics(pipeline.clone())
             .unwrap()
-            .push_constants(self.pipeline.layout().clone(), 0, view_proj)
+            .push_constants(pipeline.layout().clone(), 0, view_proj)
             .unwrap()
             .bind_vertex_buffers(0, buffer)
             .unwrap();
@@ -196,6 +150,68 @@ impl LinePass {
             builder.draw(vertex_count, 1, 0, 0).unwrap();
         }
     }
+}
+
+fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+    let vs = vs::load(device.clone())
+        .unwrap()
+        .entry_point("main")
+        .unwrap();
+    let fs = fs::load(device.clone())
+        .unwrap()
+        .entry_point("main")
+        .unwrap();
+
+    let vertex_input_state = LineVertex::per_vertex().definition(&vs).unwrap();
+
+    let stages = [
+        PipelineShaderStageCreateInfo::new(vs),
+        PipelineShaderStageCreateInfo::new(fs),
+    ];
+
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+
+    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
+
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState {
+                topology: PrimitiveTopology::LineList,
+                ..Default::default()
+            }),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState::default()),
+            multisample_state: Some(MultisampleState {
+                rasterization_samples: vulkano::image::SampleCount::Sample4,
+                ..Default::default()
+            }),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::Less,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            // Masked past the first attachment: this shader declares one output,
+            // and the subsurface render pass has two. See `co_tenant_blend_states`.
+            color_blend_state: Some(super::forward::co_tenant_blend_states(&subpass)),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .unwrap()
 }
 
 mod vs {

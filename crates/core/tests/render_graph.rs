@@ -50,6 +50,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: true,
@@ -76,6 +77,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: false,
@@ -101,6 +103,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: false,
@@ -124,6 +127,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: true,
@@ -149,6 +153,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: false,
@@ -173,6 +178,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: false,
@@ -198,6 +204,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: true,
@@ -223,6 +230,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: false,
@@ -248,6 +256,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: true,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: true,
@@ -271,6 +280,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: true,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: false,
@@ -296,6 +306,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: true,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: true,
@@ -319,6 +330,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: true,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: false,
@@ -343,6 +355,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: true,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: true,
@@ -367,6 +380,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: false,
@@ -393,6 +407,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: true,
                 ssr: true,
+                subsurface: false,
                 transparency: true,
                 refraction: false,
                 taa: true,
@@ -417,6 +432,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: true,
                 refraction: false,
                 taa: false,
@@ -442,6 +458,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: true,
                 ssr: true,
+                subsurface: false,
                 transparency: true,
                 refraction: true,
                 taa: true,
@@ -465,8 +482,63 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: false,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: true,
+                taa: false,
+                auto_exposure: false,
+                motion_blur: false,
+                dof: false,
+                bloom_mips: 0,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
+        // Subsurface scattering is the first thing to change the *forward pass's
+        // own declarations* rather than only adding passes after it: a second
+        // colour attachment and a second resolve. So this shape pins two things
+        // the others cannot — that the extra attachment is declared, and that
+        // everything downstream reads the composite's output instead of the
+        // forward pass's resolve. Reflections are on deliberately: a mirror beside
+        // a scattering face should show the face as the frame will, which means
+        // the trace has to be handed the diffused colour.
+        (
+            "editor frame, subsurface scattering",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                contact_shadows: true,
+                ssr: true,
+                subsurface: true,
+                transparency: false,
+                refraction: false,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 4,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
+        // And on its own, which is the shape that proves the diffusion keeps the
+        // geometry prepass alive by itself — the blur weights its taps by the
+        // depth that pass writes, so with nothing else in the frame wanting depth
+        // the prepass still has to run.
+        (
+            "editor frame, subsurface scattering alone",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: false,
+                contact_shadows: false,
+                ssr: false,
+                subsurface: true,
+                transparency: false,
+                refraction: false,
                 taa: false,
                 auto_exposure: false,
                 motion_blur: false,
@@ -485,6 +557,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ssao: true,
                 contact_shadows: false,
                 ssr: false,
+                subsurface: false,
                 transparency: false,
                 refraction: false,
                 taa: false,
@@ -586,6 +659,7 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             ssao: true,
             contact_shadows: false,
             ssr: false,
+            subsurface: false,
             transparency: false,
             refraction: false,
             taa: false,
@@ -630,6 +704,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         ssao: true,
         contact_shadows: false,
         ssr: false,
+        subsurface: false,
         transparency: false,
         refraction: false,
         taa: true,
@@ -686,6 +761,7 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         ssao: true,
         contact_shadows: false,
         ssr: true,
+        subsurface: false,
         transparency: true,
         refraction: false,
         taa: true,
@@ -738,6 +814,7 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         ssao: false,
         contact_shadows: false,
         ssr: false,
+        subsurface: false,
         transparency: true,
         refraction: false,
         taa: false,
@@ -766,6 +843,87 @@ fn transparency_attaches_the_prepass_depth_read_only() {
     );
 }
 
+/// The forward pass declares a second colour attachment and a second resolve
+/// exactly when the diffusion runs, and nothing downstream reads the resolve it
+/// withheld the diffusible light from.
+///
+/// Both halves are load-bearing, and neither is checkable any other way.
+///
+/// The attachment, because it is what tells `PassFramebuffers` and the graph the
+/// same story. The framebuffer's attachment list and the render pass it is built
+/// against are assembled by hand in `resources.rs`; the graph derives the barriers
+/// from these declarations. A declaration that went missing would leave the
+/// framebuffer binding an image the plan says nothing about — an image created
+/// without `COLOR_ATTACHMENT` usage, which is a startup panic, and if it were not,
+/// an untracked write.
+///
+/// The chaining, because the composite is the *only* thing that puts the
+/// diffusible radiance back. `forward_sss.frag` routes it out of `hdr_color`
+/// deliberately, so any pass still reading `hdr_color` after the composite is
+/// reading a frame with the diffuse half of every scattering surface missing —
+/// which looks like a lighting bug, not like a mis-wired graph.
+#[test]
+fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
+    let base = FrameConfig {
+        color_format: COLOR_FORMAT,
+        ssao: false,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: true,
+        transparency: false,
+        refraction: false,
+        taa: true,
+        auto_exposure: false,
+        motion_blur: false,
+        dof: false,
+        bloom_mips: 0,
+        overlay: true,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+    };
+
+    let plan = format!("{}", declare(base).unwrap().graph);
+    assert!(
+        plan.contains("msaa_subsurface ColorAttachment")
+            && plan.contains("subsurface_diffusible ResolveAttachment"),
+        "the forward pass must declare the second target and its resolve:\n{plan}",
+    );
+    // The temporal resolve is the next thing in this frame to read the lit
+    // colour, so it is where a broken hand-over would show. It must read the
+    // composite's output, never the forward pass's own.
+    let taa = plan
+        .split("pass taa_resolve")
+        .nth(1)
+        .expect("this frame resolves temporally");
+    assert!(
+        taa.contains("subsurface_color Sampled"),
+        "the temporal resolve must read the composite's output:\n{plan}",
+    );
+    assert!(
+        !taa.contains("hdr_color Sampled"),
+        "nothing after the composite may read the frame the diffusible light was \
+         withheld from:\n{plan}",
+    );
+
+    // And with the pass off, the frame is exactly what it was before any of this
+    // existed: no second attachment, and the resolve reads the forward pass
+    // directly again.
+    let off = format!(
+        "{}",
+        declare(FrameConfig {
+            subsurface: false,
+            ..base
+        })
+        .unwrap()
+        .graph
+    );
+    assert!(
+        !off.contains("msaa_subsurface") && !off.contains("subsurface"),
+        "a frame with the diffusion off must declare none of it:\n{off}",
+    );
+}
+
 /// Refraction's three nodes have to land after the transparency composite and
 /// before the temporal resolve, and both halves matter for the same reasons
 /// transparency's placement does — with one more on top.
@@ -786,6 +944,7 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         ssao: true,
         contact_shadows: false,
         ssr: true,
+        subsurface: false,
         transparency: true,
         refraction: true,
         taa: true,
@@ -839,6 +998,7 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         ssao: false,
         contact_shadows: false,
         ssr: false,
+        subsurface: false,
         transparency: true,
         refraction: true,
         taa: false,
@@ -884,6 +1044,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         ssao: true,
         contact_shadows: false,
         ssr: false,
+        subsurface: false,
         transparency: false,
         refraction: false,
         taa: true,
@@ -935,12 +1096,13 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
     );
 }
 
-/// The geometry prepass exists for whoever needs what it writes, and after this
-/// change that is five separate consumers. Each has to be able to keep it alive
-/// on its own — a prepass gated on any subset of them would leave motion blur
-/// gathering along velocities nobody rasterised, depth of field focusing on a
-/// depth buffer that was never allocated, or a reflection trace reading a
-/// material target no pass wrote.
+/// The geometry prepass exists for whoever needs what it writes, and that is now
+/// nine separate consumers. Each has to be able to keep it alive on its own — a
+/// prepass gated on any subset of them would leave motion blur gathering along
+/// velocities nobody rasterised, depth of field focusing on a depth buffer that
+/// was never allocated, a reflection trace reading a material target no pass
+/// wrote, or the subsurface blur weighting its taps by a depth that does not
+/// exist.
 #[test]
 fn any_single_consumer_keeps_the_geometry_prepass() {
     let base = FrameConfig {
@@ -948,6 +1110,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         ssao: false,
         contact_shadows: false,
         ssr: false,
+        subsurface: false,
         transparency: false,
         refraction: false,
         taa: false,
@@ -961,7 +1124,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         shadow_atlas: 0,
     };
 
-    let consumers: [(&str, fn(&mut FrameConfig)); 8] = [
+    let consumers: [(&str, fn(&mut FrameConfig)); 9] = [
         ("ssao", |c| c.ssao = true),
         ("contact shadows", |c| c.contact_shadows = true),
         ("taa", |c| c.taa = true),
@@ -970,6 +1133,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         ("reflections", |c| c.ssr = true),
         ("transparency", |c| c.transparency = true),
         ("refraction", |c| c.refraction = true),
+        ("subsurface diffusion", |c| c.subsurface = true),
     ];
     for (label, enable) in consumers {
         let mut config = base;

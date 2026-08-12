@@ -20,11 +20,19 @@
 // descriptor set does not exist in the other two, and nothing else in the frame
 // has a copy of itself to sample.
 //
-// The four extra lobes — clear coat, sheen, anisotropy, transmission — are gated
-// on bits in the material rather than on separate shaders. `push.material_index`
-// is dynamically uniform, so each test is a coherent branch a draw either takes
-// whole or skips whole; a plain metallic-roughness material costs what it did
-// before any of them existed.
+// Define `ORRIN_SUBSURFACE` to say that the frame carries a second colour target
+// and runs the screen-space diffusion passes over it. It does two things: the
+// diffusible half of the result is kept separate rather than summed, and the
+// wrapped diffuse standing in for that diffusion is switched off, because
+// applying both would soften the same transport twice. Only the opaque pass may
+// define it — the other two queues never reach those passes, so there the wrap is
+// the whole of the effect.
+//
+// The five extra lobes — clear coat, sheen, anisotropy, transmission,
+// subsurface — are gated on bits in the material rather than on separate shaders.
+// `push.material_index` is dynamically uniform, so each test is a coherent branch
+// a draw either takes whole or skips whole; a plain metallic-roughness material
+// costs what it did before any of them existed.
 
 layout(location = 0) in vec3 v_world_pos;
 layout(location = 1) in vec3 v_normal;
@@ -92,8 +100,10 @@ struct GpuMaterial {
     vec4 anisotropy;   // x = strength, y = cos(rotation), z = sin(rotation)
     vec4 transmission; // x = transmission, y = thickness, z = attenuation distance
     vec4 attenuation;  // rgb = what the volume absorbs over `transmission.z`
+    vec4 subsurface;   // rgb = scattering tint, a = forward-scatter power
+    vec4 subsurface_radius; // rgb = per-channel mean free path, metres
     uvec4 tex_indices_ext; // x=clearcoat, y=clearcoat normal, z=sheen, w=anisotropy
-    uvec4 tex_flags;       // x = transmission map, y = feature flags
+    uvec4 tex_flags;       // x = transmission map, y = feature flags, z = subsurface map
 };
 
 // Feature bits in `tex_flags.y`, mirroring `material_flags` in forward.rs.
@@ -105,6 +115,7 @@ const uint MATERIAL_CLEARCOAT    = 1u << 0;
 const uint MATERIAL_SHEEN        = 1u << 1;
 const uint MATERIAL_ANISOTROPY   = 1u << 2;
 const uint MATERIAL_TRANSMISSION = 1u << 3;
+const uint MATERIAL_SUBSURFACE   = 1u << 4;
 
 // Material table indexed by the per-draw material_index. A storage
 // buffer so the array can be sized at runtime (one entry per material).
@@ -396,6 +407,105 @@ struct Surface {
 
     vec3 sheen_color;
     float sheen_a;
+
+    // Subsurface scattering: what comes back out of the medium, and the two
+    // distances that decide where from.
+    vec3 scatter_color;
+    /// Per-channel mean free path, in metres. Red reaches furthest in every
+    /// medium this exists for, which is why it is a vector.
+    vec3 scatter_radius;
+    /// Metres of medium behind this point. The reference length the wrap below is
+    /// measured against, and the distance the transmitted term is absorbed over.
+    float thickness;
+    float forward_scatter;
+    /// How far past the terminator the diffuse lobe reaches, per channel.
+    /// Resolved once per fragment by `subsurface_wrap` — it reads a screen-space
+    /// derivative, so it cannot be computed per light inside `brdf`.
+    vec3 wrap;
+};
+
+// How far past the terminator light that entered elsewhere is allowed to leave,
+// per channel, in `[0, 1]`. Resolved once per fragment into `Surface::wrap`.
+//
+// The width is derived from the two lengths the material already carries rather
+// than authored, and the ratio is the physical question: a mean free path that is
+// short next to the body it is travelling through cannot reach around it, and one
+// that is long next to it wraps completely. That is why a marble statue is
+// Lambertian everywhere except its thin edges while a leaf of the same material is
+// lit through — same medium, different thickness — and why nothing here needs a
+// per-object dial.
+//
+// What the screen-space diffusion changes is not *whether* this applies but how
+// much of the transport is left for it to describe. The two model the same
+// physics, one on the lighting side and one on the image side, so where the
+// diffusion can do the job this must get out of the way or the surface softens
+// twice. But the diffusion's kernel is measured in pixels, and a mean free path
+// of a few millimetres is a fraction of a pixel on anything but a close-up: a flat
+// switch would mean a scattering object losing its soft terminator as it walked
+// away from the camera, which is worse than double-counting. So the wrap fades out
+// exactly as the kernel becomes resolvable, and the two hand over.
+//
+// The footprint comes from `fwidth` rather than from the projection and the depth:
+// the derivative of the world position *is* the world size of a pixel here, so it
+// needs nothing passed in and it accounts for foreshortening for free — a surface
+// seen edge-on has a wide footprint and keeps its wrap, which is right, because
+// that is also where the blur's own perpendicular-to-view estimate is least able
+// to help.
+vec3 subsurface_wrap(Surface s) {
+    vec3 w = clamp(s.scatter_radius / max(vec3(s.thickness), s.scatter_radius), 0.0, 1.0);
+#ifdef ORRIN_SUBSURFACE
+    float pixel_world = max(length(fwidth(v_world_pos)), 1e-9);
+    // Full below half a pixel, which is where `sss_blur.comp` gives up entirely,
+    // and gone by two, where its taps are spread over real neighbours.
+    float widest = max(max(s.scatter_radius.r, s.scatter_radius.g), s.scatter_radius.b);
+    w *= 1.0 - smoothstep(0.5, 2.0, widest / pixel_world);
+#endif
+    return w;
+}
+
+// The diffuse cosine, widened by the wrap and renormalised so widening it does
+// not also brighten it.
+//
+// The `(1 + w)^2` is what makes this an energy-preserving wrap rather than a
+// wrap plus a gain: the numerator's range grows by `1 + w` and the lobe's
+// integral over the hemisphere by another factor of it.
+vec3 wrapped_diffuse(Surface s, float raw_n_dot_l) {
+    vec3 wrapped = (vec3(raw_n_dot_l) + s.wrap) / ((1.0 + s.wrap) * (1.0 + s.wrap));
+    return max(wrapped, vec3(0.0));
+}
+
+// Light that entered the far side of the surface and left through this one.
+//
+// Two things multiply: what survives `thickness` of medium — Beer-Lambert
+// against the mean free path, per channel, which is what turns a thick limb
+// opaque and leaves an ear glowing — and a phase function that is mostly
+// forward. The forward lobe is why a leaf lights up when the camera is nearly
+// looking into the sun through it and goes flat when it steps aside, and the
+// `wrap_back` floor underneath keeps a surface lit from directly behind from
+// going dark off-axis.
+//
+// Deliberately not multiplied by the surface's own albedo: this light never
+// reflected off the boundary, it came *through*, so what tints it is the medium's
+// colour and nothing else. The same rule `KHR_materials_diffuse_transmission`
+// states.
+vec3 subsurface_transmission(Surface s, vec3 L, float raw_n_dot_l) {
+    vec3 through = exp(-s.thickness / s.scatter_radius);
+    float forward = exp2(clamp(dot(s.V, -L), 0.0, 1.0) * s.forward_scatter - s.forward_scatter);
+    float wrap_back = clamp(-raw_n_dot_l, 0.0, 1.0);
+    return s.scatter_color * through * mix(wrap_back, 1.0, forward) / PI;
+}
+
+// One light's contribution, split by what the frame is allowed to spread.
+//
+// `direct` is everything whose position on screen is the surface it came off:
+// every specular lobe, and the diffuse of a material that does not scatter.
+// `diffusible` is the part that physically left the surface somewhere other than
+// where it arrived, which is exactly the licence the screen-space passes need to
+// move it — and is zero unless the material scatters, so a frame with no
+// subsurface material in it has an empty second target.
+struct Lobes {
+    vec3 direct;
+    vec3 diffusible;
 };
 
 // The base layer's specular lobe: GGX, stretched along the tangent frame when
@@ -421,10 +531,34 @@ vec3 base_specular(Surface s, vec3 L, vec3 H, float n_dot_l, float n_dot_h) {
 // Outgoing radiance toward the camera from one light direction L.
 // Takes the surface's linear roughness rather than its perceptual one: the
 // caller filters it once for specular antialiasing, and this runs once per light.
-vec3 brdf(Surface s, vec3 L, vec3 radiance) {
-    float n_dot_l = max(dot(s.N, L), 0.0);
+//
+// The two visibilities are the light's own shadow term, applied here rather than
+// by the caller because a scattering surface needs two different ones and only
+// this function knows which term wants which. `visibility` is whether the light
+// reaches *this* point; `back_visibility` is whether it reaches the far side of
+// the medium, which is the question the transmitted lobe is actually asking — an
+// ear lit from behind is in shadow by the first measure and lit by the second,
+// and answering it with the first is how subsurface scattering ends up invisible
+// on exactly the geometry it exists for.
+Lobes brdf(Surface s, vec3 L, vec3 radiance, float visibility, float back_visibility) {
+    Lobes lobes;
+    lobes.direct = vec3(0.0);
+    lobes.diffusible = vec3(0.0);
+
+    bool scatters = (s.flags & MATERIAL_SUBSURFACE) != 0u;
+    float raw_n_dot_l = dot(s.N, L);
+
+    // Before the facing test, and it has to survive it: this is light that
+    // entered the other side, so a surface turned away from the light is where
+    // the term does its work rather than where it stops.
+    if (scatters) {
+        lobes.diffusible =
+            subsurface_transmission(s, L, raw_n_dot_l) * radiance * back_visibility;
+    }
+
+    float n_dot_l = max(raw_n_dot_l, 0.0);
     if (n_dot_l <= 0.0) {
-        return vec3(0.0);
+        return lobes;
     }
     vec3 H = normalize(L + s.V);
     float n_dot_h = max(dot(s.N, H), 0.0);
@@ -435,9 +569,19 @@ vec3 brdf(Surface s, vec3 L, vec3 radiance) {
 
     // Diffuse keeps the energy not reflected (1 - F) and not metallic.
     vec3 kd = (vec3(1.0) - F) * (1.0 - s.metallic);
-    vec3 diffuse = kd * s.albedo / PI;
 
-    vec3 color = diffuse + specular;
+    vec3 color = specular;
+    vec3 diffusible = vec3(0.0);
+    if (scatters) {
+        // The wrap *replaces* the cosine rather than scaling it — that is the
+        // whole mechanism — so this term deliberately misses the `n_dot_l` the
+        // returns below apply to everything else. Multiplying by both would
+        // undo the wrap at the one place it matters, the band just inside the
+        // terminator where `n_dot_l` is near zero.
+        diffusible = kd * s.albedo * wrapped_diffuse(s, raw_n_dot_l) / PI;
+    } else {
+        color += kd * s.albedo / PI;
+    }
 
     // Sheen sits beside the base lobes rather than over them: it is a separate
     // set of fibres catching light, not a film. The base is scaled down for it
@@ -449,7 +593,9 @@ vec3 brdf(Surface s, vec3 L, vec3 radiance) {
     }
 
     if ((s.flags & MATERIAL_CLEARCOAT) == 0u) {
-        return color * radiance * n_dot_l;
+        lobes.direct += color * radiance * n_dot_l * visibility;
+        lobes.diffusible += diffusible * radiance * visibility;
+        return lobes;
     }
 
     // The coat is a film *over* everything above, so it both adds a reflection
@@ -465,18 +611,29 @@ vec3 brdf(Surface s, vec3 L, vec3 radiance) {
     float coat_spec = distribution_ggx(coat_n_dot_h, s.coat_a)
                     * visibility_kelemen(v_dot_h) * Fc;
 
-    return color * (1.0 - Fc) * radiance * n_dot_l
-         + coat_spec * radiance * coat_n_dot_l;
+    lobes.direct += (color * (1.0 - Fc) * n_dot_l + coat_spec * coat_n_dot_l)
+                  * radiance * visibility;
+    // Under the film like every other diffuse term. The transmitted half added
+    // above is not: it left the medium through the *other* face, which has its
+    // own coat if it has one at all, and attenuating it here would take a
+    // reflection off this side out of light that never touched it.
+    lobes.diffusible += diffusible * (1.0 - Fc) * radiance * visibility;
+    return lobes;
 }
 
 // Exponential height fog. Density decays with altitude, so the amount along a
 // view ray is the integral of that decay rather than a function of distance
 // alone — which is what keeps a ray climbing out of the layer from fogging as
 // heavily as one running through it.
-vec3 apply_fog(vec3 color, vec3 world_pos, vec3 camera_pos) {
+// How much of what the surface sent toward the camera the air replaced, in
+// `[0, 1]`. Split out of the mix below because the frame's radiance may leave
+// this shader in two pieces: fog is a lerp, so attenuating both by `1 - amount`
+// and adding the fog's own radiance to one of them is the only way the two sum
+// back to the fogged whole. Adding it to both would put the fog in twice.
+float fog_amount(vec3 world_pos, vec3 camera_pos) {
     float density = lighting.fog_color.w;
     if (density <= 0.0) {
-        return color;
+        return 0.0;
     }
 
     float falloff = lighting.fog_params.x;
@@ -491,8 +648,7 @@ vec3 apply_fog(vec3 color, vec3 world_pos, vec3 camera_pos) {
     float t = falloff * dir_y * dist;
     float integral = abs(t) > 1e-4 ? (1.0 - exp(-t)) / (falloff * dir_y) : dist;
 
-    float amount = clamp(1.0 - exp(-density * at_camera * integral), 0.0, 1.0);
-    return mix(color, lighting.fog_color.rgb, amount);
+    return clamp(1.0 - exp(-density * at_camera * integral), 0.0, 1.0);
 }
 
 // --- Cascaded shadow maps ---
@@ -579,6 +735,45 @@ float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
     if (cascade + 1 < count && view_dist > split - band) {
         float t = clamp((view_dist - (split - band)) / max(band, 1e-4), 0.0, 1.0);
         shadow = mix(shadow, cascade_shadow(cascade + 1, world_pos, N, L), t);
+    }
+
+    return mix(1.0, shadow, lighting.shadow_params.z);
+}
+
+// The sun's visibility at the *far* side of a scattering medium — whether light
+// is arriving to be transmitted through it at all.
+//
+// Not `sun_shadow` handed an offset position, and the difference is the whole
+// point: that function returns "lit" the moment the surface faces away from the
+// sun, which is precisely the case this exists to answer. Skipping the maps there
+// is a sound saving for a reflected lobe, whose radiance is about to be
+// multiplied by a zero cosine, and it is wrong for a transmitted one — it would
+// light a leaf indoors as brightly as one in a field.
+//
+// So the lookup is taken a thickness of medium behind this point, against the
+// far face's own outward normal. Two consequences worth knowing: a thin surface
+// samples essentially where it stands and reads lit, which is correct — a single
+// leaf is the only thing between the sun and itself, and the normal-offset bias
+// is what stops it from shadowing itself. And a closed body reads lit wherever
+// its back face is, so it glows by its authored thickness rather than by the
+// distance a ray would really cross. Recovering that distance means a
+// transmittance depth out of the shadow map, which needs a non-comparison
+// sampler this set layout does not carry.
+float back_sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist, float thickness) {
+    int count = int(lighting.shadow_params.x);
+    if (count <= 0 || lighting.shadow_params.z <= 0.0) {
+        return 1.0;
+    }
+
+    vec3 p = world_pos - N * thickness;
+    int cascade = select_cascade(view_dist);
+    float shadow = cascade_shadow(cascade, p, -N, L);
+
+    float split = lighting.cascade_splits[cascade];
+    float band = split * lighting.shadow_params.y;
+    if (cascade + 1 < count && view_dist > split - band) {
+        float t = clamp((view_dist - (split - band)) / max(band, 1e-4), 0.0, 1.0);
+        shadow = mix(shadow, cascade_shadow(cascade + 1, p, -N, L), t);
     }
 
     return mix(1.0, shadow, lighting.shadow_params.z);
@@ -753,6 +948,13 @@ Surface read_surface(GpuMaterial m, out float alpha) {
     s.coat_roughness = 0.0;
     s.sheen_color = vec3(0.0);
     s.sheen_a = 1.0;
+    s.scatter_color = vec3(0.0);
+    // One, not zero: every consumer divides by this, and the guard belongs here
+    // rather than in the three places that use it.
+    s.scatter_radius = vec3(1.0);
+    s.thickness = 0.0;
+    s.forward_scatter = 1.0;
+    s.wrap = vec3(0.0);
 
     if ((s.flags & MATERIAL_ANISOTROPY) != 0u) {
         vec3 aniso_tex = sample_tex(m.tex_indices_ext.w, v_uv).rgb;
@@ -811,6 +1013,18 @@ Surface read_surface(GpuMaterial m, out float alpha) {
         // over-darkens the base at grazing angles, where the true albedo is
         // below one, and never brightens it.
         s.albedo *= 1.0 - max(max(s.sheen_color.r, s.sheen_color.g), s.sheen_color.b);
+    }
+
+    if ((s.flags & MATERIAL_SUBSURFACE) != 0u) {
+        s.scatter_color = m.subsurface.rgb * sample_tex(m.tex_flags.z, v_uv).rgb;
+        s.scatter_radius = max(m.subsurface_radius.rgb, vec3(1e-6));
+        s.forward_scatter = max(m.subsurface.a, 1e-3);
+        // The same green channel the refraction volume reads its thickness out
+        // of, and the same field on the CPU side. Two surfaces of one material
+        // cannot disagree about how deep the material is.
+        s.thickness = max(m.transmission.y * sample_tex(m.tex_flags.x, v_uv).g, 0.0);
+        // Last, because it reads both of the lengths above.
+        s.wrap = subsurface_wrap(s);
     }
 
     return s;
@@ -935,13 +1149,31 @@ vec3 transmitted_radiance(Surface s, GpuMaterial m, float transmission, float th
 }
 #endif
 
-// Radiance toward the camera in `rgb`, opacity in `a`.
-vec4 shade_surface() {
+// What one surface sends toward the camera, in the two pieces the frame may
+// treat differently.
+//
+// Every includer that has one target sums `color` and `diffusible`; the one that
+// has two keeps them apart so the diffusion passes can spread the second before
+// the frame adds it back. The split is meaningful for exactly one reason: light
+// in `diffusible` did not leave the surface where it arrived, so moving it across
+// the image is a correction rather than a smear.
+struct Shaded {
+    vec3 color;
+    vec3 diffusible;
+    /// How far across the surface, in metres, the diffusion may spread
+    /// `diffusible`. Zero means this pixel does not scatter — which is what the
+    /// blur and the composite test, so nothing else has to carry a mask.
+    float scatter;
+    float alpha;
+};
+
+Shaded shade_surface() {
     GpuMaterial m = materials[push.material_index];
     vec3 emis_tex = sample_tex(m.tex_indices.w, v_uv).rgb;
 
     float alpha;
     Surface s = read_surface(m, alpha);
+    bool scatters = (s.flags & MATERIAL_SUBSURFACE) != 0u;
 
 #if defined(ORRIN_TRANSPARENT) || defined(ORRIN_REFRACTIVE)
     // Both screen-space terms describe what the prepass rasterised at this
@@ -978,7 +1210,15 @@ vec4 shade_surface() {
     // Diffuse image-based lighting, attenuated by screen-space ambient
     // occlusion. The (1 - metallic) is the same factor `brdf` applies to its
     // own diffuse lobe: a metal has no diffuse response.
-    vec3 color = sh_irradiance(s.N) * s.albedo * (1.0 - s.metallic) * ao;
+    //
+    // Routed to the diffusible half for a scattering material, exactly as the
+    // analytic lights' diffuse is: the sky's light enters the medium and comes
+    // back out of it by the same physics a lamp's does, and leaving it behind
+    // here would diffuse a face under a lamp and not the same face under an
+    // overcast sky.
+    vec3 diffuse_ibl = sh_irradiance(s.N) * s.albedo * (1.0 - s.metallic) * ao;
+    vec3 color = scatters ? vec3(0.0) : diffuse_ibl;
+    vec3 diffusible = scatters ? diffuse_ibl : vec3(0.0);
     color += specular_ibl_along(
         ibl_reflection(s), s.n_dot_v, s.f0, s.perceptual_roughness, s.energy
     ) * ao;
@@ -1005,6 +1245,9 @@ vec4 shade_surface() {
         float coat_n_dot_v = max(dot(s.coat_N, s.V), 1e-4);
         float Fc = fresnel_schlick(coat_n_dot_v, 0.04) * s.coat;
         color *= 1.0 - Fc;
+        // Under the film for the same reason, and it has to be said twice
+        // because the two halves are two accumulators now.
+        diffusible *= 1.0 - Fc;
         color += specular_ibl_along(
             reflect(-s.V, s.coat_N), coat_n_dot_v, vec3(0.04), s.coat_roughness, vec3(1.0)
         ) * s.coat * ao;
@@ -1025,7 +1268,16 @@ vec4 shade_surface() {
         // a texel's width of the contact, and the march carries the band inside
         // it that a map's own bias reports lit.
         float shadow = sun_shadow(v_world_pos, s.N, L, view_dist) * contact;
-        color += brdf(s, L, radiance) * shadow;
+        // The far face's own visibility, and only when something is going to read
+        // it. Without the contact mask deliberately: that march describes the
+        // short range in front of *this* pixel, and the thin edges where it would
+        // bite are the ones transmission exists to light.
+        float back_shadow = scatters
+            ? back_sun_shadow(v_world_pos, s.N, L, view_dist, s.thickness)
+            : 1.0;
+        Lobes lobes = brdf(s, L, radiance, shadow, back_shadow);
+        color += lobes.direct;
+        diffusible += lobes.diffusible;
     }
 
     // Point lights.
@@ -1040,10 +1292,19 @@ vec4 shade_surface() {
         // Before the atlas lookup, not after: a surface facing away is already
         // unlit by this light, and the nine taps would be multiplied into a
         // zero. The same early-out `sun_shadow` makes for the cascades.
-        if (dot(s.N, L) <= 0.0) continue;
+        //
+        // Except on a scattering surface, where facing away from the light is not
+        // the same as being unlit by it — that is the one case the light reaches
+        // the camera by going *through*.
+        if (!scatters && dot(s.N, L) <= 0.0) continue;
         vec3 radiance = light.color.rgb * light.color.w * atten;
         float shadow = point_shadow(light, v_world_pos, s.N, L, dist);
-        color += brdf(s, L, radiance) * shadow;
+        float back_shadow = scatters
+            ? point_shadow(light, v_world_pos - s.N * s.thickness, -s.N, L, dist)
+            : 1.0;
+        Lobes lobes = brdf(s, L, radiance, shadow, back_shadow);
+        color += lobes.direct;
+        diffusible += lobes.diffusible;
     }
 
     // Spot lights: a point light with a cone over it, and one atlas face rather
@@ -1056,14 +1317,19 @@ vec4 shade_surface() {
         float atten = attenuate(dist, light.position.w);
         if (atten <= 0.0) continue;
         vec3 L = to_light / max(dist, 1e-4);
-        if (dot(s.N, L) <= 0.0) continue;
+        if (!scatters && dot(s.N, L) <= 0.0) continue;
         atten *= cone_falloff(light, L);
         if (atten <= 0.0) continue;
 
         vec3 radiance = light.color.rgb * light.color.w * atten;
         int face = int(light.params.y);
         float shadow = face < 0 ? 1.0 : atlas_shadow(face, v_world_pos, s.N, L, dist);
-        color += brdf(s, L, radiance) * shadow;
+        float back_shadow = (face < 0 || !scatters)
+            ? 1.0
+            : atlas_shadow(face, v_world_pos - s.N * s.thickness, -s.N, L, dist);
+        Lobes lobes = brdf(s, L, radiance, shadow, back_shadow);
+        color += lobes.direct;
+        diffusible += lobes.diffusible;
     }
 
 #ifdef ORRIN_REFRACTIVE
@@ -1072,14 +1338,33 @@ vec4 shade_surface() {
 
     // Emissive adds on top, unaffected by scene lighting. Already a luminance
     // in nits, so it needs no conversion — it is the one material quantity in the
-    // same unit as the target it is written into.
+    // same unit as the target it is written into. Not diffusible: a filament is
+    // where it is, and spreading it would be a bloom rather than a scattering.
     color += m.emissive.rgb * emis_tex;
 
-    color = apply_fog(color, v_world_pos, lighting.camera_pos.xyz);
+    // Both halves lose what the air replaced, and only one of them gains the
+    // air's own radiance — see `fog_amount`. Summing the two afterwards gives
+    // back exactly the lerp this used to be.
+    float fog = fog_amount(v_world_pos, lighting.camera_pos.xyz);
+    color = mix(color, lighting.fog_color.rgb, fog);
+    diffusible *= 1.0 - fog;
 
     if (lighting.shadow_params.w > 0.5) {
-        color *= cascade_debug_tint(select_cascade(view_dist));
+        vec3 tint = cascade_debug_tint(select_cascade(view_dist));
+        color *= tint;
+        diffusible *= tint;
     }
 
-    return vec4(color, alpha);
+    Shaded shaded;
+    shaded.color = color;
+    shaded.diffusible = diffusible;
+    // The widest channel, because that is the kernel the blur has to cover; the
+    // narrower two are reached by weighting the taps it already took. Zero for a
+    // material that does not scatter, which is the mask every pass downstream
+    // reads.
+    shaded.scatter = scatters
+        ? max(max(s.scatter_radius.r, s.scatter_radius.g), s.scatter_radius.b)
+        : 0.0;
+    shaded.alpha = alpha;
+    return shaded;
 }

@@ -1,0 +1,30 @@
+#version 460
+
+// Puts the diffused radiance back into the frame.
+//
+// A plain addition, and deliberately without a strength dial. The forward pass
+// did not write this light into the colour target at all — it routed it here
+// instead — so anything other than adding all of it back loses energy that the
+// same scene, with the diffusion switched off, would have kept. The dials that
+// belong to this effect are on the material, where they describe a medium: what
+// colour comes back out, and how far it travelled to do it.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_source;
+layout(set = 0, binding = 1) uniform sampler2D u_diffused;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_target;
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_target);
+    if (texel.x >= size.x || texel.y >= size.y) {
+        return;
+    }
+
+    vec4 lit = texelFetch(u_source, texel, 0);
+    // Zero everywhere nothing scattered, so this is the whole of the branch: a
+    // frame with no subsurface material in it copies itself.
+    vec3 diffused = texelFetch(u_diffused, texel, 0).rgb;
+    imageStore(u_target, texel, vec4(lit.rgb + diffused, lit.a));
+}

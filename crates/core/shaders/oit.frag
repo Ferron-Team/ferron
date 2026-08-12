@@ -38,7 +38,12 @@ float oit_weight(float depth, float alpha) {
 }
 
 void main() {
-    vec4 surface = shade_surface();
+    Shaded shaded = shade_surface();
+    // Summed: this queue never reaches the diffusion passes — they read the
+    // prepass, and blended geometry is not in it — so `shading.glsl` has given
+    // the diffusible half its wrapped diffuse instead and there is nothing to
+    // keep apart.
+    vec4 surface = vec4(shaded.color + shaded.diffusible, shaded.alpha);
     float alpha = surface.a;
 
     // A fully transparent fragment contributes nothing to either target, and
