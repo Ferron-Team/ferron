@@ -2,13 +2,33 @@ use glam::Vec3;
 
 use orrin_ecs::World;
 
-use super::textures::{bump_normals, checkerboard, load_rgba, metallic_roughness, sky_equirect};
+use super::textures::{
+    brick, bump_normals, checkerboard, load_rgba, metallic_roughness, sky_equirect,
+};
 use super::{spawn_directional_light, spawn_mesh, spawn_point_light, spawn_spot_light};
 use crate::gfx::{BlendMode, Material, RenderBackend};
 use crate::scene::{Assets, Camera, CpuMesh, MaterialBlends, MeshBounds, Spin, Transform};
 
 const GRID: i32 = 10;
 const SPACING: f32 = 2.0;
+
+/// The masonry panel the parallax A/B is drawn on: how many texels its maps get,
+/// the metres of wall they are stretched over, and how deep the mortar sits
+/// behind the blocks.
+///
+/// Five centimetres is a deeply raked joint — the deep end of what real masonry
+/// does, and chosen for that: at a joint's usual centimetre the effect is
+/// correct and almost invisible at any angle a capture can be taken from, and a
+/// readout nobody can see is not a readout.
+///
+/// Module-level because the generator and the mesh have to be told the same
+/// thing. `brick` derives the normals from the depth over the tile, the material
+/// hands the same depth to the march, and the transform scales the panel to the
+/// same tile — three readers of one set of numbers, which is the only way the
+/// blocks that are lit and the blocks that are marched are the same blocks.
+const WALL: u32 = 512;
+const WALL_TILE: [f32; 2] = [4.0, 2.0];
+const WALL_DEPTH: f32 = 0.05;
 
 /// Spheres per roughness row. Five puts a sample at 0, 0.25, 0.5, 0.75 and 1,
 /// which covers the prefiltered specular chain's six levels closely enough that
@@ -71,9 +91,8 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
     }
 
     // A flattened cube gives SSAO real contact surfaces to darken; the floating
-    // grid alone barely shows it. The real `plane` mesh is registered for the
-    // editor, but the demo floor stays a cube so output is unchanged.
-    let _ = plane;
+    // grid alone barely shows it. The floor stays a cube even though `plane`
+    // exists, so output is unchanged; the masonry panels below are what uses it.
     spawn_mesh(
         world,
         "Ground",
@@ -173,6 +192,54 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
                 scale: Vec3::splat(1.2),
             },
             sphere,
+            material,
+        );
+    }
+
+    // The parallax A/B, one wall each, at the same angle rather than mirrored:
+    // the two differ in the height map and nothing else, so anything that
+    // separates them is this feature. Turned well away from the camera on
+    // purpose, because a height field seen head-on is a normal map — the whole
+    // effect is what the ray does on its way *across* the surface. Look for the
+    // mortar sliding behind the blocks, and for a block's own edge cutting into
+    // the course below it.
+    //
+    // Behind the grid, where they also do a second job: a wall gives the
+    // reflections and the contact shadows something the sky is not.
+    // Stacked rather than side by side, which is what makes the two comparable:
+    // a view grazing enough to show the effect is a view along the wall, and two
+    // panels beside each other would then sit at two distances and two angles.
+    // One above the other, both are the same wall seen the same way, and the
+    // horizontal seam between them is the only place the frame changes.
+    //
+    // A quad rather than a slab, and the reason is the parallax rather than the
+    // polygon count. A cube's edge faces carry the whole brick tile squeezed into
+    // their thickness, so the height field there is genuinely thirty centimetres
+    // wide and five deep — the march reads that correctly and walks a quarter of
+    // the map, which looks like the smear it is. A wall is a surface; giving it
+    // one removes the faces that were never masonry.
+    for (name, material, y) in [
+        ("Wall (parallax)", "brick", 0.5f32),
+        ("Wall (flat)", "brick_flat", 2.5),
+    ] {
+        let material = world.resource::<Assets>().material(material).unwrap();
+        spawn_mesh(
+            world,
+            name,
+            Transform {
+                // The lower panel stands on the ground, whose top face is at -0.5.
+                translation: Vec3::new(0.0, y, -13.0),
+                // The quad lies in XZ facing up, so it is stood on edge first and
+                // turned second. That lands `u` along +x and `v` up, which is the
+                // orientation the blocks were generated for.
+                rotation: glam::Quat::from_rotation_y(25.0f32.to_radians())
+                    * glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                // In the quad's own plane, so the metres the maps were generated
+                // for: a block comes out half a metre square rather than whatever
+                // the mesh's aspect makes of it.
+                scale: Vec3::new(WALL_TILE[0], 1.0, WALL_TILE[1]),
+            },
+            plane,
             material,
         );
     }
@@ -388,9 +455,14 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Materia
     let rock_normal = backend.load_texture(&px, w, h, false);
     let (px, w, h) = load_rgba(include_bytes!("../../assets/Rocks016_1K-JPG_Roughness.jpg"));
     let rock_rough = backend.load_texture(&px, w, h, false);
+    let (px, w, h) = load_rgba(include_bytes!(
+        "../../assets/Rocks016_1K-JPG_Displacement.jpg"
+    ));
+    let rock_height = backend.load_texture(&px, w, h, false);
     assets.insert_texture("rock_albedo", rock_albedo);
     assets.insert_texture("rock_normal", rock_normal);
     assets.insert_texture("rock_rough", rock_rough);
+    assets.insert_texture("rock_height", rock_height);
     load_material(
         backend,
         &mut assets,
@@ -403,8 +475,66 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Materia
             albedo_texture: Some(rock_albedo),
             normal_texture: Some(rock_normal),
             metallic_roughness_texture: Some(rock_rough),
+            // The displacement map that shipped beside the other three, finally
+            // read. A cube face here is one metre and carries the whole tile, so
+            // the map's relief is centimetres of stone — and the readout is the
+            // cube's own edges: the rock now slides against them as the grid
+            // spins, which is the one thing a normal map can never do.
+            height_texture: Some(rock_height),
+            parallax_depth: 0.03,
             ..Material::default()
         },
+    );
+
+    // A masonry wall, and the A/B that says what the parallax march is doing.
+    // Both materials below are the same three maps at the same depth of relief;
+    // one of them marches and one does not, so any difference between the two
+    // walls in the scene is this feature and nothing else.
+    //
+    // Blocks of 0.5 x 0.5 m over the panel they are drawn on, and a joint two
+    // centimetres deep — which is a real masonry joint, and deep enough to see
+    // into at the angle the wall is turned to.
+    let bricks = brick(WALL, 8, 4, WALL_TILE, WALL_DEPTH);
+    let brick_albedo = backend.load_texture(&bricks.albedo, WALL, WALL, true);
+    let brick_normal = backend.load_texture(&bricks.normal, WALL, WALL, false);
+    let brick_height = backend.load_texture(&bricks.height, WALL, WALL, false);
+    assets.insert_texture("brick_albedo", brick_albedo);
+    assets.insert_texture("brick_normal", brick_normal);
+    assets.insert_texture("brick_height", brick_height);
+    let brick_material = Material {
+        // Cancels the quad's own vertex colour, which is its normal and so is
+        // (0.5, 1.0, 0.5). Everything else in the demo wears that tint, and this
+        // is the one place worth undoing it: a wall of violet blocks is a poor
+        // photograph of a height field. Exact here in a way it could not be on a
+        // cube, which has six face normals and would need six.
+        base_color: Vec3::new(2.0, 1.0, 2.0),
+        metallic: 0.0,
+        roughness: 0.85,
+        albedo_texture: Some(brick_albedo),
+        normal_texture: Some(brick_normal),
+        ..Material::default()
+    };
+    load_material(
+        backend,
+        &mut assets,
+        &mut blends,
+        "brick",
+        &Material {
+            height_texture: Some(brick_height),
+            // The same depth the maps were generated at, and the same constant
+            // rather than a number that matches it today: a normal map whose
+            // slopes belong to a deeper field than the one being marched lights
+            // a groove that is not where it is drawn.
+            parallax_depth: WALL_DEPTH,
+            ..brick_material
+        },
+    );
+    load_material(
+        backend,
+        &mut assets,
+        &mut blends,
+        "brick_flat",
+        &brick_material,
     );
 
     load_material(

@@ -57,6 +57,16 @@ pub struct CaptureSettings {
     /// switch scattering off — the analytic wrap widens to stand in — so the A/B
     /// between the two captures is exactly what the diffusion passes contribute.
     pub subsurface: bool,
+    /// Where to photograph the scene from, or `None` for the camera it ships
+    /// with.
+    ///
+    /// A whole-scene shot is a check that everything still draws, and it is a
+    /// poor check of anything that lives in the texels: at the distance the demo
+    /// camera stands, a surface detail is a handful of pixels and a capture of it
+    /// is a capture of the mip chain. So a feature whose readout is a
+    /// centimetre of relief gets its own vantage point rather than a bigger
+    /// image.
+    pub camera: Option<Camera>,
 }
 
 impl Default for CaptureSettings {
@@ -68,6 +78,7 @@ impl Default for CaptureSettings {
             refraction: true,
             taa: true,
             subsurface: true,
+            camera: None,
         }
     }
 }
@@ -83,6 +94,9 @@ pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings)
 
     let mut world = World::new();
     build_default_scene(&mut world, &mut renderer);
+    if let Some(camera) = settings.camera {
+        world.insert_resource(camera);
+    }
 
     world.insert_resource(SsaoSettings::default());
     world.insert_resource(ContactShadowSettings::default());

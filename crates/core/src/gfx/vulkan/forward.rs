@@ -125,7 +125,14 @@ pub(crate) mod material_flags {
     pub const ANISOTROPY: u32 = 1 << 2;
     pub const TRANSMISSION: u32 = 1 << 3;
     pub const SUBSURFACE: u32 = 1 << 4;
+    pub const PARALLAX: u32 = 1 << 5;
 }
+
+/// Ceiling on a material's parallax step counts. Keep in sync with
+/// `PARALLAX_STEP_LIMIT` in `shaders/parallax.glsl`, which is what actually
+/// bounds the loop: a material asking for more would pay for the extra
+/// iterations in register pressure and get none of them.
+const PARALLAX_STEP_LIMIT: u32 = 64;
 
 #[derive(vulkano::buffer::BufferContents, Clone, Copy)]
 #[repr(C)]
@@ -148,10 +155,13 @@ pub(crate) struct GpuMaterial {
     /// points — the tint weights what comes back, the distances decide how far
     /// across the image it is allowed to come back from.
     subsurface_radius: [f32; 4],
+    /// Depth of the height field in metres, then the step counts the march is
+    /// allowed head-on and edge-on.
+    parallax: [f32; 4],
     /// [clearcoat, clearcoat normal, sheen, anisotropy].
     tex_indices_ext: [u32; 4],
-    /// [transmission, feature flags, subsurface, -]. The flags ride here rather
-    /// than in a float field so the shader can test them without
+    /// [transmission, feature flags, subsurface, height]. The flags ride here
+    /// rather than in a float field so the shader can test them without
     /// `floatBitsToUint`.
     tex_flags: [u32; 4],
 }
@@ -1077,11 +1087,29 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
     if m.subsurface_color != Vec3::ZERO || m.subsurface_texture.is_some() {
         flags |= material_flags::SUBSURFACE;
     }
+    // The one lobe whose map is not optional, and the exception proves the rule
+    // the others follow: a clear coat with no map is a coat of uniform strength,
+    // while a height field with no heights is a plane. So this asks for both, and
+    // a depth of zero is the same plane said the other way.
+    if m.height_texture.is_some() && m.parallax_depth > 0.0 {
+        flags |= material_flags::PARALLAX;
+    }
 
     // Beer-Lambert wants an extinction coefficient per unit distance, and an
     // infinite attenuation distance is the "absorbs nothing" case the shader
     // would otherwise reach by dividing by infinity. Zero is that same case
     // expressed as a coefficient, so both collapse to one path there.
+    // The march interpolates between these by how head-on the surface is, so a
+    // maximum below the minimum would spend *more* samples the less they are
+    // needed. Ordered here rather than in the shader, and the upper bound is
+    // taken from the already-clamped minimum because `clamp` panics on a range
+    // that runs backwards — a material asking for a thousand steps would
+    // otherwise supply one.
+    let parallax_min = m.parallax_min_steps.clamp(1, PARALLAX_STEP_LIMIT);
+    let parallax_max = m
+        .parallax_max_steps
+        .clamp(parallax_min, PARALLAX_STEP_LIMIT);
+
     let attenuation_distance = if m.attenuation_distance.is_finite() {
         m.attenuation_distance.max(0.0)
     } else {
@@ -1156,6 +1184,12 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
             m.subsurface_radius.z.max(1e-6),
             0.0,
         ],
+        parallax: [
+            m.parallax_depth.max(0.0),
+            parallax_min as f32,
+            parallax_max as f32,
+            0.0,
+        ],
         tex_indices_ext: [
             m.clearcoat_texture.map_or(WHITE_TEXTURE, |h| h.0),
             m.clearcoat_normal_texture
@@ -1170,7 +1204,11 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
             m.transmission_texture.map_or(WHITE_TEXTURE, |h| h.0),
             flags,
             m.subsurface_texture.map_or(WHITE_TEXTURE, |h| h.0),
-            0,
+            // White is the top of the field everywhere, so an unauthored map is a
+            // flat surface rather than one displaced by its full depth — the
+            // march reads the same no-op out of it that every other default
+            // texture gives its lobe.
+            m.height_texture.map_or(WHITE_TEXTURE, |h| h.0),
         ],
     }
 }

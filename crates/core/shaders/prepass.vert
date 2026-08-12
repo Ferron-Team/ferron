@@ -24,6 +24,12 @@ layout(location = 4) out vec3 v_color;
 // the very offsets it exists to accumulate.
 layout(location = 5) out vec4 v_clip;
 layout(location = 6) out vec4 v_previous_clip;
+// Where the eye is, for the parallax march: the camera sits at the origin of
+// this space, so the direction toward it is just the negated position, and the
+// march's metres-to-UV conversion gets its lengths from a rigid transform of the
+// world ones. Carried rather than reconstructed from depth so this pass keeps
+// reading only the two sets it already binds.
+layout(location = 7) out vec3 v_view_pos;
 
 layout(push_constant) uniform Push {
     // First object row of this instanced run; gl_InstanceIndex counts from it.
@@ -71,7 +77,9 @@ void main() {
 
     // `proj * view` is the same view-projection the forward pass pushes; taking
     // it from the frame UBO keeps the prepass push to the one instance offset.
-    vec4 clip = frame.proj * frame.view * model * vec4(position, 1.0);
+    vec4 view_pos = frame.view * model * vec4(position, 1.0);
+    v_view_pos = view_pos.xyz;
+    vec4 clip = frame.proj * view_pos;
     gl_Position = clip;
 
     // `proj` carries the jitter as a translation of clip.xy by jitter * w, so

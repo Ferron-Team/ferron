@@ -394,6 +394,53 @@ pub struct Material {
     /// `rgb` multiplies `subsurface_color`, so a face can scatter through thin
     /// skin and not through an eyebrow.
     pub subsurface_texture: Option<TextureHandle>,
+
+    /// How high each texel stands above the deepest point of the surface, read
+    /// from `r`, white at the top. The convention every displacement map ships
+    /// in, which is why a stone or brick set's `Displacement` image can be
+    /// dropped straight in.
+    ///
+    /// With one authored, the surface stops being a plane: the view ray is
+    /// marched through the height field and every other map is read where it
+    /// lands, so mortar courses sit *behind* the bricks and slide against them
+    /// as the camera moves — the parallax a normal map alone cannot produce,
+    /// because a normal map changes only which way a flat pixel faces.
+    ///
+    /// What it is not: geometry. The silhouette stays the mesh's, the depth
+    /// buffer is untouched, and nothing screen-space — occlusion, reflections,
+    /// contact shadows, shadow maps — sees the relief. The relief therefore
+    /// fades back to a flat surface as the view turns edge-on — full strength
+    /// out to about 73 degrees off the normal, gone by 84 — because displacement
+    /// without the occlusion a real groove would also produce is a smear, and
+    /// the missing half is precisely the silhouette a height field cannot cut.
+    /// Motion vectors come
+    /// from the geometry too, so the relief moves a few centimetres differently
+    /// from what the temporal resolve reprojects; that is the same trade every
+    /// implementation of this makes, and the error is bounded by the depth
+    /// below.
+    pub height_texture: Option<TextureHandle>,
+    /// How deep that field goes, in **metres** — the distance between a brick's
+    /// face and the back of the mortar. A centimetre or two is a masonry wall,
+    /// millimetres are floor tiles.
+    ///
+    /// Metres rather than a fraction of the UV square, unlike most engines,
+    /// because the UV answer is not a property of the material: the same brick
+    /// map over a wall tiled once and a wall tiled eight times would need two
+    /// different numbers for one physical groove. The shader converts using the
+    /// pixel's own footprint, so retiling the wall or scaling the mesh leaves
+    /// the groove the depth it was authored at.
+    ///
+    /// Only read once [`Self::height_texture`] is set — there is nothing to
+    /// march without a field — so this is what relief looks like the moment one
+    /// is dropped in, the way [`Self::clearcoat_roughness`] is.
+    pub parallax_depth: f32,
+    /// Samples along the ray when the surface faces the camera, and when it is
+    /// edge-on. The march spends the second number where the field is stretched
+    /// across many pixels and the first where it is crossed in almost none, so
+    /// this is the effect's cost dial: a distant wall wants both low, a floor
+    /// the camera skims wants the upper one high. Clamped to 64.
+    pub parallax_min_steps: u32,
+    pub parallax_max_steps: u32,
 }
 
 impl Default for Material {
@@ -445,6 +492,18 @@ impl Default for Material {
             subsurface_radius: Vec3::new(0.0048, 0.0017, 0.0011),
             subsurface_forward_scatter: 12.0,
             subsurface_texture: None,
+
+            height_texture: None,
+            // Two centimetres: a brick's face to the back of its mortar, and the
+            // depth at which the shortening at grazing angles is not yet what
+            // the surface is made of. Read only once a map is authored.
+            parallax_depth: 0.02,
+            // Eight layers resolve a field crossed head-on; thirty-two is where
+            // a wall the camera skims stops showing the layers as terraces. The
+            // pair is the cost dial, so the defaults are the ones that look
+            // right rather than the ones that are cheapest.
+            parallax_min_steps: 8,
+            parallax_max_steps: 32,
         }
     }
 }

@@ -102,8 +102,9 @@ struct GpuMaterial {
     vec4 attenuation;  // rgb = what the volume absorbs over `transmission.z`
     vec4 subsurface;   // rgb = scattering tint, a = forward-scatter power
     vec4 subsurface_radius; // rgb = per-channel mean free path, metres
+    vec4 parallax;     // x = height field depth in metres, y = min steps, z = max steps
     uvec4 tex_indices_ext; // x=clearcoat, y=clearcoat normal, z=sheen, w=anisotropy
-    uvec4 tex_flags;       // x = transmission map, y = feature flags, z = subsurface map
+    uvec4 tex_flags;       // x = transmission map, y = feature flags, z = subsurface, w = height
 };
 
 // Feature bits in `tex_flags.y`, mirroring `material_flags` in forward.rs.
@@ -116,6 +117,7 @@ const uint MATERIAL_SHEEN        = 1u << 1;
 const uint MATERIAL_ANISOTROPY   = 1u << 2;
 const uint MATERIAL_TRANSMISSION = 1u << 3;
 const uint MATERIAL_SUBSURFACE   = 1u << 4;
+const uint MATERIAL_PARALLAX     = 1u << 5;
 
 // Material table indexed by the per-draw material_index. A storage
 // buffer so the array can be sized at runtime (one entry per material).
@@ -171,6 +173,13 @@ layout(set = 3, binding = 7, std430) readonly buffer ShadowFaces {
 vec4 sample_tex(uint index, vec2 uv) {
     return texture(sampler2D(textures[index], tex_sampler), uv);
 }
+
+// The one sample the parallax march makes, with the gradients it is handed
+// rather than the ones this fragment could derive. See parallax.glsl.
+float parallax_height(uint index, vec2 uv, vec2 dx, vec2 dy) {
+    return textureGrad(sampler2D(textures[index], tex_sampler), uv, dx, dy).r;
+}
+#include "parallax.glsl"
 
 // Declared identically to the vertex shader so the stages share one
 // push-constant range; only material_index is read here.
@@ -375,6 +384,11 @@ float filter_roughness(float a, vec3 N) {
 struct Surface {
     vec3 N;
     vec3 V;
+    /// Where this fragment actually reads the material's maps. `v_uv` until the
+    /// parallax march moves it, and every map the material carries has to be
+    /// sampled here rather than at the interpolated coordinate — a normal read
+    /// one brick along from the albedo is worse than no parallax at all.
+    vec2 uv;
     vec3 albedo;
     vec3 f0;
     float metallic;
@@ -898,14 +912,47 @@ float cone_falloff(SpotLight light, vec3 L) {
 // light. Anything that ended up on the wrong side of that line would be paid for
 // once per light for no reason.
 Surface read_surface(GpuMaterial m, out float alpha) {
+    Surface s;
+    s.flags = m.tex_flags.y;
+
+    // The interpolated frame, before any map has tilted it. The normal decode
+    // below rotates out of it, and the parallax march walks along it: a height
+    // field is defined against the surface the UVs were laid out on, not against
+    // the one a normal map claims.
+    mat3 TBN = mat3(normalize(v_tangent), normalize(v_bitangent), normalize(v_normal));
+    s.V = normalize(lighting.camera_pos.xyz - v_world_pos);
+
+    s.uv = v_uv;
+    if ((s.flags & MATERIAL_PARALLAX) != 0u) {
+        // Derivatives of the *unmarched* coordinate, taken here where the
+        // control flow is still uniform across the quad. They are also the right
+        // footprint to filter by: the ray descending into the field does not
+        // make the wall's texels any smaller.
+        vec2 dx = dFdx(v_uv);
+        vec2 dy = dFdy(v_uv);
+        s.uv = parallax_occlusion(
+            m.tex_flags.w,
+            s.uv,
+            // Toward the eye, in tangent space: the basis is orthonormal, so the
+            // transpose is the inverse and three dot products are the whole
+            // rotation.
+            normalize(vec3(dot(s.V, TBN[0]), dot(s.V, TBN[1]), dot(s.V, TBN[2]))),
+            m.parallax.x,
+            parallax_uv_per_metre(
+                TBN[0], TBN[1], dx, dy, dFdx(v_world_pos), dFdy(v_world_pos)
+            ),
+            m.parallax.y,
+            m.parallax.z,
+            dx,
+            dy
+        );
+    }
+
     // Sample the maps. Missing maps point at the default textures, so
     // these multiplies become no-ops. Albedo/emissive images are sRGB
     // (decoded to linear on sample); metal-rough is linear data.
-    vec4 albedo_tex = sample_tex(m.tex_indices.x, v_uv);
-    vec4 mr_tex     = sample_tex(m.tex_indices.z, v_uv);
-
-    Surface s;
-    s.flags = m.tex_flags.y;
+    vec4 albedo_tex = sample_tex(m.tex_indices.x, s.uv);
+    vec4 mr_tex     = sample_tex(m.tex_indices.z, s.uv);
 
     // Vertex color tints the material albedo; drop `* v_color` for a
     // pure material/texture color.
@@ -924,10 +971,8 @@ Surface read_surface(GpuMaterial m, out float alpha) {
     s.f0 = mix(vec3(0.16 * reflectance * reflectance), s.albedo, s.metallic);
 
     // Tangent-space normal map -> world space via the TBN basis.
-    vec3 n_tangent = sample_tex(m.tex_indices.y, v_uv).xyz * 2.0 - 1.0;
-    mat3 TBN = mat3(normalize(v_tangent), normalize(v_bitangent), normalize(v_normal));
+    vec3 n_tangent = sample_tex(m.tex_indices.y, s.uv).xyz * 2.0 - 1.0;
     s.N = normalize(TBN * n_tangent);
-    s.V = normalize(lighting.camera_pos.xyz - v_world_pos);
     s.n_dot_v = max(dot(s.N, s.V), 1e-4);
 
     s.a = filter_roughness(s.perceptual_roughness * s.perceptual_roughness, s.N);
@@ -957,7 +1002,7 @@ Surface read_surface(GpuMaterial m, out float alpha) {
     s.wrap = vec3(0.0);
 
     if ((s.flags & MATERIAL_ANISOTROPY) != 0u) {
-        vec3 aniso_tex = sample_tex(m.tex_indices_ext.w, v_uv).rgb;
+        vec3 aniso_tex = sample_tex(m.tex_indices_ext.w, s.uv).rgb;
         // The map stores a signed tangent-space direction, so the neutral fill
         // is the flat normal's (0.5, 0.5) rather than white. That decodes to a
         // zero vector, which has no direction to rotate — the fallback below is
@@ -985,7 +1030,7 @@ Surface read_surface(GpuMaterial m, out float alpha) {
     }
 
     if ((s.flags & MATERIAL_CLEARCOAT) != 0u) {
-        vec2 coat_tex = sample_tex(m.tex_indices_ext.x, v_uv).rg;
+        vec2 coat_tex = sample_tex(m.tex_indices_ext.x, s.uv).rg;
         s.coat = clamp(m.clearcoat.x * coat_tex.r, 0.0, 1.0);
         s.coat_roughness = clamp(m.clearcoat.y * coat_tex.g, 0.04, 1.0);
         s.coat_a = s.coat_roughness * s.coat_roughness;
@@ -993,12 +1038,12 @@ Surface read_surface(GpuMaterial m, out float alpha) {
         // normal rather than the base layer's normal-mapped one. That is glTF's
         // rule and the physical one: a smooth film over a grained surface still
         // reflects flat.
-        vec3 coat_tangent = sample_tex(m.tex_indices_ext.y, v_uv).xyz * 2.0 - 1.0;
+        vec3 coat_tangent = sample_tex(m.tex_indices_ext.y, s.uv).xyz * 2.0 - 1.0;
         s.coat_N = normalize(TBN * coat_tangent);
     }
 
     if ((s.flags & MATERIAL_SHEEN) != 0u) {
-        vec4 sheen_tex = sample_tex(m.tex_indices_ext.z, v_uv);
+        vec4 sheen_tex = sample_tex(m.tex_indices_ext.z, s.uv);
         s.sheen_color = m.sheen.rgb * sheen_tex.rgb;
         // Floored well above the base layer's: Charlie's exponent is 1/a, so a
         // near-zero roughness is an exponent large enough to underflow the `pow`
@@ -1016,13 +1061,13 @@ Surface read_surface(GpuMaterial m, out float alpha) {
     }
 
     if ((s.flags & MATERIAL_SUBSURFACE) != 0u) {
-        s.scatter_color = m.subsurface.rgb * sample_tex(m.tex_flags.z, v_uv).rgb;
+        s.scatter_color = m.subsurface.rgb * sample_tex(m.tex_flags.z, s.uv).rgb;
         s.scatter_radius = max(m.subsurface_radius.rgb, vec3(1e-6));
         s.forward_scatter = max(m.subsurface.a, 1e-3);
         // The same green channel the refraction volume reads its thickness out
         // of, and the same field on the CPU side. Two surfaces of one material
         // cannot disagree about how deep the material is.
-        s.thickness = max(m.transmission.y * sample_tex(m.tex_flags.x, v_uv).g, 0.0);
+        s.thickness = max(m.transmission.y * sample_tex(m.tex_flags.x, s.uv).g, 0.0);
         // Last, because it reads both of the lengths above.
         s.wrap = subsurface_wrap(s);
     }
@@ -1169,10 +1214,14 @@ struct Shaded {
 
 Shaded shade_surface() {
     GpuMaterial m = materials[push.material_index];
-    vec3 emis_tex = sample_tex(m.tex_indices.w, v_uv).rgb;
 
     float alpha;
     Surface s = read_surface(m, alpha);
+    // After the surface, not before: the coordinate every map is read at is what
+    // `read_surface` resolves, and a glowing filament that stayed behind while
+    // the brick around it moved would be the parallax failing in the one place
+    // it is most visible.
+    vec3 emis_tex = sample_tex(m.tex_indices.w, s.uv).rgb;
     bool scatters = (s.flags & MATERIAL_SUBSURFACE) != 0u;
 
 #if defined(ORRIN_TRANSPARENT) || defined(ORRIN_REFRACTIVE)
@@ -1194,7 +1243,7 @@ Shaded shade_surface() {
     float transmission = 0.0;
     float thickness = 0.0;
     if ((s.flags & MATERIAL_TRANSMISSION) != 0u) {
-        vec2 transmission_tex = sample_tex(m.tex_flags.x, v_uv).rg;
+        vec2 transmission_tex = sample_tex(m.tex_flags.x, s.uv).rg;
         transmission = clamp(m.transmission.x * transmission_tex.r, 0.0, 1.0);
         thickness = max(m.transmission.y * transmission_tex.g, 0.0);
         // What refracts through the surface does not scatter off it, so the

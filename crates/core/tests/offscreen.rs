@@ -19,7 +19,9 @@
 
 use std::path::PathBuf;
 
+use glam::Vec3;
 use orrin_core::capture::{CaptureSettings, capture_default_scene};
+use orrin_core::scene::Camera;
 
 fn output_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/capture");
@@ -59,6 +61,26 @@ fn captures_the_default_scene() {
             "no-subsurface-diffusion",
             CaptureSettings {
                 subsurface: false,
+                ..CaptureSettings::default()
+            },
+        ),
+        // The two masonry walls, close and at a glancing angle, which is the one
+        // vantage point where parallax occlusion mapping is legible: the left
+        // wall marches the height field and the right one has the same albedo,
+        // the same normals and no field to march. So this is an A/B inside a
+        // single frame — same light, same exposure, same mip level — and the
+        // difference between the two halves is the whole feature. Mortar that
+        // sits behind its blocks on the left and level with them on the right,
+        // and courses that stay parallel on the right while the left's shift
+        // against each other with depth.
+        (
+            "zoom-parallax",
+            CaptureSettings {
+                camera: Some(Camera {
+                    position: Vec3::new(3.76, 1.5, -12.99),
+                    target: Vec3::new(0.0, 1.5, -13.0),
+                    ..Camera::default()
+                }),
                 ..CaptureSettings::default()
             },
         ),

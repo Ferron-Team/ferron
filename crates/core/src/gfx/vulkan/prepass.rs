@@ -348,5 +348,9 @@ mod prepass_vs {
     vulkano_shaders::shader! { ty: "vertex", path: "shaders/prepass.vert" }
 }
 mod prepass_fs {
-    vulkano_shaders::shader! { ty: "fragment", path: "shaders/prepass.frag" }
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "shaders/prepass.frag",
+        include: ["shaders"],
+    }
 }
