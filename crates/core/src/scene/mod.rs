@@ -5,6 +5,7 @@ mod components;
 mod contact_shadows;
 mod culling;
 mod debug;
+mod decal;
 mod diagnostics;
 mod dof;
 pub mod entities;
@@ -40,6 +41,7 @@ pub use components::{
 pub use contact_shadows::ContactShadowSettings;
 pub use culling::Culling;
 pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
+pub use decal::{Decal, DecalSettings};
 pub use diagnostics::Diagnostics;
 pub use dof::DofSettings;
 pub use environment::{EnvironmentSettings, Hdri, HdriError, load_hdri};

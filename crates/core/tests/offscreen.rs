@@ -64,6 +64,61 @@ fn captures_the_default_scene() {
                 ..CaptureSettings::default()
             },
         ),
+        // The same frame with nothing stamped on it. A decal is applied before
+        // shading, so in `scene.png` it is indistinguishable from a surface that
+        // was always that colour — which is the point of the technique and the
+        // reason it cannot be checked by looking at one image. The difference
+        // between this file and that one is every decal in the scene, and
+        // nothing else: no pass is added or removed, no target is reallocated,
+        // and the barrier plan is byte for byte the same.
+        (
+            "no-decals",
+            CaptureSettings {
+                decals: false,
+                ..CaptureSettings::default()
+            },
+        ),
+        // Close on the ground decals and the foliage behind them, because both
+        // features live in the pixels and neither survives the demo camera's
+        // distance. Three things are legible only from here. The crater's rim is
+        // shaded by the sun and the point lights rather than painted, so it has
+        // a lit side and a dark one. The decal stops where the ground turns up
+        // into the cubes standing in it, which is the angle fade. And the leaf
+        // cards' edges are resolved across the four MSAA samples the frame was
+        // already paying for — against the sky they are a gradient, where a hard
+        // alpha test would give the same silhouette in four steps.
+        (
+            "zoom-decals-foliage",
+            CaptureSettings {
+                camera: Some(Camera {
+                    position: Vec3::new(-16.5, 3.2, 15.5),
+                    target: Vec3::new(-10.5, 0.4, 5.5),
+                    ..Camera::default()
+                }),
+                ..CaptureSettings::default()
+            },
+        ),
+        // The only place the cutout's *caster* pipeline is visible. A leaf card
+        // is a quad, so with the plain depth-only pipeline it casts the shadow of
+        // a rectangle — the single most obvious way foliage goes wrong, and one
+        // that no other capture here can show, because every other capture has
+        // the cascades switched off. Look at the ground beneath the stand: leaves
+        // and stems, with sky between them.
+        (
+            "zoom-foliage-shadow",
+            CaptureSettings {
+                shadows: true,
+                camera: Some(Camera {
+                    // Steeply down onto the open ground the stand throws its
+                    // shadow across, with the cards themselves still in frame:
+                    // the point is the pair, not either alone.
+                    position: Vec3::new(-13.5, 7.5, 11.0),
+                    target: Vec3::new(-12.0, 0.0, 1.5),
+                    ..Camera::default()
+                }),
+                ..CaptureSettings::default()
+            },
+        ),
         // The two masonry walls, close and at a glancing angle, which is the one
         // vantage point where parallax occlusion mapping is legible: the left
         // wall marches the height field and the right one has the same albedo,
@@ -76,6 +131,16 @@ fn captures_the_default_scene() {
         (
             "zoom-parallax",
             CaptureSettings {
+                // The scene's third decal is on this wall, deliberately — a
+                // decal projected onto a marched height field is the sharpest
+                // check that the prepass and the forward pass agree about where
+                // a surface *is*. It is taken back out here, because this
+                // capture's whole claim is that the only difference between the
+                // upper panel and the lower one is the height map, and a mark
+                // straddling the seam between them is a second variable. Each
+                // capture isolates one feature; that is what the switches are
+                // for.
+                decals: false,
                 camera: Some(Camera {
                     position: Vec3::new(3.76, 1.5, -12.99),
                     target: Vec3::new(0.0, 1.5, -13.0),

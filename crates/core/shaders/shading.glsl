@@ -103,6 +103,7 @@ struct GpuMaterial {
     vec4 subsurface;   // rgb = scattering tint, a = forward-scatter power
     vec4 subsurface_radius; // rgb = per-channel mean free path, metres
     vec4 parallax;     // x = height field depth in metres, y = min steps, z = max steps
+    vec4 alpha;        // x = the alpha a MASKED fragment must reach to survive
     uvec4 tex_indices_ext; // x=clearcoat, y=clearcoat normal, z=sheen, w=anisotropy
     uvec4 tex_flags;       // x = transmission map, y = feature flags, z = subsurface, w = height
 };
@@ -118,6 +119,7 @@ const uint MATERIAL_ANISOTROPY   = 1u << 2;
 const uint MATERIAL_TRANSMISSION = 1u << 3;
 const uint MATERIAL_SUBSURFACE   = 1u << 4;
 const uint MATERIAL_PARALLAX     = 1u << 5;
+const uint MATERIAL_MASKED       = 1u << 6;
 
 // Material table indexed by the per-draw material_index. A storage
 // buffer so the array can be sized at runtime (one entry per material).
@@ -180,6 +182,13 @@ float parallax_height(uint index, vec2 uv, vec2 dx, vec2 dy) {
     return textureGrad(sampler2D(textures[index], tex_sampler), uv, dx, dy).r;
 }
 #include "parallax.glsl"
+
+// The decal projector's one texture read, gradients handed in for the reason the
+// march's are. See decals.glsl.
+vec4 decal_sample(uint index, vec2 uv, vec2 dx, vec2 dy) {
+    return textureGrad(sampler2D(textures[index], tex_sampler), uv, dx, dy);
+}
+#include "decals.glsl"
 
 // Declared identically to the vertex shader so the stages share one
 // push-constant range; only material_index is read here.
@@ -967,12 +976,22 @@ Surface read_surface(GpuMaterial m, out float alpha) {
     s.perceptual_roughness = clamp(m.params.y * mr_tex.g, 0.04, 1.0);
     float reflectance = m.params.z;
 
-    // Dielectric F0 from reflectance (0.5 -> ~4%); metals use albedo as F0.
-    s.f0 = mix(vec3(0.16 * reflectance * reflectance), s.albedo, s.metallic);
-
     // Tangent-space normal map -> world space via the TBN basis.
     vec3 n_tangent = sample_tex(m.tex_indices.y, s.uv).xyz * 2.0 - 1.0;
     s.N = normalize(TBN * n_tangent);
+
+    // Decals, here and not a line either side of it. After the normal, because
+    // the angle fade asks which way this surface faces and the mapped normal is
+    // the honest answer; before `f0`, because a decal that stained a surface
+    // copper without moving its specular colour would be paint over a mirror.
+    // Everything below this line therefore describes the surface *with* the
+    // decal on it, which is what makes a decal something the frame lights rather
+    // than something drawn over the light.
+    apply_decals(v_world_pos, s.albedo, s.N, s.metallic, s.perceptual_roughness);
+
+    // Dielectric F0 from reflectance (0.5 -> ~4%); metals use albedo as F0.
+    s.f0 = mix(vec3(0.16 * reflectance * reflectance), s.albedo, s.metallic);
+
     s.n_dot_v = max(dot(s.N, s.V), 1e-4);
 
     s.a = filter_roughness(s.perceptual_roughness * s.perceptual_roughness, s.N);
@@ -1416,4 +1435,36 @@ Shaded shade_surface() {
         : 0.0;
     shaded.alpha = alpha;
     return shaded;
+}
+
+// The coverage an alpha-to-coverage cutout writes into its first colour target.
+//
+// Not a comparison. A hard `alpha < cutoff` resolves through MSAA to the same
+// four-level staircase a cutout has always had, because every sample in the
+// pixel takes the same branch — the fragment is what varies, not the sample. So
+// this measures how far the pixel's alpha sits from the cutoff *in units of how
+// fast alpha changes across the pixel*, which turns the step into a ramp one
+// pixel wide and lets the rasteriser quantise it into the four samples the frame
+// is already rasterising. That is the whole cost of the feature: one `fwidth`
+// and a divide, on the foliage pipeline only.
+//
+// Called from `main` rather than from inside `shade_surface` for the reason
+// `parallax.glsl` takes its gradients before the march: `fwidth` is a
+// quad-differencing operation and belongs where the control flow is plainly
+// uniform, not somewhere a reader has to prove that it is.
+//
+// One for a material that is not masked, so the plain pipeline — which has
+// alpha to coverage off and ignores this — is never handed a number that would
+// mean something if it were switched on.
+float mask_coverage(float alpha) {
+    GpuMaterial m = materials[push.material_index];
+    if ((m.tex_flags.y & MATERIAL_MASKED) == 0u) {
+        return 1.0;
+    }
+    // Floored, not just guarded against zero: where alpha is constant across
+    // the quad — the interior of a leaf, or a whole card at a distance where
+    // the map has mipped to a flat value — there is no edge to resolve and the
+    // ramp collapses back to the hard test it is a smoothing of.
+    float footprint = max(fwidth(alpha), 1e-5);
+    return clamp((alpha - m.alpha.x) / footprint + 0.5, 0.0, 1.0);
 }

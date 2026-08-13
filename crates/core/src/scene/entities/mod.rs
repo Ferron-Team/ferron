@@ -9,7 +9,7 @@ use glam::{Quat, Vec3};
 
 use orrin_ecs::{Entity, World};
 
-use crate::scene::{Light, LocalTransform, MaterialHandle, MeshHandle, Name, Transform};
+use crate::scene::{Decal, Light, LocalTransform, MaterialHandle, MeshHandle, Name, Transform};
 
 pub fn spawn_mesh(
     world: &mut World,
@@ -24,6 +24,27 @@ pub fn spawn_mesh(
         .with(LocalTransform::from(transform))
         .with(mesh)
         .with(material)
+        .id()
+}
+
+/// Spawn a projected decal.
+///
+/// `transform` *is* the projection: the box is the unit cube under it, so the
+/// scale is the decal's extent in metres and the rotation aims it — along the
+/// entity's forward, which is `-Z`, as everywhere else in this engine. Nothing
+/// else is needed, and in particular there is no mesh and no material: a decal
+/// is read by the passes that draw whatever it lands on.
+pub fn spawn_decal(
+    world: &mut World,
+    name: impl Into<String>,
+    transform: Transform,
+    decal: Decal,
+) -> Entity {
+    world
+        .spawn_entity()
+        .with(Name::new(name))
+        .with(LocalTransform::from(transform))
+        .with(decal)
         .id()
 }
 

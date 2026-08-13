@@ -8,6 +8,7 @@ layout(location = 4) in vec3 v_color;
 layout(location = 5) in vec4 v_clip;
 layout(location = 6) in vec4 v_previous_clip;
 layout(location = 7) in vec3 v_view_pos;
+layout(location = 8) in vec3 v_world_pos;
 
 layout(location = 0) out vec4 f_normal;
 layout(location = 1) out vec2 f_velocity;
@@ -49,6 +50,9 @@ struct GpuMaterial {
     // skipped it would report the flat wall's normal for the pixel the forward
     // pass shaded one brick along.
     vec4 parallax;    // x = height field depth in metres, y = min steps, z = max steps
+    // Read only by the ORRIN_MASKED variant below, and declared unconditionally
+    // for the stride reason the lobe blocks are.
+    vec4 alpha;       // x = the alpha a MASKED fragment must reach to survive
     uvec4 tex_indices_ext;
     uvec4 tex_flags;  // x = transmission map, y = feature flags, z = subsurface, w = height
 };
@@ -75,6 +79,24 @@ float parallax_height(uint index, vec2 uv, vec2 dx, vec2 dy) {
     return textureGrad(sampler2D(u_textures[index], u_sampler), uv, dx, dy).r;
 }
 #include "parallax.glsl"
+
+vec4 decal_sample(uint index, vec2 uv, vec2 dx, vec2 dy) {
+    return textureGrad(sampler2D(u_textures[index], u_sampler), uv, dx, dy);
+}
+#include "decals.glsl"
+
+// The camera block, declared here as well as in the vertex stage. This pass
+// reports normals in view space and a decal is authored in world space, so the
+// rotation between them is needed in the fragment stage — and it has to be
+// *this* frame's, not one derived from anything else, for the reason every pass
+// that rasterises geometry takes its matrices from `taa::FrameView`.
+layout(set = 0, binding = 0) uniform Frame {
+    mat4 view;
+    mat4 proj;
+    mat4 inv_proj;
+    mat4 prev_view_proj;
+    vec4 jitter;
+} frame;
 
 void main() {
     GpuMaterial m = materials[push.material_index];
@@ -108,17 +130,46 @@ void main() {
     // in G and metallic in B, and the roughness floor keeps the highlight from
     // going singular.
     vec4  mr_tex     = sample_tex(m.tex_indices.z, uv);
-    vec3  albedo     = m.base_color.rgb * v_color * sample_tex(m.tex_indices.x, uv).rgb;
+    vec4  albedo_tex = sample_tex(m.tex_indices.x, uv);
+
+#ifdef ORRIN_MASKED
+    // This target is one sample, so there is no coverage to spend and the cut is
+    // taken hard. The line it is taken along is deliberately the *middle* of the
+    // ramp `mask_coverage` writes in the forward pass — half coverage is alpha
+    // exactly at the cutoff — so the silhouette everything screen-space reads
+    // agrees with the shaded one to within half a pixel rather than being
+    // systematically fat or thin.
+    //
+    // In a variant of its own rather than behind a flag test, so that the plain
+    // prepass shader still contains no `discard` and keeps its early depth test:
+    // a cutout must not cost every other opaque material in the scene.
+    if (m.base_color.a * albedo_tex.a < m.alpha.x) {
+        discard;
+    }
+#endif
+
+    vec3  albedo     = m.base_color.rgb * v_color * albedo_tex.rgb;
     float metallic   = clamp(m.params.x * mr_tex.b, 0.0, 1.0);
     float roughness  = clamp(m.params.y * mr_tex.g, 0.04, 1.0);
     float reflectance = m.params.z;
+
+    vec3 n_tangent = sample_tex(m.tex_indices.y, uv).xyz * 2.0 - 1.0;
+    vec3 view_normal = normalize(TBN * n_tangent);
+
+    // The same stamp `read_surface` applies, in the same order, to the same four
+    // quantities — which is the whole point of it being one file. `view` is
+    // rigid, so its 3x3 is a rotation and the transpose is the inverse: the
+    // normal goes out to world, takes the decal, and comes back, exactly
+    // recovered where no decal touched it.
+    vec3 world_normal = transpose(mat3(frame.view)) * view_normal;
+    apply_decals(v_world_pos, albedo, world_normal, metallic, roughness);
+    view_normal = mat3(frame.view) * world_normal;
 
     // Dielectric F0 from reflectance (0.5 -> ~4%); metals use albedo as F0.
     vec3 f0 = mix(vec3(0.16 * reflectance * reflectance), albedo, metallic);
     f_material = vec4(f0, roughness);
 
-    vec3 n_tangent = sample_tex(m.tex_indices.y, uv).xyz * 2.0 - 1.0;
-    f_normal = vec4(normalize(TBN * n_tangent) * 0.5 + 0.5, 1.0);
+    f_normal = vec4(view_normal * 0.5 + 0.5, 1.0);
 
     if (v_previous_clip.w <= 0.0) {
         // Behind last frame's camera, so there is no history for this surface at

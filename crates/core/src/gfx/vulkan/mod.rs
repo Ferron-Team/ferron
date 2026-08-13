@@ -42,6 +42,7 @@ use vulkano::sync::{self, future::FenceSignalFuture};
 use vulkano::{Validated, VulkanError};
 
 use crate::geom::Aabb;
+use crate::gfx::DecalInstance;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::shadows::CascadeSet;
 use crate::scene::{
@@ -188,6 +189,13 @@ pub struct VulkanRenderer {
     texture_set: Option<Arc<DescriptorSet>>,
     prepass_material_set: Option<Arc<DescriptorSet>>,
     prepass_texture_set: Option<Arc<DescriptorSet>>,
+    /// The same two again for the shadow pass's cutout pipeline. A third copy
+    /// rather than a shared one for the reason the prepass keeps its own: set
+    /// compatibility is a property of the layout a pipeline declares, and these
+    /// three declare three. The buffer and the views inside them are the same
+    /// objects, which is what keeps the three passes agreeing about a material.
+    shadow_material_set: Option<Arc<DescriptorSet>>,
+    shadow_texture_set: Option<Arc<DescriptorSet>>,
     previous_frame_end: Option<FrameFuture>,
     recreate_swapchain: bool,
     pending_extent: [u32; 2],
@@ -364,6 +372,8 @@ impl VulkanRenderer {
             texture_set: None,
             prepass_material_set: None,
             prepass_texture_set: None,
+            shadow_material_set: None,
+            shadow_texture_set: None,
             previous_frame_end: None,
             recreate_swapchain: false,
             pending_extent: extent,
@@ -502,6 +512,7 @@ impl RenderBackend for VulkanRenderer {
         self.material_buffer = None;
         self.material_set = None;
         self.prepass_material_set = None;
+        self.shadow_material_set = None;
         handle
     }
 
@@ -542,6 +553,7 @@ impl RenderBackend for VulkanRenderer {
         self.textures.push(view);
         self.texture_set = None;
         self.prepass_texture_set = None;
+        self.shadow_texture_set = None;
         handle
     }
 
@@ -560,6 +572,7 @@ impl RenderBackend for VulkanRenderer {
         draws: DrawList<'_>,
         transparent: DrawList<'_>,
         refractive: DrawList<'_>,
+        decals: &[DecalInstance],
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
@@ -583,6 +596,7 @@ impl RenderBackend for VulkanRenderer {
             draws,
             transparent,
             refractive,
+            decals,
             lighting,
             camera,
             ssao,
@@ -679,6 +693,7 @@ impl VulkanRenderer {
         draws: DrawList<'_>,
         transparent: DrawList<'_>,
         refractive: DrawList<'_>,
+        decals: &[DecalInstance],
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
@@ -703,6 +718,7 @@ impl VulkanRenderer {
             draws,
             transparent,
             refractive,
+            decals,
             lighting,
             camera,
             ssao,
@@ -731,6 +747,7 @@ impl VulkanRenderer {
         draws: DrawList<'_>,
         transparent: DrawList<'_>,
         refractive: DrawList<'_>,
+        decals: &[DecalInstance],
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
@@ -937,6 +954,16 @@ impl VulkanRenderer {
             self.prepass_texture_set =
                 Some(self.prepass.build_texture_set(&self.ctx, &self.textures));
         }
+        if self.shadow_material_set.is_none() {
+            self.shadow_material_set = Some(self.shadow.build_material_set(&self.ctx, &materials));
+        }
+        if self.shadow_texture_set.is_none() {
+            self.shadow_texture_set = Some(self.shadow.build_texture_set(
+                &self.ctx,
+                &self.textures,
+                self.prepass.material_sampler(),
+            ));
+        }
         let material_set = self.material_set.clone().unwrap();
         let texture_set = self.texture_set.clone().unwrap();
         let prepass_material_set = self.prepass_material_set.clone().unwrap();
@@ -964,9 +991,14 @@ impl VulkanRenderer {
         // separate rather than shared because set compatibility is a property of
         // the layout each pipeline declares, not of the buffer written into it.
         let forward_object_set = self.forward.build_object_set(&self.ctx, &objects.buffer);
-        let shadow_object_set = shadows
-            .is_some()
-            .then(|| self.shadow.build_object_set(&self.ctx, &objects.buffer));
+        // One block for the whole frame, bound by the forward pass's set 0 and
+        // the prepass's alike. See `ForwardPass::upload_decals`.
+        let decal_block = self.forward.upload_decals(decals);
+        let caster_sets = shadows.is_some().then(|| shadow::CasterSets {
+            objects: self.shadow.build_object_set(&self.ctx, &objects.buffer),
+            materials: self.shadow_material_set.clone().unwrap(),
+            textures: self.shadow_texture_set.clone().unwrap(),
+        });
         let prepass_object_set = self
             .frame
             .ids
@@ -1068,6 +1100,7 @@ impl VulkanRenderer {
             material_set.clone(),
             texture_set.clone(),
             forward_object_set.clone(),
+            decal_block.clone(),
             environment,
         );
 
@@ -1496,8 +1529,8 @@ impl VulkanRenderer {
                         shadows.cascades.cascades[cascade_index].view_proj,
                         objects.cascade_bases[cascade_index],
                         self.config.shadow_resolution,
-                        shadow_object_set
-                            .clone()
+                        caster_sets
+                            .as_ref()
                             .expect("the graph scheduled a cascade with no shadows"),
                     );
                 }
@@ -1510,8 +1543,8 @@ impl VulkanRenderer {
                         shadows.atlas,
                         shadows.punctual_casters,
                         &objects.punctual_bases,
-                        shadow_object_set
-                            .clone()
+                        caster_sets
+                            .as_ref()
                             .expect("the graph scheduled the atlas with no shadow frame"),
                     );
                 }
@@ -1521,6 +1554,7 @@ impl VulkanRenderer {
                     draws,
                     extent,
                     frame_uniforms.clone().unwrap(),
+                    decal_block.clone(),
                     prepass_object_set.clone().unwrap(),
                     prepass_material_set.clone(),
                     prepass_texture_set.clone(),

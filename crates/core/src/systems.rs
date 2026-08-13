@@ -6,12 +6,13 @@ use crate::geom::Aabb;
 use crate::gfx::punctual::{MAX_SHADOW_LIGHTS, ShadowAtlas};
 use crate::gfx::shadows::{Cascade, CascadeSet, MAX_CASCADES};
 use crate::gfx::{
-    BlendMode, DrawList, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, PointLight, RenderItem, SceneLighting,
-    SpotLight,
+    BlendMode, DecalInstance, DrawList, MAX_DECALS, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, PointLight,
+    RenderItem, SceneLighting, SpotLight,
 };
 use crate::scene::{
-    AmbientLight, Camera, Culling, FogSettings, Light, LocalTransform, MAX_CONE_ANGLE,
-    MIN_CONE_ANGLE, MaterialBlends, MaterialHandle, MeshBounds, MeshHandle, Spin, WorldTransform,
+    AmbientLight, Camera, Culling, Decal, DecalSettings, FogSettings, Light, LocalTransform,
+    MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialBlends, MaterialHandle, MeshBounds, MeshHandle, Spin,
+    WorldTransform,
 };
 
 pub fn spin(world: &World, dt: f32) {
@@ -247,7 +248,13 @@ pub fn extract_geometry(
 
             if visible {
                 match mode {
-                    BlendMode::Opaque => out.visible.push(index),
+                    // One queue, deliberately. A cutout is opaque geometry that
+                    // happens to have holes in it: it writes depth, it is in the
+                    // prepass, and it belongs in the same front-to-back order
+                    // everything else is in. What separates it from `Opaque` is
+                    // a pipeline, which each pass picks per run off the material
+                    // it is already reading — see `BlendMode::is_masked`.
+                    BlendMode::Opaque | BlendMode::Masked => out.visible.push(index),
                     BlendMode::Blend => out.transparent.push(index),
                     BlendMode::Transmissive => out.refractive.push(index),
                 }
@@ -600,13 +607,14 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameGeometry, extract_geometry, normal_matrix};
-    use crate::gfx::RenderItem;
+    use super::{FrameGeometry, extract_decals, extract_geometry, normal_matrix};
     use crate::gfx::punctual::ShadowAtlas;
     use crate::gfx::shadows::CascadeSet;
+    use crate::gfx::{DecalInstance, MAX_DECALS, RenderItem};
     use crate::scene::propagate_transforms;
     use crate::scene::{
-        Camera, CpuMesh, Culling, LocalTransform, MeshBounds, MeshHandle, Transform, WorldTransform,
+        Camera, CpuMesh, Culling, Decal, DecalSettings, LocalTransform, MeshBounds, MeshHandle,
+        Transform, WorldTransform,
     };
     use glam::{Mat3, Mat4, Quat, Vec3};
     use orrin_ecs::World;
@@ -649,6 +657,146 @@ mod tests {
         );
         let visible = geometry.visible();
         (0..visible.len()).map(|i| *visible.item(i)).collect()
+    }
+
+    /// A decal box, aimed straight down at the ground the way a scorch is.
+    fn spawn_decal_at(world: &mut World, position: Vec3, size: f32, sort_order: i32) {
+        world
+            .spawn_entity()
+            .with(LocalTransform::from(Transform {
+                translation: position,
+                rotation: Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                scale: Vec3::splat(size),
+            }))
+            .with(Decal {
+                sort_order,
+                ..Decal::default()
+            });
+    }
+
+    fn decals(world: &mut World) -> Vec<DecalInstance> {
+        propagate_transforms(world);
+        let mut out = Vec::new();
+        extract_decals(world, ASPECT, &mut out);
+        out
+    }
+
+    /// The projection direction is the entity's forward, `-Z`, like every other
+    /// direction this engine exposes — so the axis handed to the shader, which
+    /// is `+Z`, points back *out* of the surface a decal is aimed at. Get this
+    /// backwards and the angle fade keeps the decal on exactly the faces it is
+    /// meant to reject.
+    #[test]
+    fn a_decal_projects_along_its_entitys_forward() {
+        let mut world = test_world();
+        spawn_decal_at(&mut world, Vec3::ZERO, 1.0, 0);
+
+        let decal = decals(&mut world).remove(0);
+        // Rotated a quarter turn back about X, forward points at the floor, so
+        // the axis the shader compares a receiver's normal against is straight
+        // up.
+        assert!(
+            decal.axes.z_axis.abs_diff_eq(Vec3::Y, 1e-5),
+            "expected +Y, got {}",
+            decal.axes.z_axis
+        );
+    }
+
+    /// The inverse the shader tests against has to undo the scale as well as the
+    /// placement, or a decal's box is the unit cube wherever it was authored and
+    /// every decal in the scene is one metre across.
+    #[test]
+    fn the_box_is_the_transformed_unit_cube() {
+        let mut world = test_world();
+        spawn_decal_at(&mut world, Vec3::new(2.0, 0.0, 0.0), 4.0, 0);
+
+        let decal = decals(&mut world).remove(0);
+        let local = |p: Vec3| decal.world_to_decal.transform_point3(p);
+        // The centre, and a point just inside the far face along the box's own
+        // width — four metres wide means two metres either side.
+        assert!(local(Vec3::new(2.0, 0.0, 0.0)).abs().max_element() < 1e-5);
+        assert!(local(Vec3::new(3.9, 0.0, 0.0)).abs().max_element() < 0.5);
+        assert!(local(Vec3::new(4.1, 0.0, 0.0)).abs().max_element() > 0.5);
+    }
+
+    /// Painting order is the author's, not the camera's. Deciding it by distance
+    /// would make a stack of decals reshuffle itself as the camera walked around
+    /// it, which is the one thing a painter's order must never do.
+    #[test]
+    fn decals_are_painted_in_their_authored_order() {
+        let mut world = test_world();
+        // The question is the ordering, not the culling, so nothing here has to
+        // be on screen.
+        world.resource_mut::<Culling>().enabled = false;
+        // Spawned nearest-first with the orders reversed, so anything sorting by
+        // distance produces the opposite of this.
+        spawn_decal_at(&mut world, Vec3::new(0.0, 0.0, 4.0), 1.0, 7);
+        spawn_decal_at(&mut world, Vec3::new(0.0, 0.0, 2.0), 1.0, 3);
+        spawn_decal_at(&mut world, Vec3::new(0.0, 0.0, 0.0), 1.0, 5);
+
+        let z: Vec<f32> = decals(&mut world)
+            .iter()
+            .map(|d| d.world_to_decal.inverse().w_axis.z.round())
+            .collect();
+        assert_eq!(z, vec![2.0, 0.0, 4.0]);
+    }
+
+    /// Over the cap, the survivors are the nearest — they are the ones covering
+    /// pixels — and they are still painted in the authored order afterwards.
+    #[test]
+    fn the_cap_keeps_the_nearest_decals() {
+        let mut world = test_world();
+        world.insert_resource(Camera {
+            position: Vec3::new(0.0, 0.0, 0.0),
+            target: Vec3::new(0.0, 0.0, -1.0),
+            ..Camera::default()
+        });
+        world.resource_mut::<Culling>().enabled = false;
+        // Twice the cap, each one further away than the last.
+        for i in 0..(MAX_DECALS * 2) {
+            spawn_decal_at(&mut world, Vec3::new(0.0, 0.0, -(i as f32) - 1.0), 1.0, 0);
+        }
+
+        let out = decals(&mut world);
+        assert_eq!(out.len(), MAX_DECALS);
+        let furthest = out
+            .iter()
+            .map(|d| -d.world_to_decal.inverse().w_axis.z)
+            .fold(0.0f32, f32::max);
+        assert!(
+            furthest <= MAX_DECALS as f32,
+            "kept one {furthest} away, past the {MAX_DECALS} nearest"
+        );
+    }
+
+    /// A decal scaled flat on an axis has no interior to project into and no
+    /// invertible transform to project with. Dropped rather than uploaded, or
+    /// the shader divides by a singular matrix.
+    #[test]
+    fn a_flattened_decal_is_dropped() {
+        let mut world = test_world();
+        world
+            .spawn_entity()
+            .with(LocalTransform::from(Transform {
+                scale: Vec3::new(1.0, 1.0, 0.0),
+                ..Default::default()
+            }))
+            .with(Decal::default());
+
+        assert!(decals(&mut world).is_empty());
+    }
+
+    /// The A/B switch, and the reason it is one: a decal lands under the
+    /// lighting, so it is indistinguishable from a surface that was always that
+    /// colour until you can turn it off.
+    #[test]
+    fn switching_decals_off_extracts_none() {
+        let mut world = test_world();
+        spawn_decal_at(&mut world, Vec3::ZERO, 1.0, 0);
+        assert_eq!(decals(&mut world).len(), 1);
+
+        world.insert_resource(DecalSettings { enabled: false });
+        assert!(decals(&mut world).is_empty());
     }
 
     /// The first extraction has nothing to compare against, so a brand-new
@@ -1000,6 +1148,104 @@ mod tests {
 
 /// The half of extraction the camera-only tests above cannot reach: that one
 /// sweep still answers both questions, and that reordering never breaks a run.
+/// Every decal the camera can see, in the order they are to be painted.
+///
+/// Its own sweep rather than a branch inside `extract_geometry`, because a decal
+/// is not a draw: it produces no `RenderItem`, enters no queue, and is read by
+/// the passes as scene data the way the lights are. That is also why it lives
+/// beside `extract_lighting` and takes the same shape.
+///
+/// Two orderings, and they answer different questions. Which decals *survive*
+/// the cap is decided by distance, because when there are more than the frame
+/// can carry, the ones nearest the camera are the ones covering pixels. Which
+/// order the survivors are *painted* in is [`Decal::sort_order`], which is the
+/// author's business and has nothing to do with where the camera happens to be —
+/// deciding both by distance would make a stack of decals reshuffle itself as
+/// the camera walked around it.
+pub fn extract_decals(world: &World, aspect: f32, out: &mut Vec<DecalInstance>) {
+    out.clear();
+    if !world
+        .get_resource::<DecalSettings>()
+        .is_none_or(|settings| settings.enabled)
+    {
+        return;
+    }
+
+    let cull = world
+        .get_resource::<Culling>()
+        .is_none_or(|culling| culling.enabled);
+    let camera = world.get_resource::<Camera>();
+    let frustum = camera.as_ref().map(|c| c.frustum(aspect));
+    let eye = camera.as_ref().map_or(Vec3::ZERO, |c| c.position);
+
+    // The unit cube the decal's transform is applied to. The same box the shader
+    // tests a fragment against, written once here so the culling and the
+    // projection cannot disagree about how big a decal is.
+    let unit = Aabb::from_points([Vec3::splat(-0.5), Vec3::splat(0.5)]);
+
+    let mut found: Vec<(f32, DecalInstance, i32)> = Vec::new();
+    world
+        .query::<(&WorldTransform, &Decal)>()
+        .for_each(|_entity, (transform, decal)| {
+            let model = transform.0;
+            if cull
+                && frustum
+                    .as_ref()
+                    .is_some_and(|frustum| !frustum.intersects(&unit.transformed(&model)))
+            {
+                return;
+            }
+
+            // A singular transform has no interior to project into and no
+            // inverse to project with — a decal scaled to zero on an axis is a
+            // plane, and the containment test would divide by nothing.
+            let world_to_decal = model.inverse();
+            if !world_to_decal.is_finite() {
+                return;
+            }
+
+            let basis = Mat3::from_mat4(model);
+            let axes = Mat3::from_cols(
+                basis.x_axis.normalize_or_zero(),
+                basis.y_axis.normalize_or_zero(),
+                basis.z_axis.normalize_or_zero(),
+            );
+            if axes.z_axis == Vec3::ZERO {
+                return;
+            }
+
+            found.push((
+                model.w_axis.truncate().distance_squared(eye),
+                DecalInstance {
+                    world_to_decal,
+                    axes,
+                    base_color: decal.base_color,
+                    opacity: decal.opacity.clamp(0.0, 1.0),
+                    albedo: decal.albedo,
+                    normal: decal.normal,
+                    metallic_roughness: decal.metallic_roughness,
+                    normal_strength: decal.normal_strength.max(0.0),
+                    metallic: decal.metallic.clamp(0.0, 1.0),
+                    roughness: decal.roughness.clamp(0.0, 1.0),
+                    affects_surface: decal.affects_surface,
+                    // Clamped to the open half-turn: a fade angle of zero would
+                    // want a cosine of one, where nothing but a surface exactly
+                    // facing the projector survives and the decal is invisible
+                    // for a reason nobody would guess from the number.
+                    angle_cos: decal.angle.clamp(1.0, 179.0).to_radians().cos(),
+                },
+                decal.sort_order,
+            ));
+        });
+
+    if found.len() > MAX_DECALS {
+        found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        found.truncate(MAX_DECALS);
+    }
+    found.sort_by_key(|(_, _, order)| *order);
+    out.extend(found.into_iter().map(|(_, instance, _)| instance));
+}
+
 #[cfg(test)]
 mod geometry_tests {
     use super::{FrameGeometry, extract_geometry};

@@ -11,7 +11,7 @@
 //! produces are indistinguishable from a live one's.
 
 use crate::geom::Aabb;
-use crate::gfx::{DrawList, Material, RenderBackend, SceneLighting, TextureHandle};
+use crate::gfx::{DecalInstance, DrawList, Material, RenderBackend, SceneLighting, TextureHandle};
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
     HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, RefractionSettings, SsaoSettings,
@@ -78,6 +78,7 @@ impl RenderBackend for HeadlessBackend {
         _draws: DrawList<'_>,
         _transparent: DrawList<'_>,
         _refractive: DrawList<'_>,
+        _decals: &[DecalInstance],
         _lighting: &SceneLighting,
         _camera: &Camera,
         _ssao: &SsaoSettings,

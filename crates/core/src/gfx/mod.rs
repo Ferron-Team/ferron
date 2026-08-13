@@ -140,6 +140,54 @@ pub const MAX_SPOT_LIGHTS: usize = 8;
 /// allows far more).
 pub const MAX_TEXTURES: usize = 64;
 
+/// How many decals a frame may project. Keep in sync with `MAX_DECALS` in
+/// `shaders/decals.glsl`.
+///
+/// A flat cap with a brute-force loop behind it, and that is a deliberate first
+/// version rather than an oversight. Binning decals into screen tiles is the
+/// same machinery clustered lighting wants, it is a compute pass and a buffer of
+/// its own, and it only starts paying at a decal count this cap does not reach —
+/// sixteen boxes tested against a fragment is sixteen matrix-vector products and
+/// an early-out, which is less than one of the lighting loops already costs.
+/// What the cap buys in the meantime is that decals add no pass, so the render
+/// graph and its golden barrier plan are untouched by the whole feature.
+pub const MAX_DECALS: usize = 16;
+
+/// One projected decal, as extraction hands it to the passes: the matrices
+/// resolved, the textures already indices, the angle already a cosine.
+///
+/// Mirrors [`Decal`](crate::scene::Decal) the way [`PointLight`] mirrors a
+/// `Light` — the component says what a decal *is* in the units it was authored
+/// in, and this says what the shader needs. Nothing past extraction knows a
+/// decal was ever an entity.
+#[derive(Clone, Copy, Debug)]
+pub struct DecalInstance {
+    /// World space into the decal's unit cube, `[-0.5, 0.5]` on each axis: the
+    /// inverse of the entity's world transform. Both the containment test and
+    /// the texture coordinate come out of one multiply.
+    pub world_to_decal: Mat4,
+    /// The decal's own axes in world space, normalised — columns `x`, `y`, `z`.
+    /// The projection runs along `-z`, the engine's forward.
+    ///
+    /// Carried rather than recovered from the inverse above, because recovering
+    /// it means renormalising three rows per fragment per decal to undo a scale
+    /// the CPU already knows.
+    pub axes: Mat3,
+    pub base_color: Vec3,
+    pub opacity: f32,
+    pub albedo: Option<TextureHandle>,
+    pub normal: Option<TextureHandle>,
+    pub metallic_roughness: Option<TextureHandle>,
+    pub normal_strength: f32,
+    pub metallic: f32,
+    pub roughness: f32,
+    pub affects_surface: bool,
+    /// Cosine of the fade angle. A cosine here rather than degrees for the
+    /// reason a spot light's `outer_cos` is one: the shader has a dot product
+    /// and would otherwise need an `acos` per fragment per decal to compare it.
+    pub angle_cos: f32,
+}
+
 /// The `u32` is the texture's index in the shader's array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextureHandle(pub u32);
@@ -243,6 +291,25 @@ pub enum BlendMode {
     /// [`Material::alpha`] is ignored.
     #[default]
     Opaque,
+    /// Opaque everywhere, but with the parts of it whose alpha falls below
+    /// [`Material::alpha_cutoff`] cut away — a leaf card, a chain-link fence, a
+    /// grate. Stays in the opaque queue in every sense that matters: it is in the
+    /// prepass, in the caster lists, and everything screen-space treats what
+    /// survives the cut as the surface it is.
+    ///
+    /// A mode rather than a flag on [`Opaque`](BlendMode::Opaque) because it
+    /// draws through pipelines of its own. In the forward pass those enable
+    /// **alpha to coverage**, which spends the MSAA samples the frame is already
+    /// paying for on the cutout's edge rather than on the mesh's silhouette — so
+    /// the edge is antialiased for very close to nothing, and no `discard`
+    /// appears in the opaque shader to cost every other material its early
+    /// depth test. The 1-sample passes — prepass, shadow — have no coverage to
+    /// spend and alpha-test with a `discard` instead, in shader variants of
+    /// their own so that the same early-Z argument holds there.
+    ///
+    /// Two-sided, because a cutout sheet is what this exists for and a leaf has
+    /// no back to cull.
+    Masked,
     /// Accumulated by the weighted-blended pass instead: depth-tested against
     /// the opaque scene but writing no depth, and composited afterwards. Never
     /// written into the geometry prepass, so nothing screen-space — occlusion,
@@ -269,8 +336,26 @@ impl BlendMode {
     /// non-opaque mode cannot half-land: extraction, `MaterialBlends` and the
     /// demo scene all ask this question and none of them cares *which* non-opaque
     /// queue the material ends up in.
+    ///
+    /// [`Masked`](BlendMode::Masked) answers *true*, and that is the whole
+    /// difference between it and the two below it: a cutout writes depth, so it
+    /// is a surface the prepass and the shadow maps have every reason to know
+    /// about. What it does not share with [`Opaque`](BlendMode::Opaque) is a
+    /// pipeline, which is [`Self::is_masked`]'s question and not this one.
     pub fn is_opaque(self) -> bool {
-        matches!(self, BlendMode::Opaque)
+        matches!(self, BlendMode::Opaque | BlendMode::Masked)
+    }
+
+    /// Whether a draw in the opaque queue needs the alpha-testing pipeline
+    /// rather than the plain one.
+    ///
+    /// Asked per run by each of the three passes that rasterise opaque geometry,
+    /// against the material table the backend already holds — which is why a
+    /// cutout needs no draw list of its own. Extraction stays one opaque queue,
+    /// sorted and ordered front to back exactly as before, and the passes switch
+    /// pipeline where a run's answer changes.
+    pub fn is_masked(self) -> bool {
+        matches!(self, BlendMode::Masked)
     }
 }
 
@@ -284,9 +369,24 @@ impl BlendMode {
 #[derive(Copy, Clone, Debug)]
 pub struct Material {
     pub base_color: Vec3,
-    /// Opacity, multiplied by the albedo map's alpha. Only read for
-    /// [`BlendMode::Blend`].
+    /// Opacity, multiplied by the albedo map's alpha. Read for
+    /// [`BlendMode::Blend`] as the weight the surface accumulates with, and for
+    /// [`BlendMode::Masked`] as the value tested against
+    /// [`Self::alpha_cutoff`] — glTF's rule, and the reason the two modes share
+    /// one field rather than each having a private one.
     pub alpha: f32,
+    /// What [`Self::alpha`] must reach for a [`BlendMode::Masked`] fragment to
+    /// survive. Ignored by every other mode.
+    ///
+    /// The cut is *softened over one pixel* rather than taken as a hard
+    /// comparison: the forward pass converts the distance from the cutoff into
+    /// coverage across the pixel's own footprint, which is what lets the MSAA
+    /// samples already being paid for antialias the edge. A hard test would
+    /// resolve to the same four-level staircase a cutout has always had.
+    ///
+    /// `0.5` because that is glTF's default and because a foliage atlas is
+    /// authored against it.
+    pub alpha_cutoff: f32,
     pub blend: BlendMode,
     pub metallic: f32,
     pub roughness: f32,
@@ -448,6 +548,7 @@ impl Default for Material {
         Self {
             base_color: Vec3::splat(0.8),
             alpha: 1.0,
+            alpha_cutoff: 0.5,
             blend: BlendMode::Opaque,
             metallic: 0.0,
             roughness: 0.5,
@@ -561,6 +662,11 @@ pub trait RenderBackend {
         // What the refraction pass draws, grouped the same way and then ordered
         // back to front — which the list above must not be, and this one must.
         refractive: DrawList<'_>,
+        // This frame's decals, already ordered back to front by
+        // `Decal::sort_order`. Beside the lighting rather than among the three
+        // lists above because a decal is not a draw: it enters no queue and
+        // produces no `RenderItem` — see [`DecalInstance`].
+        decals: &[DecalInstance],
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,

@@ -90,6 +90,15 @@ struct PrepassPush {
 pub struct GeometryPrepass {
     pub(super) render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
+    /// The same pass for a `Masked` run: back faces kept, and a fragment shader
+    /// that cuts the texels below the material's cutoff away.
+    ///
+    /// A second pipeline rather than a flag the one shader tests, because a
+    /// `discard` anywhere in a shader costs *every* draw through it its early
+    /// depth test — and this pass exists to be the depth everything downstream
+    /// reads. Two pipelines at startup is the price of keeping that cost on the
+    /// foliage alone.
+    masked_pipeline: Arc<GraphicsPipeline>,
     /// The material maps are sampled at the same texture coordinates and the
     /// same mip selection the forward pass uses, so the two rasterisations
     /// cannot disagree about what a surface is.
@@ -101,7 +110,18 @@ impl GeometryPrepass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
         let render_pass = build_render_pass(device);
-        let pipeline = build_pipeline(device, &render_pass);
+        let pipeline = build_pipeline(
+            device,
+            &render_pass,
+            prepass_fs::load(device.clone()).unwrap(),
+            false,
+        );
+        let masked_pipeline = build_pipeline(
+            device,
+            &render_pass,
+            prepass_fs_masked::load(device.clone()).unwrap(),
+            true,
+        );
         let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
             device
                 .physical_device()
@@ -130,6 +150,7 @@ impl GeometryPrepass {
         Self {
             render_pass,
             pipeline,
+            masked_pipeline,
             sampler,
             uniform_allocator,
         }
@@ -146,6 +167,16 @@ impl GeometryPrepass {
             jitter: [view.jitter.x, view.jitter.y, 0.0, 0.0],
         };
         frame
+    }
+
+    /// The sampler this pass reads material maps through.
+    ///
+    /// Lent to the shadow pass's cutout pipeline rather than duplicated there:
+    /// an alpha test that filtered differently from the two passes it has to
+    /// agree with would cut the leaf out at a slightly different place in the
+    /// shadow map than in the frame, which reads as the shadow being offset.
+    pub(super) fn material_sampler(&self) -> &Arc<Sampler> {
+        &self.sampler
     }
 
     /// The set-1 per-object descriptor set this pass binds.
@@ -217,6 +248,7 @@ impl GeometryPrepass {
         draws: DrawList<'_>,
         extent: [u32; 2],
         frame: Subbuffer<FrameUbo>,
+        decals: Subbuffer<super::forward::GpuDecals>,
         object_set: Arc<DescriptorSet>,
         material_set: Arc<DescriptorSet>,
         texture_set: Arc<DescriptorSet>,
@@ -224,7 +256,14 @@ impl GeometryPrepass {
         let frame_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::buffer(0, frame)],
+            [
+                WriteDescriptorSet::buffer(0, frame),
+                // The very buffer object the forward pass's set 0 binds. See
+                // `ForwardPass::upload_decals` — one allocation bound twice is
+                // what keeps the two passes from stamping different decals onto
+                // the same pixel.
+                WriteDescriptorSet::buffer(1, decals),
+            ],
             [],
         )
         .unwrap();
@@ -240,16 +279,10 @@ impl GeometryPrepass {
                 .into_iter()
                 .collect(),
             )
-            .unwrap()
-            .bind_pipeline_graphics(self.pipeline.clone())
-            .unwrap()
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.pipeline.layout().clone(),
-                0,
-                vec![frame_set, object_set, material_set, texture_set],
-            )
             .unwrap();
+
+        let sets = vec![frame_set, object_set, material_set, texture_set];
+        let mut bound: Option<bool> = None;
 
         // One instanced draw per (mesh, material) run, matching the forward pass.
         // The model and normal matrices come from the shared object buffer, so
@@ -259,12 +292,37 @@ impl GeometryPrepass {
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
+            // The same question the forward pass asks of the same flag word, so
+            // the two passes cut a cutout out at the same place. See
+            // `GpuMaterial::is_masked`.
+            let wants_masked = renderer
+                .materials
+                .get(item.material.0 as usize)
+                .is_some_and(super::forward::GpuMaterial::is_masked);
+            let pipeline = if wants_masked {
+                &self.masked_pipeline
+            } else {
+                &self.pipeline
+            };
+            if bound != Some(wants_masked) {
+                builder
+                    .bind_pipeline_graphics(pipeline.clone())
+                    .unwrap()
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipeline.layout().clone(),
+                        0,
+                        sets.clone(),
+                    )
+                    .unwrap();
+                bound = Some(wants_masked);
+            }
             let push = PrepassPush {
                 object_base: run.start as u32,
                 material_index: item.material.0,
             };
             builder
-                .push_constants(self.pipeline.layout().clone(), 0, push)
+                .push_constants(pipeline.layout().clone(), 0, push)
                 .unwrap()
                 .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
                 .unwrap()
@@ -293,15 +351,17 @@ fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
     .unwrap()
 }
 
-fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+fn build_pipeline(
+    device: &Arc<Device>,
+    render_pass: &Arc<RenderPass>,
+    fragment: Arc<vulkano::shader::ShaderModule>,
+    masked: bool,
+) -> Arc<GraphicsPipeline> {
     let vs = prepass_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
         .unwrap();
-    let fs = prepass_fs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
+    let fs = fragment.entry_point("main").unwrap();
     let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
     let stages = [
         PipelineShaderStageCreateInfo::new(vs),
@@ -324,7 +384,14 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
             input_assembly_state: Some(InputAssemblyState::default()),
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState {
-                cull_mode: CullMode::Back,
+                // Two-sided for a cutout, matching the forward pass. The two
+                // rasterise the same triangles or the depth this pass leaves is
+                // not the depth the frame was shaded against.
+                cull_mode: if masked {
+                    CullMode::None
+                } else {
+                    CullMode::Back
+                },
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState::default()),
@@ -352,5 +419,16 @@ mod prepass_fs {
         ty: "fragment",
         path: "shaders/prepass.frag",
         include: ["shaders"],
+    }
+}
+/// The same source with the cutout's `discard` compiled in. Two modules rather
+/// than two files, because the difference really is one define — everything
+/// about what this pass reports stays in the one file both compile from.
+mod prepass_fs_masked {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "shaders/prepass.frag",
+        include: ["shaders"],
+        define: [("ORRIN_MASKED", "1")],
     }
 }

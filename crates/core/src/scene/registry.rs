@@ -40,6 +40,9 @@ pub const PARENT: ComponentId = ComponentId::new("orrin.parent");
 /// - `MeshHandle` / `MaterialHandle` index a runtime asset table, so writing
 ///   one to disk would bake a session-local number into a scene. They register
 ///   once assets have stable ids.
+/// - `Decal` names its three maps by `TextureHandle`, which is an upload index
+///   and so session-local for exactly the reason the two handles above are. It
+///   registers alongside them, once assets have stable ids.
 /// - `ScriptComponent` owns a `GCHandle` whose `Drop` is the single managed
 ///   teardown path. It joins as a *bridge* to the C# property bag, never as an
 ///   ordinary component — a registry `write` replaces the component wholesale,

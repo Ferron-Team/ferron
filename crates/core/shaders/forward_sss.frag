@@ -24,6 +24,11 @@ layout(location = 1) out vec4 f_subsurface;
 
 void main() {
     Shaded shaded = shade_surface();
-    f_color = vec4(shaded.color, 1.0);
+    // Coverage, as in `forward.frag`. Alpha to coverage reads the *first*
+    // attachment's alpha and applies the result to every attachment, so a leaf's
+    // scattered light is carved out by the same samples its colour is — which is
+    // what keeps the diffusion from spreading radiance out of a texel the cutout
+    // removed.
+    f_color = vec4(shaded.color, mask_coverage(shaded.alpha));
     f_subsurface = vec4(shaded.diffusible, shaded.scatter);
 }

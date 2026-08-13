@@ -4,9 +4,10 @@ use crate::gfx::shadows::MAX_CASCADES;
 
 use super::{color_row, vec3_row};
 use crate::scene::{
-    AmbientLight, BloomSettings, Camera, ContactShadowSettings, DofSettings, EnvironmentSettings,
-    FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings,
-    SsrSettings, SubsurfaceSettings, TaaSettings, TransparencySettings,
+    AmbientLight, BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings,
+    EnvironmentSettings, FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings,
+    ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
+    TransparencySettings,
 };
 
 type Column = fn(&mut egui::Ui, &World);
@@ -160,6 +161,19 @@ fn screen_space_column(ui: &mut egui::Ui, world: &World) {
         // non-opaque surface looks wrong.
         ui.checkbox(&mut refraction.enabled, "Enabled")
             .on_hover_text("Off draws nothing at all where a transmissive material is used");
+    }
+    ui.add_space(6.0);
+    ui.strong("Decals")
+        .on_hover_text("Boxes that stamp maps onto the surfaces inside them, before shading");
+    {
+        let mut decals = world.resource_mut::<DecalSettings>();
+        // Unlike everything above it in this column, this is *not* frame
+        // structure: decals add no pass and no target, so the graph is the same
+        // either way and nothing is reallocated when it is clicked. It is here
+        // as the A/B — decals land under the lighting, so "is this a decal or a
+        // light?" is otherwise a hard question to ask of a still frame.
+        ui.checkbox(&mut decals.enabled, "Enabled")
+            .on_hover_text("Off leaves every surface as its own material describes it");
     }
 }
 

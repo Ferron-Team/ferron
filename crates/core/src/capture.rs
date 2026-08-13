@@ -23,14 +23,14 @@ use vulkano::VulkanLibrary;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
 use crate::gfx::punctual::ShadowAtlas;
-use crate::gfx::shadows::CascadeSet;
-use crate::gfx::vulkan::VulkanRenderer;
-use crate::gfx::{RenderBackend, SceneLighting};
+use crate::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
+use crate::gfx::vulkan::{ShadowFrame, VulkanRenderer};
+use crate::gfx::{DrawList, RenderBackend, SceneLighting};
 use crate::scene::entities::build_default_scene;
 use crate::scene::{
-    BloomSettings, Camera, ContactShadowSettings, DofSettings, EnvironmentSettings, HdrSettings,
-    MotionBlurSettings, RefractionSettings, SsaoSettings, SsrSettings, SubsurfaceSettings,
-    TaaSettings, TransparencySettings,
+    BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings, EnvironmentSettings,
+    HdrSettings, MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings,
+    SubsurfaceSettings, TaaSettings, TransparencySettings,
 };
 use crate::systems::{self, FrameGeometry};
 
@@ -57,6 +57,22 @@ pub struct CaptureSettings {
     /// switch scattering off — the analytic wrap widens to stand in — so the A/B
     /// between the two captures is exactly what the diffusion passes contribute.
     pub subsurface: bool,
+    /// Whether decals are projected. The A/B that says which marks on a surface
+    /// are decals and which are the material, which is otherwise a hard question
+    /// to ask of a still frame — a decal lands *under* the lighting, so it looks
+    /// exactly like something that was always painted there. That is the feature
+    /// working, and it is also why it needs a capture with it off.
+    pub decals: bool,
+    /// Whether the sun's cascades are fitted and drawn.
+    ///
+    /// Off by default, and that is a cost decision rather than a claim that
+    /// shadows do not matter: cascades are a second caster extraction and a
+    /// depth pass per cascade on every warm-up frame, which every capture would
+    /// then pay for. Switched on for the ones that are *about* a shadow — a
+    /// cutout's caster pipeline runs its own alpha test, and the difference
+    /// between a leaf-shaped shadow and a quad-shaped one is the only place that
+    /// pipeline is visible at all.
+    pub shadows: bool,
     /// Where to photograph the scene from, or `None` for the camera it ships
     /// with.
     ///
@@ -78,6 +94,8 @@ impl Default for CaptureSettings {
             refraction: true,
             taa: true,
             subsurface: true,
+            decals: true,
+            shadows: false,
             camera: None,
         }
     }
@@ -105,6 +123,9 @@ pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings)
         enabled: settings.subsurface,
         ..SubsurfaceSettings::default()
     });
+    world.insert_resource(DecalSettings {
+        enabled: settings.decals,
+    });
     world.insert_resource(TransparencySettings {
         enabled: settings.transparency,
     });
@@ -123,11 +144,13 @@ pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings)
 
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
-    // No cascades and no atlas: shadows are a second whole extraction and a
-    // caster list per light, and this is a picture of the shading. A capture
-    // that wants them can grow a `ShadowFrame` the way `app.rs` builds one.
-    let cascades = CascadeSet::default();
+    let mut decals = Vec::new();
+    // No punctual atlas either way: the sun is what a cutout's shadow is legible
+    // against, and a tile per face per lamp is a second budget for no extra
+    // evidence. A capture that wants one grows it the way `app.rs` does.
     let atlas = ShadowAtlas::default();
+    let shadow_settings = ShadowSettings::default();
+    let mut cascade_set = CascadeSet::default();
     let aspect = settings.extent[0] as f32 / settings.extent[1] as f32;
 
     for _ in 0..settings.frames.max(1) {
@@ -137,13 +160,31 @@ pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings)
         // and the frame is a skybox with nothing in front of it.
         crate::scene::propagate_transforms(&mut world);
         systems::extract_lighting(&world, &mut lighting);
-        systems::extract_geometry(&world, aspect, &cascades, &atlas, &mut geometry);
-
         let camera = *world.resource::<Camera>();
-        renderer.render(
+        // Fitted before extraction and after the lighting, exactly as `app.rs`
+        // orders it: the boxes are built around the sun that extraction just
+        // found, and the caster lists are culled against those boxes.
+        cascade_set = if settings.shadows {
+            cascades(
+                &camera,
+                aspect,
+                lighting.sun.direction,
+                &shadow_settings.cascade_config(),
+            )
+        } else {
+            CascadeSet::default()
+        };
+        systems::extract_geometry(&world, aspect, &cascade_set, &atlas, &mut geometry);
+        systems::extract_decals(&world, aspect, &mut decals);
+
+        let caster_lists: [DrawList<'_>; MAX_CASCADES] =
+            std::array::from_fn(|i| geometry.cascade(i));
+        let punctual_lists: [DrawList<'_>; 0] = [];
+        renderer.render_with_overlay(
             geometry.visible(),
             geometry.transparent(),
             geometry.refractive(),
+            &decals,
             &lighting,
             &camera,
             &world.resource::<SsaoSettings>().clone(),
@@ -162,6 +203,21 @@ pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings)
             // the same picture: auto-exposure adapts over time, and a capture
             // that depended on how fast the host was would be useless to diff.
             1.0 / 60.0,
+            // No debug lines, no profiler, no editor: this is a picture of the
+            // scene. `render_with_overlay` rather than `render` only because the
+            // shadow frame comes in through it — an `Option` so that a capture
+            // with shadows off is byte for byte the frame it was before this
+            // existed.
+            &[],
+            0,
+            (cascade_set.count > 0).then(|| ShadowFrame {
+                cascades: &cascade_set,
+                casters: &caster_lists,
+                atlas: &atlas,
+                punctual_casters: &punctual_lists,
+                settings: &shadow_settings,
+            }),
+            None,
         );
     }
 

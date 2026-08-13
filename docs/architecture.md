@@ -74,6 +74,10 @@ Environments are calibrated rather than scaled, which is what makes a downloaded
 
 Physical units have landed, ahead of the bindless table. A sun carries lux, a point or spot light lumens, ambient and emission cd/m², and the conversion to the candela the shader wants lives with the component so both integrators divide by the same 4π. The frame is therefore in real luminance end to end, which is what makes the EV100 exposure model mean what it says and the histogram window a statement about the world rather than a guess. The break was taken deliberately and loudly: the old unitless `intensity` field is gone rather than reinterpreted, so a scene authored against it fails to load naming the field instead of loading three orders of magnitude too dark.
 
+Decals belong to the material model rather than to the rasteriser, and are built that way: a decal box rewrites a surface's albedo, normal and specular parameters *before* anything is integrated, in one shared file that the forward pass, the two non-opaque queues and the geometry prepass all include. That is what puts a stamp under the shadows and the reflections instead of over them — and it is what §3.4's path tracer will have to do too, at the same point in its own surface evaluation, for exactly the reason it has to agree about how bright a bulb is. A decal composited onto the raster image afterwards would be a term the two integrators could never be compared on.
+
+Alpha-masked materials are the same argument at a smaller scale. Which pixels of a leaf card exist is a property of the material, so it is answered identically in every pass that rasterises the surface — with alpha to coverage where there are MSAA samples to spend on it and a hard test where there are not, cutting along the same line either way.
+
 The payoff is that content made during the showcase years never gets re-authored, and the two integrators can be compared pixel for pixel. Which leads to the most useful early step:
 
 ### 3.4 A reference path tracer, early and slow

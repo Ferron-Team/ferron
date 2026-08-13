@@ -47,9 +47,32 @@ struct PushConstants {
     object_base: u32,
 }
 
+/// The cutout variant's, four bytes longer: it also names the material row to
+/// alpha-test against. Two structs rather than one with an unused tail, because
+/// a push-constant member no stage reads can be stripped from the reflected
+/// range and the write would then run past its end.
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+struct MaskedPushConstants {
+    light_view_proj: [[f32; 4]; 4],
+    object_base: u32,
+    material_index: u32,
+}
+
 pub struct ShadowPass {
     pub(super) render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
+    /// The caster pipeline for a `Masked` material: two-sided, and running the
+    /// fragment shader's alpha test.
+    ///
+    /// Without it a cutout casts the shadow of the quad its texels are painted
+    /// on, which is the single most visible way foliage goes wrong — the
+    /// silhouette is right in the frame and a rectangle on the ground. It needs
+    /// the material table and the texture array that the depth-only pipeline
+    /// has no use for, so its layout has three sets where the plain one has one;
+    /// set 0 is identical in both, which is what lets the object set stay bound
+    /// across a switch.
+    masked_pipeline: Arc<GraphicsPipeline>,
     /// 1x1 array depth image cleared to 1.0, bound when shadows are off so the
     /// forward shader samples "fully lit" with no second code path. Not a graph
     /// resource: with shadows off the graph has no cascade image at all, so
@@ -75,11 +98,13 @@ impl ShadowPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
         let render_pass = depth_only_render_pass(device);
-        let pipeline = build_pipeline(device, &render_pass);
+        let pipeline = build_pipeline(device, &render_pass, false);
+        let masked_pipeline = build_pipeline(device, &render_pass, true);
 
         Self {
             render_pass,
             pipeline,
+            masked_pipeline,
             lit_view: build_lit_view(ctx),
             lit_atlas_view: build_lit_atlas_view(ctx),
             constant_bias: 1.25,
@@ -118,6 +143,49 @@ impl ShadowPass {
         .unwrap()
     }
 
+    /// The set-1 material table and set-2 texture array the cutout pipeline
+    /// alpha-tests against, over the same buffer and the same views every other
+    /// pass reads. Cached by the renderer beside the prepass's, and rebuilt on
+    /// the same invalidations.
+    pub(super) fn build_material_set(
+        &self,
+        ctx: &VkContext,
+        materials: &Subbuffer<[super::forward::GpuMaterial]>,
+    ) -> Arc<DescriptorSet> {
+        DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            self.masked_pipeline.layout().set_layouts()[1].clone(),
+            [WriteDescriptorSet::buffer(0, materials.clone())],
+            [],
+        )
+        .unwrap()
+    }
+
+    pub(super) fn build_texture_set(
+        &self,
+        ctx: &VkContext,
+        textures: &[Arc<ImageView>],
+        sampler: &Arc<Sampler>,
+    ) -> Arc<DescriptorSet> {
+        let default_view = textures[0].clone();
+        let texture_array = (0..crate::gfx::MAX_TEXTURES).map(|index| {
+            textures
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| default_view.clone())
+        });
+        DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            self.masked_pipeline.layout().set_layouts()[2].clone(),
+            [
+                WriteDescriptorSet::image_view_array(0, 0, texture_array),
+                WriteDescriptorSet::sampler(1, sampler.clone()),
+            ],
+            [],
+        )
+        .unwrap()
+    }
+
     /// Record one cascade's depth pass.
     ///
     /// `resolution` is the shadow map's, not the frame's — every other pass in
@@ -132,26 +200,20 @@ impl ShadowPass {
         view_proj: Mat4,
         object_base: u32,
         resolution: u32,
-        object_set: Arc<DescriptorSet>,
+        sets: &CasterSets,
     ) {
         self.set_tile(builder, [0, 0], resolution);
         // Dynamic so the editor's bias sliders tune acne live instead of
         // rebuilding the pipeline on every drag. `clamp` stays 0.0: a nonzero
-        // one needs the `depth_bias_clamp` device feature.
+        // one needs the `depth_bias_clamp` device feature. Set before any
+        // pipeline is bound, which is fine and is the point of dynamic state: it
+        // survives the pipeline switches `draw` makes between cutout runs and
+        // the rest.
         builder
             .set_depth_bias(self.constant_bias, 0.0, self.slope_bias)
-            .unwrap()
-            .bind_pipeline_graphics(self.pipeline.clone())
-            .unwrap()
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.pipeline.layout().clone(),
-                0,
-                vec![object_set],
-            )
             .unwrap();
 
-        self.draw(builder, renderer, casters, view_proj, object_base);
+        self.draw(builder, renderer, casters, view_proj, object_base, sets);
     }
 
     /// Record every face of every punctual caster into one atlas.
@@ -169,19 +231,10 @@ impl ShadowPass {
         atlas: &ShadowAtlas,
         casters: &[DrawList<'_>],
         bases: &[u32],
-        object_set: Arc<DescriptorSet>,
+        sets: &CasterSets,
     ) {
         builder
             .set_depth_bias(self.punctual_constant_bias, 0.0, self.punctual_slope_bias)
-            .unwrap()
-            .bind_pipeline_graphics(self.pipeline.clone())
-            .unwrap()
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.pipeline.layout().clone(),
-                0,
-                vec![object_set],
-            )
             .unwrap();
 
         for (index, caster) in atlas.casters.iter().enumerate() {
@@ -193,7 +246,7 @@ impl ShadowPass {
             }
             for face in &atlas.faces[caster.first_face..caster.first_face + caster.face_count] {
                 self.set_tile(builder, face.tile.offset, face.tile.size);
-                self.draw(builder, renderer, *list, face.view_proj, base);
+                self.draw(builder, renderer, *list, face.view_proj, base, sets);
             }
         }
     }
@@ -236,6 +289,13 @@ impl ShadowPass {
 
     /// The draw loop both callers share: one instanced draw per (mesh, material)
     /// run, with the light's matrix pushed per run.
+    ///
+    /// Nothing is bound on entry — not the pipeline and not the object set —
+    /// because a run's material decides both. Every tile of the atlas and every
+    /// cascade re-enters here, so the first run of each rebinds; that is one
+    /// bind per tile against a loop whose body is a draw call, and it is what
+    /// lets the pipeline change *inside* a tile when the caster list mixes
+    /// foliage with everything else.
     fn draw(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
@@ -243,19 +303,71 @@ impl ShadowPass {
         casters: DrawList<'_>,
         view_proj: Mat4,
         object_base: u32,
+        sets: &CasterSets,
     ) {
+        let mut bound: Option<bool> = None;
         for run in casters.runs() {
             let item = casters.item(run.start);
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
-            let push = PushConstants {
-                light_view_proj: view_proj.to_cols_array_2d(),
-                object_base: object_base + run.start as u32,
+            // The same flag word the forward pass and the prepass read, so all
+            // three cut the cutout out along the same line. A caster list with
+            // no cutout in it never touches `masked_pipeline` and records
+            // exactly what it recorded before this existed.
+            let wants_masked = renderer
+                .materials
+                .get(item.material.0 as usize)
+                .is_some_and(super::forward::GpuMaterial::is_masked);
+            let pipeline = if wants_masked {
+                &self.masked_pipeline
+            } else {
+                &self.pipeline
             };
+            if bound != Some(wants_masked) {
+                builder
+                    .bind_pipeline_graphics(pipeline.clone())
+                    .unwrap()
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipeline.layout().clone(),
+                        0,
+                        sets.for_pipeline(wants_masked),
+                    )
+                    .unwrap();
+                bound = Some(wants_masked);
+            }
+
+            let object_base = object_base + run.start as u32;
+            let light_view_proj = view_proj.to_cols_array_2d();
+            // Two ranges, so two writes. The plain pipeline's layout has no
+            // material index in its range and pushing one would run past its
+            // end — see `MaskedPushConstants`.
+            if wants_masked {
+                builder
+                    .push_constants(
+                        pipeline.layout().clone(),
+                        0,
+                        MaskedPushConstants {
+                            light_view_proj,
+                            object_base,
+                            material_index: item.material.0,
+                        },
+                    )
+                    .unwrap();
+            } else {
+                builder
+                    .push_constants(
+                        pipeline.layout().clone(),
+                        0,
+                        PushConstants {
+                            light_view_proj,
+                            object_base,
+                        },
+                    )
+                    .unwrap();
+            }
             builder
-                .push_constants(self.pipeline.layout().clone(), 0, push)
-                .unwrap()
                 .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
                 .unwrap()
                 .bind_index_buffer(mesh.index_buffer.clone())
@@ -265,6 +377,33 @@ impl ShadowPass {
                     .draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0)
                     .unwrap();
             }
+        }
+    }
+}
+
+/// What a caster draw binds, in the two shapes the two pipelines want.
+///
+/// One struct rather than three parameters threaded through `record`,
+/// `record_atlas` and `draw`, and it holds the *cutout* sets as an `Option`
+/// because a frame is entitled to have no material table cached yet — nothing
+/// here forces the alpha-testing pipeline into existence for a scene with no
+/// foliage in it.
+pub(super) struct CasterSets {
+    pub objects: Arc<DescriptorSet>,
+    pub materials: Arc<DescriptorSet>,
+    pub textures: Arc<DescriptorSet>,
+}
+
+impl CasterSets {
+    fn for_pipeline(&self, masked: bool) -> Vec<Arc<DescriptorSet>> {
+        if masked {
+            vec![
+                self.objects.clone(),
+                self.materials.clone(),
+                self.textures.clone(),
+            ]
+        } else {
+            vec![self.objects.clone()]
         }
     }
 }
@@ -313,15 +452,24 @@ fn depth_only_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
     .unwrap()
 }
 
-fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
-    let vs = vs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let fs = fs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
+fn build_pipeline(
+    device: &Arc<Device>,
+    render_pass: &Arc<RenderPass>,
+    masked: bool,
+) -> Arc<GraphicsPipeline> {
+    let (vs, fs) = if masked {
+        (
+            vs_masked::load(device.clone()).unwrap(),
+            fs_masked::load(device.clone()).unwrap(),
+        )
+    } else {
+        (
+            vs::load(device.clone()).unwrap(),
+            fs::load(device.clone()).unwrap(),
+        )
+    };
+    let vs = vs.entry_point("main").unwrap();
+    let fs = fs.entry_point("main").unwrap();
 
     let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
     let stages = [
@@ -350,7 +498,11 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
                 // correct because `fit_cascade` applies the same Y flip the
                 // camera projection does — otherwise the winding is mirrored
                 // here and this would cull front faces instead.
-                cull_mode: CullMode::Back,
+                cull_mode: if masked {
+                    CullMode::None
+                } else {
+                    CullMode::Back
+                },
                 // Placeholders; the real values are set dynamically per frame.
                 depth_bias: Some(DepthBiasState::default()),
                 ..Default::default()
@@ -452,4 +604,20 @@ mod vs {
 }
 mod fs {
     vulkano_shaders::shader! { ty: "fragment", path: "shaders/shadow.frag" }
+}
+/// The cutout variants of the two above, from the same two files: one define
+/// turns the vertex shader's UV on and the fragment shader's alpha test with it.
+mod vs_masked {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        path: "shaders/shadow.vert",
+        define: [("ORRIN_MASKED", "1")],
+    }
+}
+mod fs_masked {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "shaders/shadow.frag",
+        define: [("ORRIN_MASKED", "1")],
+    }
 }

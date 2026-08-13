@@ -26,9 +26,10 @@ use crate::profile_scope;
 use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene};
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, ContactShadowSettings, Culling, DebugLine, DebugLines,
-    Diagnostics, DofSettings, EnvironmentSettings, FogSettings, HdrSettings, InputState, LogBuffer,
-    LogLevel, MotionBlurSettings, PresentSettings, RefractionSettings, ShadowSettings, SsaoSettings,
-    SsrSettings, SubsurfaceSettings, TaaSettings, Time, TransparencySettings, load_hdri,
+    DecalSettings, Diagnostics, DofSettings, EnvironmentSettings, FogSettings, HdrSettings,
+    InputState, LogBuffer, LogLevel, MotionBlurSettings, PresentSettings, RefractionSettings,
+    ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings, Time,
+    TransparencySettings, load_hdri,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -58,6 +59,10 @@ pub struct App {
     /// so its `Vec`s keep their capacity across frames instead of reallocating.
     geometry: FrameGeometry,
     lighting: SceneLighting,
+    /// This frame's decals. Kept alongside `lighting` for the same reason it is
+    /// a field rather than a local: extraction refills it every frame and the
+    /// allocation is reused.
+    decals: Vec<crate::gfx::DecalInstance>,
     /// This frame's cascade matrices. The caster orders live in `geometry`,
     /// which was culled against exactly these.
     cascades: CascadeSet,
@@ -168,6 +173,7 @@ impl App {
             last_instant: None,
             geometry: FrameGeometry::default(),
             lighting: SceneLighting::default(),
+            decals: Vec::new(),
             cascades: CascadeSet::default(),
             atlas: ShadowAtlas::default(),
             debug_lines: Vec::new(),
@@ -202,6 +208,7 @@ impl App {
         world.insert_resource(SsrSettings::default());
         world.insert_resource(SubsurfaceSettings::default());
         world.insert_resource(TransparencySettings::default());
+        world.insert_resource(DecalSettings::default());
         world.insert_resource(RefractionSettings::default());
         world.insert_resource(ShadowSettings::default());
         world.insert_resource(ContactShadowSettings::default());
@@ -580,6 +587,9 @@ impl ApplicationHandler for App {
                     let extent = active.renderer.extent();
                     let aspect = extent[0] as f32 / extent[1].max(1) as f32;
                     systems::extract_lighting(&self.world, &mut self.lighting);
+                    // Beside the lighting and for the same reason: a decal is
+                    // scene data two existing passes read, not a queue.
+                    systems::extract_decals(&self.world, aspect, &mut self.decals);
                     // Cascades are fitted before extraction because the caster
                     // lists are culled against them: a shadow pass needs what
                     // reaches its box, which is not what the camera can see.
@@ -668,8 +678,11 @@ impl ApplicationHandler for App {
                     renderer, editor, ..
                 } = active;
                 let mut draw_overlay = |before, image| editor.draw(before, image);
-                let overlay: Option<crate::gfx::vulkan::Overlay<'_>> =
-                    if overlay_on { Some(&mut draw_overlay) } else { None };
+                let overlay: Option<crate::gfx::vulkan::Overlay<'_>> = if overlay_on {
+                    Some(&mut draw_overlay)
+                } else {
+                    None
+                };
                 {
                     profile_scope!("render submit");
                     // Borrowed once here: `ShadowFrame` holds `DrawList`s into
@@ -682,6 +695,7 @@ impl ApplicationHandler for App {
                         self.geometry.visible(),
                         self.geometry.transparent(),
                         self.geometry.refractive(),
+                        &self.decals,
                         &self.lighting,
                         &camera,
                         &ssao,

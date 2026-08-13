@@ -30,6 +30,11 @@ layout(location = 6) out vec4 v_previous_clip;
 // world ones. Carried rather than reconstructed from depth so this pass keeps
 // reading only the two sets it already binds.
 layout(location = 7) out vec3 v_view_pos;
+// Where the fragment is in the world, for the decal projection. This pass works
+// in view space throughout — see above — but a decal's box is authored in world
+// space and the forward pass tests against it there, so testing here in any
+// other space would mean two descriptions of one box.
+layout(location = 8) out vec3 v_world_pos;
 
 layout(push_constant) uniform Push {
     // First object row of this instanced run; gl_InstanceIndex counts from it.
@@ -77,7 +82,9 @@ void main() {
 
     // `proj * view` is the same view-projection the forward pass pushes; taking
     // it from the frame UBO keeps the prepass push to the one instance offset.
-    vec4 view_pos = frame.view * model * vec4(position, 1.0);
+    vec4 world_pos = model * vec4(position, 1.0);
+    v_world_pos = world_pos.xyz;
+    vec4 view_pos = frame.view * world_pos;
     v_view_pos = view_pos.xyz;
     vec4 clip = frame.proj * view_pos;
     gl_Position = clip;

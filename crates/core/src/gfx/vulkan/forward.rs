@@ -30,8 +30,8 @@ use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, MAX_SHADOW_LIGHTS, Shadow
 use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
 use crate::gfx::{
-    BlendMode, DrawList, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, MAX_TEXTURES, Material, SceneLighting,
-    Vertex,
+    BlendMode, DecalInstance, DrawList, MAX_DECALS, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS,
+    MAX_TEXTURES, Material, SceneLighting, Vertex,
 };
 use crate::scene::{Camera, EnvironmentSettings};
 
@@ -126,6 +126,12 @@ pub(crate) mod material_flags {
     pub const TRANSMISSION: u32 = 1 << 3;
     pub const SUBSURFACE: u32 = 1 << 4;
     pub const PARALLAX: u32 = 1 << 5;
+    /// Unlike every bit above it, this one selects a *pipeline* as well as a
+    /// branch: the passes read it off `BlendMode` on the CPU to choose between
+    /// the plain and the alpha-testing variant. It rides here too so the shader
+    /// can ask the same question about the pixel it is on — the 1-sample passes
+    /// need it to know whether to `discard`.
+    pub const MASKED: u32 = 1 << 6;
 }
 
 /// Ceiling on a material's parallax step counts. Keep in sync with
@@ -158,12 +164,32 @@ pub(crate) struct GpuMaterial {
     /// Depth of the height field in metres, then the step counts the march is
     /// allowed head-on and edge-on.
     parallax: [f32; 4],
+    /// `x` = the alpha a `Masked` fragment must reach to survive.
+    ///
+    /// A block of its own rather than a spare lane in one of the ones above, for
+    /// the reason every block here has one: what a cutout is has nothing to do
+    /// with a height field or a coat, and a scalar parked in a neighbour's
+    /// padding is a comment away from being lost. Sixteen bytes a material.
+    alpha: [f32; 4],
     /// [clearcoat, clearcoat normal, sheen, anisotropy].
     tex_indices_ext: [u32; 4],
     /// [transmission, feature flags, subsurface, height]. The flags ride here
     /// rather than in a float field so the shader can test them without
     /// `floatBitsToUint`.
     tex_flags: [u32; 4],
+}
+
+impl GpuMaterial {
+    /// Whether a run drawing with this material needs the alpha-testing
+    /// pipeline.
+    ///
+    /// Asked of the *uploaded* flag word rather than of a second CPU-side table,
+    /// so the pipeline a draw is recorded with and the branch its shader takes
+    /// are reading one bit. A `MaterialBlends` that disagreed with the material
+    /// it was registered beside could then only cost a queue, never a pipeline.
+    pub(super) fn is_masked(&self) -> bool {
+        self.tex_flags[1] & material_flags::MASKED != 0
+    }
 }
 
 /// Pack the engine's [`SceneLighting`] into the std140 layout the shader expects.
@@ -412,6 +438,77 @@ struct GpuLighting {
     irradiance: [[f32; 4]; SH9],
 }
 
+/// Feature bits in [`GpuDecal::tex`]`[3]`, mirrored by `shaders/decals.glsl`.
+///
+/// Both say whether a block was *authored*, exactly as `material_flags` does,
+/// and both exist because the neutral value is not available: a decal with no
+/// normal map would decode the flat-normal default to its own projection axis
+/// and tilt every surface it touched to face the projector, and there is no
+/// roughness that means "leave what was there".
+pub(crate) mod decal_flags {
+    pub const NORMAL: u32 = 1 << 0;
+    pub const SURFACE: u32 = 1 << 1;
+}
+
+/// One decal as the shader reads it. 160 bytes; std430 packs this exactly like
+/// the `#[repr(C)]` here because every field is 16 bytes or a `mat4`.
+#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[repr(C)]
+pub(crate) struct GpuDecal {
+    world_to_decal: [[f32; 4]; 4],
+    /// `rgb` = tint, `a` = opacity.
+    base_color: [f32; 4],
+    /// metallic, roughness, normal strength, cos(fade angle).
+    params: [f32; 4],
+    /// [albedo, normal, metal-rough, feature flags]. The flags ride in a `uint`
+    /// lane for the reason `GpuMaterial`'s do.
+    tex: [u32; 4],
+    /// The decal's own axes in world space: `u`, `v` and the projection axis.
+    /// Three `vec4`s rather than a `mat3`, because std430 lays a `mat3` out as
+    /// three `vec4`s anyway and this way both sides can see that it does.
+    axis_u: [f32; 4],
+    axis_v: [f32; 4],
+    axis_n: [f32; 4],
+}
+
+impl GpuDecal {
+    /// A slot no fragment will ever be inside: the identity puts the box at the
+    /// origin, and a zero opacity would weight it away even there. Written into
+    /// the tail of the block so nothing is left undefined, though the count is
+    /// what actually stops the loop.
+    const ZERO: Self = Self {
+        world_to_decal: [[0.0; 4]; 4],
+        base_color: [0.0; 4],
+        params: [0.0; 4],
+        tex: [0; 4],
+        axis_u: [0.0; 4],
+        axis_v: [0.0; 4],
+        axis_n: [0.0; 4],
+    };
+}
+
+/// The whole decal block: how many are live, then a fixed array of them.
+///
+/// One buffer with the count inside it rather than a count passed alongside,
+/// and that is the point. The forward pass reads its frame data out of the
+/// lighting uniform and the prepass reads its own out of `FrameUbo`; a count
+/// added to both would be two places to keep in step, and a frame where they
+/// disagreed would light a decal the prepass had not written a normal for. Here
+/// there is one array and one length, in one allocation, bound to both.
+///
+/// Fixed-length rather than a runtime-sized array, which costs 2.5 KB a frame
+/// whether the scene has decals or not and buys a `Subbuffer<GpuDecals>` that
+/// both passes can bind with no length to agree on either.
+#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[repr(C)]
+pub(crate) struct GpuDecals {
+    /// `x` = how many of `decals` are live. A `uvec4` because std430 aligns the
+    /// struct that follows it to sixteen bytes regardless, so the padding may as
+    /// well be visible on both sides.
+    count: [u32; 4],
+    decals: [GpuDecal; MAX_DECALS],
+}
+
 /// One atlas face as the shader reads it: the matrix that rendered it, and the
 /// slice of the atlas it landed in.
 ///
@@ -481,6 +578,18 @@ pub struct ForwardPass {
     pub subsurface_render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
     subsurface_pipeline: Arc<GraphicsPipeline>,
+    /// The same two, with alpha to coverage on and back faces kept, for the
+    /// `Masked` runs inside the same render pass.
+    ///
+    /// Four pipelines rather than two, and built at startup for the reason the
+    /// second render pass is: which of them a *frame* uses is structural, but
+    /// which of them a *run* uses is per draw, so both have to exist at once
+    /// regardless. They are built from the identical shader modules and the
+    /// identical shadow sampler as their plain counterparts — only the
+    /// multisample and rasterization state differ — so all four are set
+    /// compatible and the executor's five descriptor sets bind to any of them.
+    masked_pipeline: Arc<GraphicsPipeline>,
+    masked_subsurface_pipeline: Arc<GraphicsPipeline>,
     uniform_buffer_allocator: SubbufferAllocator,
     /// Per-frame storage for the atlas face table. A storage buffer rather than
     /// more of the lighting uniform: forty-eight matrices is three kilobytes,
@@ -488,6 +597,11 @@ pub struct ForwardPass {
     shadow_face_allocator: SubbufferAllocator,
     /// Per-frame streaming allocator for the set-4 per-object transform buffer.
     object_buffer_allocator: SubbufferAllocator,
+    /// Per-frame storage for the decal block. Owned here rather than by a decal
+    /// module because there is no decal *pass* to own it — the block is frame
+    /// data that two existing passes read, which is exactly what the shadow face
+    /// table above is.
+    decal_allocator: SubbufferAllocator,
     sampler: Arc<Sampler>,
     ao_sampler: Arc<Sampler>,
 }
@@ -578,19 +692,35 @@ impl ForwardPass {
         )
         .unwrap();
 
-        // One sampler for both pipelines. See `build_pipeline`.
+        // One sampler for all four pipelines. See `build_pipeline`.
         let shadow_sampler = super::shadow::comparison_sampler(device);
         let pipeline = build_pipeline(
             device,
             &render_pass,
             fs::load(device.clone()).unwrap(),
             &shadow_sampler,
+            false,
         );
         let subsurface_pipeline = build_pipeline(
             device,
             &subsurface_render_pass,
             fs_sss::load(device.clone()).unwrap(),
             &shadow_sampler,
+            false,
+        );
+        let masked_pipeline = build_pipeline(
+            device,
+            &render_pass,
+            fs::load(device.clone()).unwrap(),
+            &shadow_sampler,
+            true,
+        );
+        let masked_subsurface_pipeline = build_pipeline(
+            device,
+            &subsurface_render_pass,
+            fs_sss::load(device.clone()).unwrap(),
+            &shadow_sampler,
+            true,
         );
 
         let uniform_buffer_allocator = SubbufferAllocator::new(
@@ -614,6 +744,16 @@ impl ForwardPass {
         );
 
         let shadow_face_allocator = SubbufferAllocator::new(
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::STORAGE_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
+
+        let decal_allocator = SubbufferAllocator::new(
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::STORAGE_BUFFER,
@@ -656,9 +796,12 @@ impl ForwardPass {
             subsurface_render_pass,
             pipeline,
             subsurface_pipeline,
+            masked_pipeline,
+            masked_subsurface_pipeline,
             uniform_buffer_allocator,
             object_buffer_allocator,
             shadow_face_allocator,
+            decal_allocator,
             sampler,
             ao_sampler,
         }
@@ -731,6 +874,73 @@ impl ForwardPass {
             [],
         )
         .unwrap()
+    }
+
+    /// Pack this frame's decals into the block both geometry passes bind.
+    ///
+    /// Uploaded unconditionally, including for a frame with no decals in it —
+    /// 2.5 KB of streaming write against a descriptor that has to be bound
+    /// either way, and a zero count is what the shader's frame-uniform branch
+    /// tests. The alternative is a "no decals" buffer kept alive as a second
+    /// path through both passes, which is more state to get wrong than the
+    /// write costs.
+    pub(super) fn upload_decals(&self, decals: &[DecalInstance]) -> Subbuffer<GpuDecals> {
+        let buffer = self.decal_allocator.allocate_sized::<GpuDecals>().unwrap();
+        {
+            let mut block = buffer.write().unwrap();
+            let count = decals.len().min(MAX_DECALS);
+            block.count = [count as u32, 0, 0, 0];
+            block.decals = [GpuDecal::ZERO; MAX_DECALS];
+            for (slot, decal) in block.decals.iter_mut().zip(decals.iter().take(count)) {
+                let mut flags = 0u32;
+                if decal.normal.is_some() {
+                    flags |= decal_flags::NORMAL;
+                }
+                if decal.affects_surface {
+                    flags |= decal_flags::SURFACE;
+                }
+                *slot = GpuDecal {
+                    world_to_decal: decal.world_to_decal.to_cols_array_2d(),
+                    base_color: [
+                        decal.base_color.x,
+                        decal.base_color.y,
+                        decal.base_color.z,
+                        decal.opacity,
+                    ],
+                    params: [
+                        decal.metallic,
+                        decal.roughness,
+                        decal.normal_strength,
+                        decal.angle_cos,
+                    ],
+                    tex: [
+                        decal.albedo.map_or(WHITE_TEXTURE, |h| h.0),
+                        decal.normal.map_or(FLAT_NORMAL_TEXTURE, |h| h.0),
+                        decal.metallic_roughness.map_or(WHITE_TEXTURE, |h| h.0),
+                        flags,
+                    ],
+                    axis_u: [
+                        decal.axes.x_axis.x,
+                        decal.axes.x_axis.y,
+                        decal.axes.x_axis.z,
+                        0.0,
+                    ],
+                    axis_v: [
+                        decal.axes.y_axis.x,
+                        decal.axes.y_axis.y,
+                        decal.axes.y_axis.z,
+                        0.0,
+                    ],
+                    axis_n: [
+                        decal.axes.z_axis.x,
+                        decal.axes.z_axis.y,
+                        decal.axes.z_axis.z,
+                        0.0,
+                    ],
+                };
+            }
+        }
+        buffer
     }
 
     /// Build this frame's per-object rows, written straight into the mapped
@@ -829,6 +1039,7 @@ impl ForwardPass {
         material_set: Arc<DescriptorSet>,
         texture_set: Arc<DescriptorSet>,
         object_set: Arc<DescriptorSet>,
+        decals: Subbuffer<GpuDecals>,
         environment: &EnvironmentSettings,
     ) -> ForwardSets {
         let lighting_buffer = self
@@ -876,7 +1087,16 @@ impl ForwardPass {
         let lighting_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::buffer(0, lighting_buffer)],
+            [
+                WriteDescriptorSet::buffer(0, lighting_buffer),
+                // The same buffer object the prepass binds. Not a copy: what a
+                // decal does to a normal, an `f0` and a roughness has to be the
+                // same in both passes or `ssr_resolve.comp` subtracts an
+                // environment term belonging to the surface as it was before the
+                // stamp landed — the identical argument the parallax march makes
+                // about *where* a map is sampled.
+                WriteDescriptorSet::buffer(1, decals),
+            ],
             [],
         )
         .unwrap();
@@ -936,10 +1156,10 @@ impl ForwardPass {
         // The jittered one, from the frame's shared view: every pass that
         // rasterises geometry has to agree on it to a subpixel.
         let view_proj = view.view_proj;
-        let pipeline = if subsurface {
-            &self.subsurface_pipeline
+        let (plain, masked) = if subsurface {
+            (&self.subsurface_pipeline, &self.masked_subsurface_pipeline)
         } else {
-            &self.pipeline
+            (&self.pipeline, &self.masked_pipeline)
         };
 
         builder
@@ -953,16 +1173,12 @@ impl ForwardPass {
                 .into_iter()
                 .collect(),
             )
-            .unwrap()
-            .bind_pipeline_graphics(pipeline.clone())
-            .unwrap()
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                pipeline.layout().clone(),
-                0,
-                sets.as_vec(),
-            )
             .unwrap();
+
+        // Nothing is bound yet, so the first run always binds. `None` rather
+        // than "the plain one" so that a frame of nothing but foliage does not
+        // begin by binding a pipeline it never draws with.
+        let mut bound: Option<bool> = None;
 
         // `extract_geometry` groups the order by (mesh, material), so each run
         // is one instanced draw: the recording cost stops scaling with entity
@@ -972,6 +1188,35 @@ impl ForwardPass {
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
+            // A run is one material, so this is one lookup per run rather than
+            // per item. The opaque order is left grouped by (mesh, material) and
+            // sorted front to back, which means cutouts are not a contiguous
+            // tail and this can flip more than once — a pipeline bind per run in
+            // the worst case, against a list whose length is distinct
+            // mesh/material pairs.
+            let wants_masked = renderer
+                .materials
+                .get(item.material.0 as usize)
+                .is_some_and(GpuMaterial::is_masked);
+            let pipeline = if wants_masked { masked } else { plain };
+            if bound != Some(wants_masked) {
+                // The descriptor sets are rebound with the incoming pipeline's
+                // layout. All four layouts are built from the same stages and
+                // the same immutable shadow sampler, so they are set compatible
+                // and this is a formality — but it is the formality that keeps
+                // it true if one of them ever stops being.
+                builder
+                    .bind_pipeline_graphics(pipeline.clone())
+                    .unwrap()
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipeline.layout().clone(),
+                        0,
+                        sets.as_vec(),
+                    )
+                    .unwrap();
+                bound = Some(wants_masked);
+            }
             let push = PushConstants::new(view_proj, item.material.0, run.start as u32);
 
             builder
@@ -1094,6 +1339,15 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
     if m.height_texture.is_some() && m.parallax_depth > 0.0 {
         flags |= material_flags::PARALLAX;
     }
+    // Read straight off the blend mode rather than derived from whether an alpha
+    // was authored, which is the one place this file's usual rule does not
+    // apply: every other flag above answers "would this change a pixel", and a
+    // cutout's answer is "yes, by removing it". A material whose albedo map has
+    // no alpha channel samples 1.0 and survives the test everywhere, which is
+    // the same no-op the default textures give the lobes.
+    if m.blend == BlendMode::Masked {
+        flags |= material_flags::MASKED;
+    }
 
     // Beer-Lambert wants an extinction coefficient per unit distance, and an
     // infinite attenuation distance is the "absorbs nothing" case the shader
@@ -1190,6 +1444,12 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
             parallax_max as f32,
             0.0,
         ],
+        // Clamped just inside the unit range at both ends. A cutoff of exactly
+        // zero would keep a fully transparent texel — the test is "reaches" —
+        // and one of exactly one would cut every texel of an opaque map away,
+        // which reads as the mesh having failed to load rather than as a badly
+        // authored number.
+        alpha: [m.alpha_cutoff.clamp(1e-3, 1.0 - 1e-3), 0.0, 0.0, 0.0],
         tex_indices_ext: [
             m.clearcoat_texture.map_or(WHITE_TEXTURE, |h| h.0),
             m.clearcoat_normal_texture
@@ -1267,6 +1527,14 @@ fn build_pipeline(
     // around the same sampler object. The same rule `refraction.rs` obeys by
     // lifting this layout instead of deriving it.
     shadow_sampler: &Arc<Sampler>,
+    // The alpha-testing variant, for `BlendMode::Masked`. It differs from the
+    // plain one in exactly two pieces of state, and both are the feature: back
+    // faces are kept, because a cutout sheet has no back to cull, and coverage
+    // is taken from the fragment's alpha, which spends the four samples this
+    // pass already rasterises on the cutout's edge. The shader module is the
+    // same one — there is no permutation here, only state — so a material that
+    // is masked and one that is not are shaded by the same code.
+    masked: bool,
 ) -> Arc<GraphicsPipeline> {
     let vs = vertex_shader(device);
     let fs = fragment.entry_point("main").unwrap();
@@ -1308,11 +1576,16 @@ fn build_pipeline(
             input_assembly_state: Some(InputAssemblyState::default()),
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState {
-                cull_mode: CullMode::Back,
+                cull_mode: if masked {
+                    CullMode::None
+                } else {
+                    CullMode::Back
+                },
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState {
                 rasterization_samples: vulkano::image::SampleCount::Sample4,
+                alpha_to_coverage_enable: masked,
                 ..Default::default()
             }),
             depth_stencil_state: Some(DepthStencilState {
@@ -1351,5 +1624,81 @@ mod fs_sss {
         ty: "fragment",
         path: "shaders/forward_sss.frag",
         include: ["shaders"],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GpuMaterial, material_flags, to_gpu_material};
+    use crate::gfx::{BlendMode, Material};
+
+    /// The bit the three opaque passes pick a pipeline from, and the value the
+    /// shader tests, are the same word — so this is the one place the two can be
+    /// checked against each other without a GPU. A material that answered
+    /// `is_masked` differently from what it uploaded would draw through the
+    /// alpha-to-coverage pipeline and then never test its alpha, or the reverse.
+    #[test]
+    fn only_a_masked_material_asks_for_the_alpha_testing_pipeline() {
+        for (blend, expected) in [
+            (BlendMode::Opaque, false),
+            (BlendMode::Masked, true),
+            (BlendMode::Blend, false),
+            (BlendMode::Transmissive, false),
+        ] {
+            let gpu = to_gpu_material(&Material {
+                blend,
+                ..Material::default()
+            });
+            assert_eq!(gpu.is_masked(), expected, "{blend:?}");
+            assert_eq!(
+                gpu.tex_flags[1] & material_flags::MASKED != 0,
+                expected,
+                "{blend:?}: the flag the shader reads disagrees with is_masked"
+            );
+            assert_eq!(blend.is_masked(), expected, "{blend:?}");
+        }
+    }
+
+    /// A cutout is opaque geometry: it writes depth, it is in the prepass, and it
+    /// is in every caster list. Only the two queues that write no depth leave.
+    #[test]
+    fn a_cutout_stays_in_the_opaque_queue() {
+        assert!(BlendMode::Masked.is_opaque());
+        assert!(BlendMode::Opaque.is_opaque());
+        assert!(!BlendMode::Blend.is_opaque());
+        assert!(!BlendMode::Transmissive.is_opaque());
+    }
+
+    /// Both ends of the range are degenerate and neither is worth shipping as a
+    /// mystery: at zero every texel survives including the fully transparent
+    /// ones, and at one every texel of an opaque map is cut away, which reads as
+    /// the mesh having failed to load rather than as a badly authored number.
+    #[test]
+    fn the_cutoff_is_clamped_inside_the_unit_range() {
+        let cutoff = |alpha_cutoff| {
+            to_gpu_material(&Material {
+                blend: BlendMode::Masked,
+                alpha_cutoff,
+                ..Material::default()
+            })
+            .alpha[0]
+        };
+        assert!(cutoff(0.0) > 0.0);
+        assert!(cutoff(1.0) < 1.0);
+        assert!(cutoff(-5.0) > 0.0);
+        assert_eq!(cutoff(0.5), 0.5);
+    }
+
+    /// std430 derives an array's stride from its element, so the mirrors in
+    /// `prepass.frag` and `shadow.frag` step through the table at whatever pitch
+    /// this struct is — a mirror one block short reads every material past the
+    /// first out of the middle of its neighbour. Nothing in either shader can
+    /// notice, which is why the size is pinned here.
+    #[test]
+    fn the_material_block_is_the_size_both_shader_mirrors_declare() {
+        // 15 vec4-sized blocks: base colour, emissive, params, texture indices,
+        // the five lobes' blocks, the two subsurface blocks, parallax, alpha,
+        // the extended indices, and the flags.
+        assert_eq!(std::mem::size_of::<GpuMaterial>(), 15 * 16);
     }
 }

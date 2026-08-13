@@ -3,11 +3,13 @@ use glam::Vec3;
 use orrin_ecs::World;
 
 use super::textures::{
-    brick, bump_normals, checkerboard, load_rgba, metallic_roughness, sky_equirect,
+    brick, bump_normals, checkerboard, foliage, load_rgba, metallic_roughness, scorch, sky_equirect,
 };
-use super::{spawn_directional_light, spawn_mesh, spawn_point_light, spawn_spot_light};
+use super::{
+    spawn_decal, spawn_directional_light, spawn_mesh, spawn_point_light, spawn_spot_light,
+};
 use crate::gfx::{BlendMode, Material, RenderBackend};
-use crate::scene::{Assets, Camera, CpuMesh, MaterialBlends, MeshBounds, Spin, Transform};
+use crate::scene::{Assets, Camera, CpuMesh, Decal, MaterialBlends, MeshBounds, Spin, Transform};
 
 const GRID: i32 = 10;
 const SPACING: f32 = 2.0;
@@ -244,6 +246,123 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
         );
     }
 
+    // A stand of leaf cards, and the readout for alpha to coverage.
+    //
+    // Crossed pairs rather than single quads, which is what foliage actually is
+    // and is also the thing that would go wrong first: two cutouts intersecting
+    // at ninety degrees write depth against each other, so any ordering mistake
+    // shows as one card erasing the other. Nothing here is sorted and nothing
+    // needs to be — this is the opaque queue.
+    //
+    // Look at the leaf edges against the sky. With the cutout drawn through the
+    // alpha-to-coverage pipeline they resolve to the sixteen levels four samples
+    // and a one-pixel ramp can express; a hard alpha test would give the same
+    // silhouette in four hard steps. Look at the ground for the second half:
+    // the shadows are leaf-shaped, which is the caster pipeline's alpha test and
+    // not this one.
+    // Outboard of the cube grid rather than standing in it, for two reasons that
+    // are really one. The cards intersected the cubes, which is the sort of thing
+    // a demo scene should not be showing anybody; and the sun throws their
+    // shadows a metre or so back and to the left, which inside the grid means
+    // onto other cubes. Out here the shadow lands on flat open ground, where the
+    // caster pipeline's alpha test is the only thing deciding its shape.
+    let foliage_material = world.resource::<Assets>().material("foliage").unwrap();
+    for (index, (x, z, yaw)) in [
+        (-11.5f32, 3.5f32, 10.0f32),
+        (-10.4, 6.5, -35.0),
+        (11.0, 4.0, -15.0),
+        (12.1, 7.0, 40.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (half, turn) in [(0usize, 0.0f32), (1, 90.0)] {
+            spawn_mesh(
+                world,
+                format!("Foliage {index}.{half}"),
+                Transform {
+                    // The quad lies in XZ facing up, so it is stood on edge and
+                    // then turned, exactly as the masonry panels are.
+                    translation: Vec3::new(x, 1.6, z),
+                    rotation: glam::Quat::from_rotation_y((yaw + turn).to_radians())
+                        * glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                    scale: Vec3::splat(3.2),
+                },
+                plane,
+                foliage_material,
+            );
+        }
+    }
+
+    // Three decals, and each is a different half of the claim.
+    //
+    // The two on the ground are aimed straight down and are deep enough to reach
+    // it from above; the third is aimed at the masonry wall along its own normal.
+    // What to look for, in order: the crater's rim catches the sun and the point
+    // lights, because a decal lands *before* shading rather than over it; the
+    // ground decals stop at the cubes standing in them instead of running up
+    // their sides, which is the angle fade; and the wall decal sits in the
+    // parallax-mapped brick without sliding against it as the camera moves,
+    // because the height march has already chosen where this pixel's surface is
+    // by the time the decal is projected onto it.
+    let scorch_albedo = world.resource::<Assets>().texture("scorch_albedo").unwrap();
+    let scorch_normal = world.resource::<Assets>().texture("scorch_normal").unwrap();
+    let scorch_rough = world.resource::<Assets>().texture("scorch_rough").unwrap();
+    let scorch_decal = Decal {
+        albedo: Some(scorch_albedo),
+        normal: Some(scorch_normal),
+        metallic_roughness: Some(scorch_rough),
+        affects_surface: true,
+        // Well under a right angle, which is what keeps these off the sides of
+        // the cubes their boxes swallow. Turn it up to 90 and the streaks it
+        // exists to prevent come straight back.
+        angle: 55.0,
+        ..Decal::default()
+    };
+    // On the open ground outboard of the sphere rows rather than inside the cube
+    // grid, and that is a lesson rather than a preference: put a five-metre decal
+    // among cubes on two-metre centres and what reaches the camera is a dozen
+    // slivers of ground between them. Enough to prove the projection works and
+    // useless as a photograph of it.
+    for (index, (x, z, size)) in [(-10.0f32, 10.0f32, 5.0f32), (9.5, 8.0, 3.5)]
+        .into_iter()
+        .enumerate()
+    {
+        spawn_decal(
+            world,
+            format!("Scorch {index}"),
+            Transform {
+                // The ground's top face is at -0.5; the box is `size * 0.4` deep
+                // along its projection axis, so it reaches from above it.
+                translation: Vec3::new(x, -0.5, z),
+                // Forward is -Z, so a quarter turn back about X aims it at the
+                // floor.
+                rotation: glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                scale: Vec3::new(size, size, size * 0.4),
+            },
+            scorch_decal,
+        );
+    }
+    spawn_decal(
+        world,
+        "Scorch (wall)",
+        Transform {
+            translation: Vec3::new(-0.8, 1.1, -12.7),
+            // The lower masonry panel's own normal: the same yaw the wall was
+            // turned by, which points this decal's +Z back out of it and so
+            // projects along -Z into it.
+            rotation: glam::Quat::from_rotation_y(25.0f32.to_radians()),
+            scale: Vec3::new(1.6, 1.6, 0.8),
+        },
+        Decal {
+            // Half strength, so the brick under it is plainly still there — a
+            // decal that replaced the surface would prove nothing about landing
+            // under the lighting.
+            opacity: 0.75,
+            ..scorch_decal
+        },
+    );
+
     let sun_dir = Vec3::new(-0.4, -1.0, -0.6).normalize();
     // Deep twilight, and chosen for that rather than inherited. Physical units put
     // the sun, the sky and every fixture on one scale, and under a 100 000 lux
@@ -445,6 +564,48 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Materia
             albedo_texture: Some(albedo),
             normal_texture: Some(normal),
             metallic_roughness_texture: Some(metal_rough),
+            ..Material::default()
+        },
+    );
+
+    // The cutout, and the one material in the demo whose alpha means shape
+    // rather than opacity. Two-sided and alpha-tested rather than blended, so it
+    // is in the prepass, in the caster lists, and lit like any other surface —
+    // which is exactly what separates `Masked` from `Blend`.
+    // Decal maps. No material and no `MaterialBlends` entry, because a decal is
+    // not drawn: these are three texture indices a `Decal` component names, read
+    // by the two passes that were rasterising the receiver anyway.
+    const SCORCH: u32 = 256;
+    let scorch_maps = scorch(SCORCH);
+    let scorch_albedo = backend.load_texture(&scorch_maps.albedo, SCORCH, SCORCH, true);
+    let scorch_normal = backend.load_texture(&scorch_maps.normal, SCORCH, SCORCH, false);
+    let scorch_rough = backend.load_texture(&scorch_maps.metallic_roughness, SCORCH, SCORCH, false);
+    assets.insert_texture("scorch_albedo", scorch_albedo);
+    assets.insert_texture("scorch_normal", scorch_normal);
+    assets.insert_texture("scorch_rough", scorch_rough);
+
+    const LEAF: u32 = 256;
+    let leaf_albedo = backend.load_texture(&foliage(LEAF), LEAF, LEAF, true);
+    assets.insert_texture("leaf_albedo", leaf_albedo);
+    load_material(
+        backend,
+        &mut assets,
+        &mut blends,
+        "foliage",
+        &Material {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 0.6,
+            albedo_texture: Some(leaf_albedo),
+            blend: BlendMode::Masked,
+            alpha_cutoff: 0.5,
+            // A leaf is the textbook case for the transmitted lobe, and it is
+            // here for a second reason: scattering is the term that makes a
+            // cutout's *interior* look like a leaf once the cutout has made its
+            // outline one. Together they are what a card has instead of geometry.
+            subsurface_color: Vec3::new(0.28, 0.55, 0.12),
+            subsurface_radius: Vec3::new(0.010, 0.014, 0.004),
+            thickness: 0.0004,
             ..Material::default()
         },
     );

@@ -13,8 +13,9 @@ void main() {
     // `shading.glsl` has already put the wrapped diffuse in the second one to
     // stand in for the pass that is not running.
     //
-    // The opacity a material carries is what the transparent pass weights with.
-    // Nothing blends here, so it is dropped rather than written into an alpha
-    // channel the resolve would ignore anyway.
-    f_color = vec4(shaded.color + shaded.diffusible, 1.0);
+    // The alpha channel is coverage, not opacity. Nothing blends in this pass,
+    // so on the plain pipeline the value is ignored and one is what a fully
+    // covered pixel means; on the `Masked` pipeline alpha to coverage is on and
+    // this is what carves the cutout out of the four samples.
+    f_color = vec4(shaded.color + shaded.diffusible, mask_coverage(shaded.alpha));
 }
