@@ -23,7 +23,7 @@ use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::{DrawList, RenderBackend, SceneLighting};
 use crate::profile::Profiler;
 use crate::profile_scope;
-use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene};
+use crate::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, ContactShadowSettings, Culling, DebugLine, DebugLines,
     DecalSettings, Diagnostics, DofSettings, EnvironmentSettings, FogSettings, HdrSettings,
@@ -84,6 +84,8 @@ pub struct App {
     /// the engine is running standalone on its built-in demo scene — and, for
     /// the editor, that there is nowhere to keep themes or a layout.
     project: Option<orrin_project::Project>,
+    /// Which built-in scene this run opens, from `ORRIN_SCENE`.
+    scene: SceneChoice,
     /// Extra profiling load from `ORRIN_STRESS`; `None` for a normal run.
     stress: Option<StressSpec>,
     /// Kept alive for the process: dropping the messenger stops validation
@@ -182,6 +184,7 @@ impl App {
             #[cfg(feature = "scripting")]
             build_watcher: None,
             project,
+            scene: SceneChoice::from_env(),
             stress: StressSpec::from_env().filter(|spec| !spec.is_empty()),
             _debug_messenger: debug_messenger,
         };
@@ -380,7 +383,7 @@ impl ApplicationHandler for App {
             *self.world.resource::<PresentSettings>(),
         );
 
-        build_default_scene(&mut self.world, &mut renderer);
+        self.scene.build(&mut self.world, &mut renderer);
         if let Some(spec) = self.stress {
             spawn_stress_scene(&mut self.world, &spec);
         }
@@ -406,7 +409,7 @@ impl ApplicationHandler for App {
             self.project.as_ref(),
         );
 
-        print_run_banner(&self.world, &renderer);
+        print_run_banner(&self.world, &renderer, self.scene);
 
         self.active = Some(Active {
             window,
@@ -810,7 +813,7 @@ fn pressed_overlay_toggle(event: &WindowEvent) -> bool {
 /// on and a release build with it off differ by more than most of the work in the
 /// renderer. The banner exists so a pasted log is a complete description of the
 /// run it came from.
-fn print_run_banner(world: &World, renderer: &VulkanRenderer) {
+fn print_run_banner(world: &World, renderer: &VulkanRenderer, scene: SceneChoice) {
     let present = match renderer.applied_present() {
         Some((mode, images)) => format!("{mode:?}, {images} images"),
         None => "offscreen".to_string(),
@@ -819,7 +822,7 @@ fn print_run_banner(world: &World, renderer: &VulkanRenderer) {
 
     println!(
         "Run config: {} build | debug assertions {} | validation {} | present {} | \
-         {}x{} | MSAA {:?} | overlay {} | GPU pass timings {}",
+         {}x{} | MSAA {:?} | overlay {} | GPU pass timings {} | scene {}",
         if cfg!(debug_assertions) {
             "unoptimised"
         } else {
@@ -833,6 +836,7 @@ fn print_run_banner(world: &World, renderer: &VulkanRenderer) {
         crate::gfx::vulkan::MSAA_SAMPLES,
         on_off(world.resource::<Diagnostics>().overlay),
         on_off(crate::profile::gpu_passes_enabled()),
+        scene.label(),
     );
 }
 

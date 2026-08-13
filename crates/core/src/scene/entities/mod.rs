@@ -1,15 +1,89 @@
+mod library;
 mod scene;
+mod showcase;
+mod sponza;
 mod stress;
 mod textures;
 
 pub use scene::build_default_scene;
+pub use showcase::build_showcase_scene;
+pub use sponza::build_sponza_scene;
 pub use stress::{StressSpec, spawn_stress_scene};
 
 use glam::{Quat, Vec3};
 
 use orrin_ecs::{Entity, World};
 
+use crate::gfx::RenderBackend;
 use crate::scene::{Decal, Light, LocalTransform, MaterialHandle, MeshHandle, Name, Transform};
+
+/// Which built-in scene a run opens with.
+///
+/// Three scenes rather than one, because the jobs pull in different directions:
+/// the rig separates variables, the courtyard composes them, and Sponza is
+/// neither — it is somebody else's geometry at somebody else's complexity, which
+/// is the only one of the three that can say whether this renderer handles a
+/// scene it did not author. Trying to make one scene do two of these costs the
+/// A/B captures their meaning — every offscreen capture that frames a specific
+/// wall at a specific angle is a claim about a feature, and it stops being one
+/// the moment the wall moves for a nicer silhouette.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SceneChoice {
+    /// [`build_default_scene`]: the feature rig, and what every capture but the
+    /// showcase pair is taken of.
+    #[default]
+    Demo,
+    /// [`build_showcase_scene`]: the ruined courtyard.
+    Showcase,
+    /// [`build_sponza_scene`]: Crytek's Sponza atrium, imported from glTF. Needs
+    /// the model on disk — see `scripts/fetch-sponza.sh`.
+    Sponza,
+}
+
+impl SceneChoice {
+    /// Read `ORRIN_SCENE`, falling back to the rig.
+    ///
+    /// An unrecognised name is a warning and the default, never a silent empty
+    /// world — the same rule `ORRIN_STRESS` follows, and for the same reason: a
+    /// typo that quietly changed what you were looking at is worse than one that
+    /// says so.
+    pub fn from_env() -> Self {
+        match std::env::var("ORRIN_SCENE") {
+            Err(_) => Self::default(),
+            Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "" | "demo" | "rig" | "default" => Self::Demo,
+                "showcase" | "courtyard" => Self::Showcase,
+                "sponza" | "crytek" => Self::Sponza,
+                other => {
+                    eprintln!(
+                        "ORRIN_SCENE: unknown scene `{other}` (expected demo, showcase or \
+                         sponza); opening the demo scene"
+                    );
+                    Self::Demo
+                }
+            },
+        }
+    }
+
+    pub fn build(self, world: &mut World, backend: &mut impl RenderBackend) {
+        match self {
+            Self::Demo => build_default_scene(world, backend),
+            Self::Showcase => build_showcase_scene(world, backend),
+            Self::Sponza => build_sponza_scene(world, backend),
+        }
+    }
+
+    /// For the run banner. A frame time from the courtyard and one from the rig
+    /// are not comparable, so which scene produced it belongs in the line that
+    /// describes the run.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Demo => "demo",
+            Self::Showcase => "showcase",
+            Self::Sponza => "sponza",
+        }
+    }
+}
 
 pub fn spawn_mesh(
     world: &mut World,

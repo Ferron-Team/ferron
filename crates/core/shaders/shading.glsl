@@ -45,7 +45,7 @@ layout(location = 5) in vec3 v_color;
 // forward.rs.
 const int MAX_POINT_LIGHTS = 16;
 const int MAX_SPOT_LIGHTS = 8;
-const int MAX_TEXTURES = 64;
+const int MAX_TEXTURES = 192;
 const float PI = 3.14159265359;
 
 // Brings `MAX_CASCADES`, the `Cascades` block and the shadow lookup itself. The

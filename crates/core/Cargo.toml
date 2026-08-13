@@ -13,6 +13,7 @@ vulkano.workspace = true
 vulkano-shaders.workspace = true
 winit.workspace = true
 glam.workspace = true
+gltf.workspace = true
 image.workspace = true
 egui.workspace = true
 egui_winit_vulkano.workspace = true

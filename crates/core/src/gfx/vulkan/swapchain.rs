@@ -190,8 +190,7 @@ impl SwapchainState {
             return false;
         };
 
-        let (present_mode, min_image_count) =
-            resolve(current.device(), current.surface(), present);
+        let (present_mode, min_image_count) = resolve(current.device(), current.surface(), present);
         let (swapchain, images) = current
             .recreate(SwapchainCreateInfo {
                 image_extent: extent,
@@ -216,7 +215,10 @@ impl SwapchainState {
     /// the driver quietly declined is the last thing a frame-time figure may omit.
     pub fn applied_present(&self) -> Option<(PresentMode, u32)> {
         let swapchain = self.swapchain.as_ref()?;
-        Some((swapchain.create_info().present_mode, swapchain.image_count()))
+        Some((
+            swapchain.create_info().present_mode,
+            swapchain.image_count(),
+        ))
     }
 }
 

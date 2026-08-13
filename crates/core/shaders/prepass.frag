@@ -61,9 +61,9 @@ layout(set = 2, binding = 0, std430) readonly buffer Materials {
 };
 
 // Keep in sync with MAX_TEXTURES in gfx/mod.rs, as forward.frag does. One
-// shared sampler beside an array of textures rather than 64 combined ones, for
-// the sampler-limit reason that shader documents.
-const int MAX_TEXTURES = 64;
+// shared sampler beside an array of textures rather than that many combined
+// ones, for the sampler-limit reason that shader documents.
+const int MAX_TEXTURES = 192;
 layout(set = 3, binding = 0) uniform texture2D u_textures[MAX_TEXTURES];
 layout(set = 3, binding = 1) uniform sampler u_sampler;
 

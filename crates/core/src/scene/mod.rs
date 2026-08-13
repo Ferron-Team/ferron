@@ -16,6 +16,7 @@ mod hierarchy;
 mod input;
 mod material;
 mod mesh;
+pub mod model;
 mod motion_blur;
 mod persist;
 mod present;

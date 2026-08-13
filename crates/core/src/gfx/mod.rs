@@ -135,10 +135,19 @@ pub const MAX_POINT_LIGHTS: usize = 16;
 /// or not. Keep in sync with `MAX_SPOT_LIGHTS` in `forward.frag`.
 pub const MAX_SPOT_LIGHTS: usize = 8;
 
-/// Size of the shader's bound texture array (set 2). Keep at or below the
-/// device's `maxPerStageDescriptorSampledImages` (≥16 guaranteed; MoltenVK
-/// allows far more).
-pub const MAX_TEXTURES: usize = 64;
+/// Size of the shader's bound texture array (set 2). Keep in sync with
+/// `MAX_TEXTURES` in `shading.glsl`, `prepass.frag` and `shadow.frag` — the
+/// three fragment shaders that bind the array.
+///
+/// The ceiling is MoltenVK's, not the desktop drivers': an M5 Pro reports
+/// `maxPerStageDescriptorSampledImages` 256 and `maxPerStageResources` 287,
+/// where AMD and NVIDIA report six figures. The refraction shader is the worst
+/// case in the frame and samples eight images outside this array (AO, cascades,
+/// environment, contact shadows, the spot atlas, the fog volume and two copies
+/// of the scene), so this cap plus those has to clear both limits with room for
+/// the next pass that wants a target — which is what puts it below 256 rather
+/// than at it.
+pub const MAX_TEXTURES: usize = 192;
 
 /// How many decals a frame may project. Keep in sync with `MAX_DECALS` in
 /// `shaders/decals.glsl`.

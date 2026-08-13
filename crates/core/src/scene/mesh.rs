@@ -50,6 +50,25 @@ impl CpuMesh {
         Aabb::from_points(self.vertices.iter().map(|v| Vec3::from(v.position)))
     }
 
+    /// The same mesh with its vertex colour set to white.
+    ///
+    /// Every primitive here bakes `normal * 0.5 + 0.5` into vertex colour, and
+    /// `read_surface` multiplies that into albedo — so an untextured cube is
+    /// lavender on one face and mint on the next. In the feature rig that is a
+    /// free readout of which way a face points; anywhere a material is meant to
+    /// be the colour it was authored as it is unusable, and it cannot be undone
+    /// from the material, because six faces carry six different tints and a
+    /// material has one `base_color`.
+    ///
+    /// A second mesh rather than dropping the colours from the primitives: the
+    /// rig's captures are pixel comparisons, and every one of them would move.
+    pub fn uncolored(mut self) -> Self {
+        for vertex in &mut self.vertices {
+            vertex.color = [1.0; 3];
+        }
+        self
+    }
+
     pub fn cube() -> Self {
         // Per-face vertices so each face has a flat normal.
         const FACES: [([f32; 3], [f32; 3], [f32; 3]); 6] = [

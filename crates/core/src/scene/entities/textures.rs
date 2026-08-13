@@ -165,7 +165,7 @@ pub fn brick(size: u32, columns: u32, rows: u32, tile: [f32; 2], depth: f32) -> 
 
 /// PCG's output hash, which is enough of a random number for a wall: what it has
 /// to be is repeatable, since three maps ask it the same questions.
-fn hash01(seed: u32) -> f32 {
+pub fn hash01(seed: u32) -> f32 {
     let state = seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
     let word = ((state >> ((state >> 28).wrapping_add(4))) ^ state).wrapping_mul(277_803_737);
     ((word >> 22) ^ word) as f32 / u32::MAX as f32

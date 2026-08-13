@@ -125,14 +125,12 @@ fn measurement(ui: &mut egui::Ui, world: &World) {
                          A mode the surface doesn't support falls back to Fifo.",
                     );
 
-                ui.add(
-                    egui::Slider::new(&mut present.images, 2..=4).text("Swapchain images"),
-                )
-                .on_hover_text(
-                    "Three is what an uncapped mode wants — with two, the CPU blocks in \
+                ui.add(egui::Slider::new(&mut present.images, 2..=4).text("Swapchain images"))
+                    .on_hover_text(
+                        "Three is what an uncapped mode wants — with two, the CPU blocks in \
                      the acquire as soon as one image is queued and the other is being \
                      drawn. Clamped to what the surface advertises.",
-                );
+                    );
             }
 
             if let Some(mut diagnostics) = world.get_resource_mut::<Diagnostics>() {

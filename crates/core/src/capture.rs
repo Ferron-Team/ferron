@@ -25,8 +25,8 @@ use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
 use crate::gfx::vulkan::{ShadowFrame, VulkanRenderer};
-use crate::gfx::{DrawList, RenderBackend, SceneLighting};
-use crate::scene::entities::build_default_scene;
+use crate::gfx::{DrawList, SceneLighting};
+use crate::scene::entities::SceneChoice;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings, EnvironmentSettings,
     FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings,
@@ -73,16 +73,22 @@ pub struct CaptureSettings {
     /// between a leaf-shaped shadow and a quad-shaped one is the only place that
     /// pipeline is visible at all.
     pub shadows: bool,
-    /// The air. Overridden whole rather than by a flag, because the A/B the fog
-    /// captures make is between two *ways of integrating one medium* — the
-    /// froxels and the analytic height layer — and that comparison is only
-    /// meaningful if the density, the falloff and the albedo are identical
-    /// across the pair. A `volumetric: bool` beside the others would have let
-    /// the two differ in more than the thing being compared.
+    /// The air, or `None` for whatever the scene asked for.
     ///
-    /// The default is the engine's, whose density is zero — so every capture
-    /// that is not about fog is the frame it was before this existed.
-    pub fog: FogSettings,
+    /// Overridden whole rather than by a flag, because the A/B the fog captures
+    /// make is between two *ways of integrating one medium* — the froxels and the
+    /// analytic height layer — and that comparison is only meaningful if the
+    /// density, the falloff and the albedo are identical across the pair. A
+    /// `volumetric: bool` beside the others would have let the two differ in more
+    /// than the thing being compared.
+    ///
+    /// `None` rather than the engine's default, so that a scene built around its
+    /// own air is photographed in it: the courtyard sets a medium in
+    /// `build_showcase_scene` and a capture that reinstalled the zero-density
+    /// default would take the one picture the scene is not about.
+    pub fog: Option<FogSettings>,
+    /// Which built-in scene to photograph.
+    pub scene: SceneChoice,
     /// Where to photograph the scene from, or `None` for the camera it ships
     /// with.
     ///
@@ -106,23 +112,36 @@ impl Default for CaptureSettings {
             subsurface: true,
             decals: true,
             shadows: false,
-            fog: FogSettings::default(),
+            fog: None,
+            scene: SceneChoice::default(),
             camera: None,
         }
     }
 }
 
-/// Render the engine's default scene and write it to `path` as a PNG.
+/// Render one of the built-in scenes and write it to `path` as a PNG.
 ///
 /// Panics rather than returning an error on a device that cannot be reached: it
 /// is a developer tool driven from a test, and a `Result` nobody can act on
 /// would only push the same panic one frame up the stack.
-pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
+pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
     let instance = headless_instance();
     let mut renderer = VulkanRenderer::offscreen(&instance, settings.extent);
 
+    // Default, then scene, then capture override — in that order, and the order
+    // is the contract. The baseline goes in *first* so a scene that describes its
+    // own air, exposure or environment is photographed as itself rather than as
+    // the engine's defaults; the explicit fields below then still win, because a
+    // capture that is an A/B has to be able to state both halves of it.
     let mut world = World::new();
-    build_default_scene(&mut world, &mut renderer);
+    world.insert_resource(MotionBlurSettings::default());
+    world.insert_resource(DofSettings::default());
+    world.insert_resource(BloomSettings::default());
+    world.insert_resource(HdrSettings::default());
+    world.insert_resource(EnvironmentSettings::default());
+    world.insert_resource(FogSettings::default());
+
+    settings.scene.build(&mut world, &mut renderer);
     if let Some(camera) = settings.camera {
         world.insert_resource(camera);
     }
@@ -147,12 +166,9 @@ pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings)
         enabled: settings.taa,
         ..TaaSettings::default()
     });
-    world.insert_resource(MotionBlurSettings::default());
-    world.insert_resource(DofSettings::default());
-    world.insert_resource(BloomSettings::default());
-    world.insert_resource(HdrSettings::default());
-    world.insert_resource(EnvironmentSettings::default());
-    world.insert_resource(settings.fog);
+    if let Some(fog) = settings.fog {
+        world.insert_resource(fog);
+    }
 
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();

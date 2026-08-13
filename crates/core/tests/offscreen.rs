@@ -1,4 +1,4 @@
-//! Renders the default scene to a PNG with no window.
+//! Renders the built-in scenes to PNGs with no window.
 //!
 //! `#[ignore]`d because it needs a GPU and CI has none — the render graph's
 //! golden is the part of the renderer CI can assert, and it asserts
@@ -12,16 +12,22 @@
 //! cargo test -p orrin-core --test offscreen -- --ignored --nocapture
 //! ```
 //!
-//! and look at what lands in `target/capture/`. The captures are an A/B set on
-//! purpose: the same scene with each non-opaque queue switched off, and with the
-//! subsurface diffusion switched off, and the same air marched as froxels and
+//! and look at what lands in `target/capture/`. Most of these are an A/B set on
+//! purpose: the same rig scene with each non-opaque queue switched off, and with
+//! the subsurface diffusion switched off, and the same air marched as froxels and
 //! integrated analytically — which is what turns "this looks wrong" into "this
 //! looks wrong because of that pass".
+//!
+//! The last two are the exception and are a different kind of file. `showcase`
+//! and `showcase-materials` photograph the courtyard, where every feature is
+//! contributing to one image at once, so neither is evidence about any single
+//! pass. They are the check the A/B set cannot make: that the features compose.
 
 use std::path::PathBuf;
 
 use glam::Vec3;
-use orrin_core::capture::{CaptureSettings, capture_default_scene};
+use orrin_core::capture::{CaptureSettings, capture_scene};
+use orrin_core::scene::entities::SceneChoice;
 use orrin_core::scene::{Camera, FogSettings};
 
 /// Where both fog captures stand, shared so the pair differs in one field.
@@ -48,7 +54,7 @@ fn output_dir() -> PathBuf {
 
 #[test]
 #[ignore = "needs a GPU"]
-fn captures_the_default_scene() {
+fn captures_the_built_in_scenes() {
     let dir = output_dir();
 
     for (name, settings) in [
@@ -188,12 +194,12 @@ fn captures_the_default_scene() {
             "fog-volumetric",
             CaptureSettings {
                 shadows: true,
-                fog: FogSettings {
+                fog: Some(FogSettings {
                     density: 0.04,
                     height_falloff: 0.08,
                     volumetric: true,
                     ..FogSettings::default()
-                },
+                }),
                 camera: Some(fog_camera()),
                 ..CaptureSettings::default()
             },
@@ -202,19 +208,63 @@ fn captures_the_default_scene() {
             "fog-analytic",
             CaptureSettings {
                 shadows: true,
-                fog: FogSettings {
+                fog: Some(FogSettings {
                     density: 0.04,
                     height_falloff: 0.08,
                     volumetric: false,
                     ..FogSettings::default()
-                },
+                }),
                 camera: Some(fog_camera()),
+                ..CaptureSettings::default()
+            },
+        ),
+        // The courtyard, from the camera it is composed for: low sun through the
+        // gateway, everything in frame backlit, and the air marched so the beam
+        // has an edge. Shadows are not optional in either showcase capture — the
+        // scatter pass's visibility is a constant 1.0 with no cascades fitted,
+        // and a shaft is the shape of an occluder.
+        //
+        // `fog` is left `None`, unlike the pair above: this scene describes its
+        // own medium and the capture is of the scene, not of a comparison.
+        (
+            "showcase",
+            CaptureSettings {
+                scene: SceneChoice::Showcase,
+                shadows: true,
+                ..CaptureSettings::default()
+            },
+        ),
+        // The same courtyard from the one place the sun is behind the camera,
+        // looking along the brick pier's lit face. Contre-jour is what makes the
+        // shafts and the transmitted lobe legible and it is exactly wrong for
+        // surface detail, so the two cameras split that: this is where the
+        // parallax march, the decal sitting in it, and the flagstones' relief are
+        // readable, and it is deliberately not a prettier version of the first.
+        (
+            "showcase-materials",
+            CaptureSettings {
+                scene: SceneChoice::Showcase,
+                shadows: true,
+                camera: Some(Camera {
+                    // Two metres off the pier's face and four along it, which is
+                    // 62° from its normal — the same obliquity the rig's
+                    // `zoom-parallax` stands at, and for the same reason. It is
+                    // not a matter of "as grazing as possible": past about 73°
+                    // the march deliberately fades the field back to flat,
+                    // because displacement without a silhouette shears the
+                    // courses into diagonal smears. Standing closer to the wall
+                    // photographs that fade instead of the relief.
+                    position: Vec3::new(-0.8, 1.9, -7.0),
+                    target: Vec3::new(1.28, 1.7, -3.0),
+                    fov_y: 45f32.to_radians(),
+                    ..Camera::default()
+                }),
                 ..CaptureSettings::default()
             },
         ),
     ] {
         let path = dir.join(format!("{name}.png"));
-        capture_default_scene(&path, &settings);
+        capture_scene(&path, &settings);
 
         let written = std::fs::metadata(&path)
             .unwrap_or_else(|e| panic!("{} was not written: {e}", path.display()))

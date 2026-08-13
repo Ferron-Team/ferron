@@ -51,7 +51,7 @@ layout(set = 1, binding = 0, std430) readonly buffer Materials {
 
 // Keep in sync with MAX_TEXTURES in gfx/mod.rs. One shared sampler beside an
 // array of textures, for the per-stage sampler limit Metal imposes.
-const int MAX_TEXTURES = 64;
+const int MAX_TEXTURES = 192;
 layout(set = 2, binding = 0) uniform texture2D u_textures[MAX_TEXTURES];
 layout(set = 2, binding = 1) uniform sampler u_sampler;
 #endif
