@@ -60,12 +60,22 @@ impl GraphImages {
         for (id, image) in graph.transient_images() {
             let extent = image.desc.extent.resolve(extent);
             let mip_levels = image.desc.mip_levels.min(max_mip_levels(extent));
+            // Vulkan has no arrayed 3D image, so the two are a declaration
+            // mistake together rather than a shape to resolve a winner for.
+            assert!(
+                image.desc.depth.is_none() || image.desc.array_layers.is_none(),
+                "render graph: `{}` asked to be both a 3D image and a 2D array",
+                graph.resource_name(id),
+            );
             let allocated = Image::new(
                 memory.clone(),
                 ImageCreateInfo {
-                    image_type: ImageType::Dim2d,
+                    image_type: match image.desc.depth {
+                        Some(_) => ImageType::Dim3d,
+                        None => ImageType::Dim2d,
+                    },
                     format: image.desc.format,
-                    extent: [extent[0], extent[1], 1],
+                    extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
                     usage: image.usage,
                     samples: image.desc.samples,
                     array_layers: image.desc.array_layers.unwrap_or(1),
@@ -94,10 +104,10 @@ impl GraphImages {
             let view = ImageView::new(
                 allocated.clone(),
                 ImageViewCreateInfo {
-                    view_type: if image.desc.array_layers.is_some() {
-                        ImageViewType::Dim2dArray
-                    } else {
-                        ImageViewType::Dim2d
+                    view_type: match (image.desc.depth, image.desc.array_layers) {
+                        (Some(_), _) => ImageViewType::Dim3d,
+                        (None, Some(_)) => ImageViewType::Dim2dArray,
+                        (None, None) => ImageViewType::Dim2d,
                     },
                     // A storage image descriptor takes exactly one level, so a
                     // view spanning the whole pyramid cannot claim that usage —
@@ -338,6 +348,8 @@ impl PassFramebuffers {
                     | PassBody::SsrSource
                     | PassBody::SsrTrace
                     | PassBody::SsrResolve
+                    | PassBody::FogScatter
+                    | PassBody::FogIntegrate
                     | PassBody::SubsurfaceBlurHorizontal
                     | PassBody::SubsurfaceBlurVertical
                     | PassBody::SubsurfaceComposite
@@ -438,6 +450,8 @@ pub(super) fn clear_values(body: PassBody, attachments: usize) -> Vec<Option<Cle
         | PassBody::SubsurfaceComposite => Vec::new(),
         // No render pass, so nothing to clear.
         PassBody::Overlay
+        | PassBody::FogScatter
+        | PassBody::FogIntegrate
         | PassBody::SsrHiz
         | PassBody::SsrSource
         | PassBody::SsrTrace

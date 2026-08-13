@@ -29,8 +29,8 @@ use crate::gfx::{DrawList, RenderBackend, SceneLighting};
 use crate::scene::entities::build_default_scene;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings, EnvironmentSettings,
-    HdrSettings, MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings,
-    SubsurfaceSettings, TaaSettings, TransparencySettings,
+    FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings,
+    SsrSettings, SubsurfaceSettings, TaaSettings, TransparencySettings,
 };
 use crate::systems::{self, FrameGeometry};
 
@@ -73,6 +73,16 @@ pub struct CaptureSettings {
     /// between a leaf-shaped shadow and a quad-shaped one is the only place that
     /// pipeline is visible at all.
     pub shadows: bool,
+    /// The air. Overridden whole rather than by a flag, because the A/B the fog
+    /// captures make is between two *ways of integrating one medium* — the
+    /// froxels and the analytic height layer — and that comparison is only
+    /// meaningful if the density, the falloff and the albedo are identical
+    /// across the pair. A `volumetric: bool` beside the others would have let
+    /// the two differ in more than the thing being compared.
+    ///
+    /// The default is the engine's, whose density is zero — so every capture
+    /// that is not about fog is the frame it was before this existed.
+    pub fog: FogSettings,
     /// Where to photograph the scene from, or `None` for the camera it ships
     /// with.
     ///
@@ -96,6 +106,7 @@ impl Default for CaptureSettings {
             subsurface: true,
             decals: true,
             shadows: false,
+            fog: FogSettings::default(),
             camera: None,
         }
     }
@@ -141,6 +152,7 @@ pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings)
     world.insert_resource(BloomSettings::default());
     world.insert_resource(HdrSettings::default());
     world.insert_resource(EnvironmentSettings::default());
+    world.insert_resource(settings.fog);
 
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
@@ -199,6 +211,7 @@ pub fn capture_default_scene(path: impl AsRef<Path>, settings: &CaptureSettings)
             &world.resource::<BloomSettings>().clone(),
             &world.resource::<HdrSettings>().clone(),
             &world.resource::<EnvironmentSettings>().clone(),
+            &world.resource::<FogSettings>().clone(),
             // A fixed step rather than a real clock, so two runs of this produce
             // the same picture: auto-exposure adapts over time, and a capture
             // that depended on how fast the host was would be useless to diff.

@@ -408,14 +408,45 @@ fn lighting_column(ui: &mut egui::Ui, world: &World) {
     ui.add_space(6.0);
     ui.strong("Fog");
     let mut fog = world.resource_mut::<FogSettings>();
-    color_row(ui, "Color", &mut fog.color);
+    color_row(ui, "Albedo", &mut fog.albedo);
     ui.add(
         egui::Slider::new(&mut fog.density, 0.0..=0.1)
             .logarithmic(true)
             .text("Density"),
+    )
+    .on_hover_text(
+        "Extinction per metre at the reference height. 0.005 is a light haze, \
+         0.05 is thick enough to lose a building at fifty metres.",
     );
     ui.add(egui::Slider::new(&mut fog.height_falloff, 0.0..=1.0).text("Falloff"));
     ui.add(egui::Slider::new(&mut fog.height, -20.0..=20.0).text("Height"));
+    ui.checkbox(&mut fog.volumetric, "Volumetric")
+        .on_hover_text(
+            "March the first `Distance` metres as a froxel volume, so the shadow \
+             maps reach the air and the sun casts shafts. Off, the same medium is \
+             integrated analytically along each view ray — smooth, and unshadowed.",
+        );
+    ui.add_enabled_ui(fog.volumetric, |ui| {
+        ui.add(
+            egui::Slider::new(&mut fog.distance, 8.0..=256.0)
+                .suffix(" m")
+                .text("Distance"),
+        )
+        .on_hover_text(
+            "How far the volume reaches. The froxel count is fixed, so this trades \
+             reach against resolution and not against cost.",
+        );
+        ui.add(egui::Slider::new(&mut fog.anisotropy, -0.9..=0.9).text("Anisotropy"))
+            .on_hover_text(
+                "Henyey-Greenstein g. Positive scatters forward, which is what makes \
+                 looking toward the sun through haze so much brighter than looking away.",
+            );
+        ui.add(egui::Slider::new(&mut fog.feedback, 0.0..=0.98).text("Feedback"))
+            .on_hover_text(
+                "How much reprojected history each froxel keeps. Low values make the \
+                 depth jitter visible as crawling slices.",
+            );
+    });
 }
 
 fn camera_column(ui: &mut egui::Ui, world: &World) {

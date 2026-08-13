@@ -46,9 +46,16 @@ layout(location = 5) in vec3 v_color;
 const int MAX_POINT_LIGHTS = 16;
 const int MAX_SPOT_LIGHTS = 8;
 const int MAX_TEXTURES = 64;
-// Keep in sync with MAX_CASCADES in gfx/shadows.rs.
-const int MAX_CASCADES = 4;
 const float PI = 3.14159265359;
+
+// Brings `MAX_CASCADES`, the `Cascades` block and the shadow lookup itself. The
+// froxel fog includes the same file, so a shaft in the air lands on the shadow
+// its ground does.
+#include "cascades.glsl"
+// And the air itself: the froxel mapping, the phase function and the term
+// applied at the end of `shade_surface`. `fog_scatter.comp` includes the same
+// file, so the froxel a fragment reads is the froxel that was lit for it.
+#include "fog.glsl"
 
 // Every quantity below is photometric, and the frame this shader writes is in
 // nits (cd/m2) as a result: a candela over a squared distance is a lux, and a lux
@@ -75,12 +82,10 @@ layout(set = 0, binding = 0) uniform Lighting {
     vec4 sun_color;     // rgb = color, w = illuminance (lux)
     vec4 params;        // x = point light count (y,z legacy), w = spot count
     vec4 viewport;      // x=w, y=h, z=1/w, w=1/h
-    vec4 fog_color;     // rgb = color, w = density at the reference height
-    vec4 fog_params;    // x = height falloff, y = reference height
-    mat4 cascade_view_proj[MAX_CASCADES];
-    vec4 cascade_splits;      // per-cascade far distance, radial from the camera
-    vec4 cascade_texel_sizes; // world size of one shadow texel, per cascade
-    vec4 shadow_params;       // x = count, y = blend overlap, z = strength, w = debug
+    // The four cascade fields, nested rather than written out flat. std140 lays
+    // the struct out at exactly the offsets the flat fields had, so `GpuLighting`
+    // is unchanged by the nesting — see `cascades.glsl`.
+    Cascades cascades;
     PointLight point_lights[MAX_POINT_LIGHTS];
     SpotLight spot_lights[MAX_SPOT_LIGHTS];
     vec4 environment;    // x = sin(env yaw), y = cos(env yaw)
@@ -169,6 +174,18 @@ struct ShadowFace {
 layout(set = 3, binding = 7, std430) readonly buffer ShadowFaces {
     ShadowFace shadow_faces[];
 };
+
+// The froxel fog: the integrated volume, and the block describing the medium it
+// was integrated out of. The block is bound whether or not the volume was
+// written, because the analytic term past the volume's far plane — and the whole
+// ray in a frame with no volume at all — is described by the very same numbers.
+// `camera_pos.w` is what says which of those a frame is in; the volume is a
+// 1x1x1 stand-in when it is zero, so there is one binding here rather than two
+// pipelines.
+layout(set = 3, binding = 8) uniform sampler3D u_fog_volume;
+layout(set = 3, binding = 9) uniform Fog {
+    GpuFog f;
+} u_fog;
 
 // Index is dynamically uniform (from the material), so plain indexing
 // is legal without the nonuniform qualifier.
@@ -644,94 +661,14 @@ Lobes brdf(Surface s, vec3 L, vec3 radiance, float visibility, float back_visibi
     return lobes;
 }
 
-// Exponential height fog. Density decays with altitude, so the amount along a
-// view ray is the integral of that decay rather than a function of distance
-// alone — which is what keeps a ray climbing out of the layer from fogging as
-// heavily as one running through it.
-// How much of what the surface sent toward the camera the air replaced, in
-// `[0, 1]`. Split out of the mix below because the frame's radiance may leave
-// this shader in two pieces: fog is a lerp, so attenuating both by `1 - amount`
-// and adding the fog's own radiance to one of them is the only way the two sum
-// back to the fogged whole. Adding it to both would put the fog in twice.
-float fog_amount(vec3 world_pos, vec3 camera_pos) {
-    float density = lighting.fog_color.w;
-    if (density <= 0.0) {
-        return 0.0;
-    }
-
-    float falloff = lighting.fog_params.x;
-    vec3 ray = world_pos - camera_pos;
-    float dist = length(ray);
-    float dir_y = ray.y / max(dist, 1e-4);
-
-    float at_camera = exp(-falloff * (camera_pos.y - lighting.fog_params.y));
-
-    // The quotient has a removable singularity for rays with no vertical
-    // component, where the integral is just the ray length.
-    float t = falloff * dir_y * dist;
-    float integral = abs(t) > 1e-4 ? (1.0 - exp(-t)) / (falloff * dir_y) : dist;
-
-    return clamp(1.0 - exp(-density * at_camera * integral), 0.0, 1.0);
-}
-
 // --- Cascaded shadow maps ---
+//
+// The lookup itself is in `cascades.glsl`, shared with the froxel fog. What is
+// left here is the part only a surface can say: the two early-outs, and the
+// nested block the shared functions are handed.
 
-// The cascade this fragment is routed to: the first whose far distance it is
-// nearer than. Distance is radial rather than view-space depth, which costs a
-// little over-coverage at the frustum corners and buys rotation invariance —
-// the same property the sphere fit on the CPU side is built around.
-int select_cascade(float view_dist) {
-    int count = int(lighting.shadow_params.x);
-    for (int i = 0; i < count; ++i) {
-        if (view_dist < lighting.cascade_splits[i]) {
-            return i;
-        }
-    }
-    return count - 1;
-}
-
-// Percentage-closer filtered visibility from one cascade. 1.0 is lit.
-float cascade_shadow(int cascade, vec3 world_pos, vec3 N, vec3 L) {
-    // Normal-offset bias: move the lookup along the surface normal by about a
-    // texel's worth of world space, more at grazing angles where a texel covers
-    // the most depth. Offsetting in texture space rather than in depth is what
-    // removes acne without the peter-panning a depth offset causes.
-    float texel = lighting.cascade_texel_sizes[cascade];
-    float slope = 1.0 - max(dot(N, L), 0.0);
-    vec3 p = world_pos + N * texel * 1.4142136 * (1.0 + slope);
-
-    vec4 clip = lighting.cascade_view_proj[cascade] * vec4(p, 1.0);
-    vec3 ndc = clip.xyz / clip.w;
-    // Past the cascade's far plane there is nothing to occlude against.
-    if (ndc.z > 1.0) {
-        return 1.0;
-    }
-
-    vec2 uv = ndc.xy * 0.5 + 0.5;
-    vec2 step = 1.0 / vec2(textureSize(sampler2DArrayShadow(u_shadow_maps, u_shadow_cmp), 0).xy);
-
-    // 3x3 taps. Each is itself a hardware 2x2 comparison — the compare happens
-    // before the bilinear filter — so this is effectively a 4x4 kernel.
-    float sum = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            vec2 offset = vec2(x, y) * step;
-            sum += texture(
-                sampler2DArrayShadow(u_shadow_maps, u_shadow_cmp),
-                vec4(uv + offset, float(cascade), ndc.z)
-            );
-        }
-    }
-    return sum / 9.0;
-}
-
-// Sun visibility, blended across the cascade seam.
+// Sun visibility for a *surface*, blended across the cascade seam.
 float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
-    int count = int(lighting.shadow_params.x);
-    if (count <= 0) {
-        return 1.0;
-    }
-
     // A surface facing away from the sun is already unlit by it — `brdf`
     // returns zero for n_dot_l <= 0, so whatever the maps say gets multiplied
     // into nothing. Leaving before the lookup saves the nine taps this cascade
@@ -743,24 +680,13 @@ float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
     // Strength zero is the "shadows off" slider, and the blend below collapses
     // to a constant 1.0 at it. Same taps saved, for a setting rather than for
     // the geometry.
-    if (lighting.shadow_params.z <= 0.0) {
+    if (lighting.cascades.params.z <= 0.0) {
         return 1.0;
     }
 
-    int cascade = select_cascade(view_dist);
-    float shadow = cascade_shadow(cascade, world_pos, N, L);
-
-    // The next cascade only has depth slightly before its own near plane, and
-    // that overlap is what `cascades()` widened each slice by — so the blend
-    // band has to be the same fraction or it fades into a region with no data.
-    float split = lighting.cascade_splits[cascade];
-    float band = split * lighting.shadow_params.y;
-    if (cascade + 1 < count && view_dist > split - band) {
-        float t = clamp((view_dist - (split - band)) / max(band, 1e-4), 0.0, 1.0);
-        shadow = mix(shadow, cascade_shadow(cascade + 1, world_pos, N, L), t);
-    }
-
-    return mix(1.0, shadow, lighting.shadow_params.z);
+    return cascade_sun_shadow(
+        lighting.cascades, u_shadow_maps, u_shadow_cmp, world_pos, N, L, view_dist
+    );
 }
 
 // The sun's visibility at the *far* side of a scattering medium — whether light
@@ -783,23 +709,22 @@ float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
 // transmittance depth out of the shadow map, which needs a non-comparison
 // sampler this set layout does not carry.
 float back_sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist, float thickness) {
-    int count = int(lighting.shadow_params.x);
-    if (count <= 0 || lighting.shadow_params.z <= 0.0) {
+    if (lighting.cascades.params.z <= 0.0) {
         return 1.0;
     }
 
-    vec3 p = world_pos - N * thickness;
-    int cascade = select_cascade(view_dist);
-    float shadow = cascade_shadow(cascade, p, -N, L);
-
-    float split = lighting.cascade_splits[cascade];
-    float band = split * lighting.shadow_params.y;
-    if (cascade + 1 < count && view_dist > split - band) {
-        float t = clamp((view_dist - (split - band)) / max(band, 1e-4), 0.0, 1.0);
-        shadow = mix(shadow, cascade_shadow(cascade + 1, p, -N, L), t);
-    }
-
-    return mix(1.0, shadow, lighting.shadow_params.z);
+    // The far face's own outward normal, which is what makes this a different
+    // question rather than `sun_shadow` at an offset — and note the missing
+    // `dot(N, L)` early-out, deliberately.
+    return cascade_sun_shadow(
+        lighting.cascades,
+        u_shadow_maps,
+        u_shadow_cmp,
+        world_pos - N * thickness,
+        -N,
+        L,
+        view_dist
+    );
 }
 
 // Distinct tint per cascade, for checking that the splits land where intended.
@@ -1410,15 +1335,24 @@ Shaded shade_surface() {
     // where it is, and spreading it would be a bloom rather than a scattering.
     color += m.emissive.rgb * emis_tex;
 
-    // Both halves lose what the air replaced, and only one of them gains the
-    // air's own radiance — see `fog_amount`. Summing the two afterwards gives
-    // back exactly the lerp this used to be.
-    float fog = fog_amount(v_world_pos, lighting.camera_pos.xyz);
-    color = mix(color, lighting.fog_color.rgb, fog);
-    diffusible *= 1.0 - fog;
+    // Both halves lose what the air absorbed, and only one of them gains what it
+    // scattered in. Summing the two afterwards gives back exactly the fogged
+    // whole; adding the in-scatter to both would put the air in twice.
+    //
+    // This is where the froxel volume is read, and it is why the effect needs no
+    // pass of its own downstream: three shaders reach this line — the opaque
+    // one, the blended one and the refractive one — and each applies the fog at
+    // *its own* depth. A composite over the finished frame could only ever apply
+    // the opaque depth, and would fog a pane of glass as though it were the wall
+    // behind it.
+    FogTerm fog = fog_term(
+        u_fog.f.fog, u_fog_volume, v_world_pos, gl_FragCoord.xy * lighting.viewport.zw
+    );
+    color = color * fog.transmittance + fog.inscatter;
+    diffusible *= fog.transmittance;
 
-    if (lighting.shadow_params.w > 0.5) {
-        vec3 tint = cascade_debug_tint(select_cascade(view_dist));
+    if (lighting.cascades.params.w > 0.5) {
+        vec3 tint = cascade_debug_tint(select_cascade(lighting.cascades, view_dist));
         color *= tint;
         diffusible *= tint;
     }

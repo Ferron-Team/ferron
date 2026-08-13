@@ -14,14 +14,31 @@
 //!
 //! and look at what lands in `target/capture/`. The captures are an A/B set on
 //! purpose: the same scene with each non-opaque queue switched off, and with the
-//! subsurface diffusion switched off, which is what turns "this looks wrong" into
-//! "this looks wrong because of that pass".
+//! subsurface diffusion switched off, and the same air marched as froxels and
+//! integrated analytically — which is what turns "this looks wrong" into "this
+//! looks wrong because of that pass".
 
 use std::path::PathBuf;
 
 use glam::Vec3;
 use orrin_core::capture::{CaptureSettings, capture_default_scene};
-use orrin_core::scene::Camera;
+use orrin_core::scene::{Camera, FogSettings};
+
+/// Where both fog captures stand, shared so the pair differs in one field.
+///
+/// Low, and looking *along* the sun rather than across it: the demo's sun points
+/// down and away from `+x`/`+z`, so a ray from here has `dot(L, dir)` near 0.75
+/// and the Henyey-Greenstein term at `g = 0.7` is several times its isotropic
+/// value. A camera facing the other way would see the same medium at a fraction
+/// of the brightness — which is the anisotropy working, and the reason a fog
+/// capture cannot be taken from wherever the scene shot happens to stand.
+fn fog_camera() -> Camera {
+    Camera {
+        position: Vec3::new(-20.0, 1.0, -4.0),
+        target: Vec3::new(-11.0, 4.5, 4.0),
+        ..Camera::default()
+    }
+}
 
 fn output_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/capture");
@@ -146,6 +163,52 @@ fn captures_the_default_scene() {
                     target: Vec3::new(0.0, 1.5, -13.0),
                     ..Camera::default()
                 }),
+                ..CaptureSettings::default()
+            },
+        ),
+        // The froxel fog, and the same medium integrated analytically — the pair
+        // is the capture, not either file. Both carry identical density,
+        // falloff and albedo, so everything that differs between them is what
+        // marching the volume buys: shafts where the cutout stand and the cubes
+        // block the sun, and air that darkens inside their shadows. The analytic
+        // one has no shadow term at all and cannot — past the froxels there is
+        // no map deep enough to ask — so it is the same haze at a uniform
+        // brightness.
+        //
+        // Shadows on in both, and that is not optional here: with no cascades
+        // fitted the scatter pass's visibility is a constant 1.0 and the two
+        // files would be near enough identical, which would make the A/B look
+        // like the feature does nothing.
+        //
+        // The sun is low and the camera looks across it rather than along it, so
+        // the anisotropy is doing visible work: at `g = 0.7` the air on the sun
+        // side of the frame is several times brighter than the air away from it,
+        // and that gradient is the phase function rather than the density.
+        (
+            "fog-volumetric",
+            CaptureSettings {
+                shadows: true,
+                fog: FogSettings {
+                    density: 0.04,
+                    height_falloff: 0.08,
+                    volumetric: true,
+                    ..FogSettings::default()
+                },
+                camera: Some(fog_camera()),
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "fog-analytic",
+            CaptureSettings {
+                shadows: true,
+                fog: FogSettings {
+                    density: 0.04,
+                    height_falloff: 0.08,
+                    volumetric: false,
+                    ..FogSettings::default()
+                },
+                camera: Some(fog_camera()),
                 ..CaptureSettings::default()
             },
         ),

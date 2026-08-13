@@ -23,6 +23,7 @@ use super::MSAA_SAMPLES;
 use super::bloom::MAX_BLOOM_MIPS;
 use super::contact_shadows::MASK_FORMAT;
 use super::dof::COC_TILE_SHIFT;
+use super::fog::{FOG_FORMAT, FROXEL_SHIFT, FROXEL_SLICES};
 use super::hdr::HDR_FORMAT;
 use super::motion_blur::TILE_SHIFT;
 use super::oit::{ACCUM_FORMAT, REVEAL_FORMAT};
@@ -97,6 +98,17 @@ pub struct FrameConfig {
     /// rather than set, so the number of passes registered cannot disagree with
     /// the number of levels there is room for — the same reason
     /// `shadow_cascades` is sourced from the cascade set.
+    /// Whether the frame marches the air in front of the camera as a froxel
+    /// volume. Structural like the rest: it registers two dispatches and the
+    /// volumes they write, and it is the one effect here that changes what the
+    /// *geometry* passes read rather than what runs after them — the forward,
+    /// transparency and refraction passes all sample the result.
+    ///
+    /// Off is not "no fog": the same medium is integrated analytically along
+    /// each view ray inside `shading.glsl`, which is what the froxels hand over
+    /// to past their far plane anyway. What this switches is whether the first
+    /// `FogSettings::distance` metres are shadowed.
+    pub volumetric_fog: bool,
     pub bloom_mips: u8,
     /// Whether the editor's egui overlay draws over the frame. Off for headless
     /// and export renders.
@@ -125,6 +137,14 @@ pub enum PassBody {
     SsaoBlur,
     /// The sun's visibility over the short range a cascade texel cannot resolve.
     ContactShadows,
+    /// What every froxel of air scatters and blocks — one cascade lookup apiece,
+    /// which is the whole cost of the effect and the whole reason a shaft has an
+    /// edge.
+    FogScatter,
+    /// Each froxel column marched front to back into the running radiance and
+    /// transmittance a fragment applies. One invocation per column rather than
+    /// per froxel, because slice `n` needs what slice `n - 1` ended with.
+    FogIntegrate,
     Forward,
     /// Every level of the reflection trace's min-depth pyramid, in one dispatch.
     SsrHiz,
@@ -221,6 +241,7 @@ pub struct FrameIds {
     /// struct: the pass reads the prepass and writes this, and there is nothing
     /// else to name.
     pub contact_shadows: Option<ResourceId>,
+    pub fog: Option<FogIds>,
     pub ssr: Option<SsrIds>,
     /// Present exactly when the frame runs the diffusion — which is also how the
     /// executor knows to bind the forward pass's second pipeline, so the
@@ -285,6 +306,26 @@ pub struct PrepassIds {
     /// trace cannot recover from depth and normals alone.
     pub material: ResourceId,
     pub depth: ResourceId,
+}
+
+/// The froxel fog's two volumes.
+///
+/// `scatter` is **imported** and ping-ponged, for the reason the TAA history is:
+/// the scatter pass reads its own previous frame to average the depth jitter,
+/// and a transient is `Undefined` at every frame's start by contract. The
+/// backing allocations swap each frame, so the volume bound here is the one
+/// bound as the history next — which is why it leaves the frame in the layout it
+/// is declared to enter in.
+///
+/// `volume` is an ordinary transient: it is produced and consumed inside one
+/// frame, and nothing wants last frame's integral.
+#[derive(Clone, Copy, Debug)]
+pub struct FogIds {
+    /// `rgb` = scattered radiance per metre, `a` = extinction per metre.
+    pub scatter: ResourceId,
+    /// `rgb` = in-scattered radiance up to this slice, `a` = the transmittance
+    /// behind it. What every shading pass samples.
+    pub volume: ResourceId,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -619,6 +660,53 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         mask
     });
 
+    // After the cascades, because it reads them, and before every geometry pass,
+    // because all three sample the result. It needs no prepass and takes no
+    // screen-space input at all — a froxel is a point in the world, not a pixel —
+    // which is what lets the whole effect sit here rather than in the composite
+    // chain after shading, and is why it fogs blended and refractive surfaces at
+    // their own depth instead of at the opaque depth behind them.
+    let fog = config.volumetric_fog.then(|| {
+        // Entry `ShaderReadOnlyOptimal` states the steady state, which the
+        // ping-pong guarantees: this leaves every frame in exactly that layout
+        // and is the allocation the *history* names next frame. The one frame it
+        // is not true — the first after an allocation — is the frame the scatter
+        // pass is told to ignore its history anyway.
+        let scatter = builder.import_image(
+            "fog_scatter",
+            ImageDesc::new(FOG_FORMAT)
+                .extent(Extent::FrameDiv(FROXEL_SHIFT))
+                .depth(FROXEL_SLICES),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let volume = builder.create_image(
+            "fog_volume",
+            ImageDesc::new(FOG_FORMAT)
+                .extent(Extent::FrameDiv(FROXEL_SHIFT))
+                .depth(FROXEL_SLICES),
+        );
+
+        // The history is the *other* allocation of `scatter`, which the graph
+        // cannot see and does not need to: the executor binds it, and a resource
+        // read and written by one pass is one point in the schedule either way.
+        let mut scatter_pass = builder.pass("fog_scatter", PassKind::Compute);
+        if let Some(shadows) = shadows {
+            scatter_pass = scatter_pass.access(shadows, Access::Sampled);
+        }
+        let id = scatter_pass.access(scatter, Access::StorageWrite).build();
+        record(id, PassBody::FogScatter, &mut bodies);
+
+        let id = builder
+            .pass("fog_integrate", PassKind::Compute)
+            .access(scatter, Access::Sampled)
+            .access(volume, Access::StorageWrite)
+            .build();
+        record(id, PassBody::FogIntegrate, &mut bodies);
+
+        FogIds { scatter, volume }
+    });
+
     // Declared before the pass that writes them, because the forward pass has to
     // declare them as attachments: a second colour target and its resolve, in the
     // same shape as the frame's first pair, and only in a frame that diffuses.
@@ -646,6 +734,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     }
     if let Some(atlas) = shadow_atlas {
         forward = forward.access(atlas, Access::Sampled);
+    }
+    if let Some(fog) = fog {
+        forward = forward.access(fog.volume, Access::Sampled);
     }
     forward = forward
         .access(msaa_hdr, Access::ColorAttachment)
@@ -852,6 +943,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         if let Some(atlas) = shadow_atlas {
             accumulate = accumulate.access(atlas, Access::Sampled);
         }
+        if let Some(fog) = fog {
+            accumulate = accumulate.access(fog.volume, Access::Sampled);
+        }
         let id = accumulate
             .access(accum, Access::ColorAttachment)
             .access(reveal, Access::ColorAttachment)
@@ -943,6 +1037,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         }
         if let Some(atlas) = shadow_atlas {
             draw = draw.access(atlas, Access::Sampled);
+        }
+        if let Some(fog) = fog {
+            draw = draw.access(fog.volume, Access::Sampled);
         }
         let id = draw
             .access(accum, Access::ColorAttachment)
@@ -1310,6 +1407,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             prepass,
             ssao,
             contact_shadows,
+            fog,
             ssr,
             subsurface,
             transparency,

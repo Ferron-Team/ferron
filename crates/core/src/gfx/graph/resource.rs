@@ -61,6 +61,20 @@ pub struct ImageDesc {
     /// `texture2DArray`. Deriving the view type from the layer count instead
     /// silently produces a plain 2D view whenever the count happens to be one.
     pub array_layers: Option<u32>,
+    /// `Some(n)` makes this a *3D* image `n` texels deep, which
+    /// [`extent`](Self::extent) then sizes the other two axes of.
+    ///
+    /// An `Option` for the reason `array_layers` is one, and the distinction is
+    /// sharper here: a 3D image and a 2D array image are laid out alike and are
+    /// entirely different things to sample. An array is filtered *within* a
+    /// layer and never across layers, while a volume is filtered across all
+    /// three axes — which is the whole reason the froxel fog wants one, since
+    /// the slice boundaries are exactly where a nearest fetch would band.
+    ///
+    /// Mutually exclusive with `array_layers`: Vulkan has no arrayed 3D image,
+    /// and asking for both is a declaration bug rather than something to
+    /// silently pick a winner for.
+    pub depth: Option<u32>,
     /// How many mip levels the image carries. More than one makes it a pyramid,
     /// which one pass writes whole and later passes sample with `textureLod`.
     ///
@@ -84,6 +98,7 @@ impl ImageDesc {
             extent: Extent::Frame,
             samples: SampleCount::Sample1,
             array_layers: None,
+            depth: None,
             mip_levels: 1,
         }
     }
@@ -103,6 +118,14 @@ impl ImageDesc {
     /// Make this a 2D array image of `layers` layers, even when `layers` is 1.
     pub fn array_layers(mut self, layers: u32) -> Self {
         self.array_layers = Some(layers);
+        self
+    }
+
+    /// Make this a 3D image `depth` texels deep, even when `depth` is 1. See
+    /// [`depth`](Self::depth) for why that is not the same request as
+    /// [`array_layers`](Self::array_layers).
+    pub fn depth(mut self, depth: u32) -> Self {
+        self.depth = Some(depth.max(1));
         self
     }
 

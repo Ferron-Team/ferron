@@ -36,6 +36,7 @@ use crate::gfx::{
 use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
+use super::fog::GpuFog;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
@@ -259,40 +260,6 @@ fn to_gpu_lighting(
     // The shader wants the direction *toward* the light, so negate.
     let to_sun = (-lighting.sun.direction).normalize_or_zero();
 
-    let mut cascade_view_proj = [[[0.0f32; 4]; 4]; MAX_CASCADES];
-    let mut cascade_splits = [0.0f32; MAX_CASCADES];
-    let mut cascade_texel_sizes = [0.0f32; MAX_CASCADES];
-    // A zero count is what makes every shadow lookup return "lit"; the arrays
-    // above are then never indexed.
-    let shadow_params = match shadows {
-        Some(shadows) => {
-            for (slot, cascade) in cascade_view_proj
-                .iter_mut()
-                .zip(&shadows.cascades.cascades[..shadows.cascades.count])
-            {
-                *slot = cascade.view_proj.to_cols_array_2d();
-            }
-            for (index, cascade) in shadows.cascades.cascades[..shadows.cascades.count]
-                .iter()
-                .enumerate()
-            {
-                cascade_splits[index] = cascade.split_distance;
-                cascade_texel_sizes[index] = cascade.texel_world_size;
-            }
-            [
-                shadows.cascades.count as f32,
-                crate::gfx::shadows::OVERLAP,
-                shadows.settings.strength,
-                if shadows.settings.debug_cascades {
-                    1.0
-                } else {
-                    0.0
-                },
-            ]
-        }
-        None => [0.0; 4],
-    };
-
     GpuLighting {
         camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
         ambient: [
@@ -315,17 +282,7 @@ fn to_gpu_lighting(
             spot_count as f32,
         ],
         viewport: [w, h, 1.0 / w, 1.0 / h],
-        fog_color: [
-            lighting.fog_color.x,
-            lighting.fog_color.y,
-            lighting.fog_color.z,
-            lighting.fog_density.max(0.0),
-        ],
-        fog_params: [lighting.fog_height_falloff, lighting.fog_height, 0.0, 0.0],
-        cascade_view_proj,
-        cascade_splits,
-        cascade_texel_sizes,
-        shadow_params,
+        cascades: GpuCascades::new(shadows),
         point_lights,
         spot_lights,
         environment: {
@@ -334,6 +291,76 @@ fn to_gpu_lighting(
         },
         env_specular: [env_specular.x, env_specular.y, env_specular.z, 0.0],
         irradiance: irradiance.map(|c| [c.x, c.y, c.z, 0.0]),
+    }
+}
+
+/// Everything it takes to read the cascaded shadow maps, mirroring `Cascades` in
+/// `shaders/cascades.glsl`.
+///
+/// Its own struct because two uniform blocks carry it: the lighting block every
+/// surface shades from, and the fog block the froxel scatter pass dispatches
+/// with. A dispatch has no lighting set bound and the alternative was declaring
+/// the whole `Lighting` block — point lights, spot lights, irradiance — in a
+/// shader that wants four fields of it. One constructor fills both, so the two
+/// copies are made together or not at all.
+///
+/// std140 gives a struct of a `mat4` array and three `vec4`s exactly the offsets
+/// it gave these fields written out flat, which is why nesting them changed no
+/// layout.
+#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[repr(C)]
+pub(super) struct GpuCascades {
+    /// Per-cascade light view-projection. std140 lays a `mat4` out as four
+    /// `vec4`s with no padding between them, which is exactly what this is.
+    view_proj: [[[f32; 4]; 4]; MAX_CASCADES],
+    /// Split distances, as radial distance from the camera.
+    splits: [f32; MAX_CASCADES],
+    /// World size of one shadow texel in each cascade, for the normal-offset
+    /// bias. It differs per cascade because each fits a different-sized box to
+    /// the same number of texels.
+    texel_sizes: [f32; MAX_CASCADES],
+    /// x = cascade count, y = blend overlap fraction, z = strength,
+    /// w = 1.0 to tint by cascade index.
+    params: [f32; 4],
+}
+
+impl GpuCascades {
+    pub(super) fn new(shadows: Option<ShadowFrame<'_>>) -> Self {
+        let mut view_proj = [[[0.0f32; 4]; 4]; MAX_CASCADES];
+        let mut splits = [0.0f32; MAX_CASCADES];
+        let mut texel_sizes = [0.0f32; MAX_CASCADES];
+        // A zero count is what makes every shadow lookup return "lit"; the
+        // arrays above are then never indexed.
+        let params = match shadows {
+            Some(shadows) => {
+                let live = &shadows.cascades.cascades[..shadows.cascades.count];
+                for (slot, cascade) in view_proj.iter_mut().zip(live) {
+                    *slot = cascade.view_proj.to_cols_array_2d();
+                }
+                for (index, cascade) in live.iter().enumerate() {
+                    splits[index] = cascade.split_distance;
+                    texel_sizes[index] = cascade.texel_world_size;
+                }
+                [
+                    shadows.cascades.count as f32,
+                    crate::gfx::shadows::OVERLAP,
+                    shadows.settings.strength,
+                    if shadows.settings.debug_cascades {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                ]
+            }
+            None => [0.0; 4],
+        };
+
+        Self {
+            view_proj,
+            splits,
+            texel_sizes,
+            params,
+        }
     }
 }
 
@@ -406,22 +433,7 @@ struct GpuLighting {
     params: [f32; 4],
     /// x=w, y=h, z=1/w, w=1/h
     viewport: [f32; 4],
-    /// rgb = fog color, w = density at the reference height.
-    fog_color: [f32; 4],
-    /// x = height falloff, y = reference height.
-    fog_params: [f32; 4],
-    /// Per-cascade light view-projection. std140 lays a `mat4` out as four
-    /// `vec4`s with no padding between them, which is exactly what this is.
-    cascade_view_proj: [[[f32; 4]; 4]; MAX_CASCADES],
-    /// Split distances, as radial distance from the camera.
-    cascade_splits: [f32; MAX_CASCADES],
-    /// World size of one shadow texel in each cascade, for the normal-offset
-    /// bias. It differs per cascade because each fits a different-sized box to
-    /// the same number of texels.
-    cascade_texel_sizes: [f32; MAX_CASCADES],
-    /// x = cascade count, y = blend overlap fraction, z = strength,
-    /// w = 1.0 to tint by cascade index.
-    shadow_params: [f32; 4],
+    cascades: GpuCascades,
     point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
     spot_lights: [GpuSpotLight; MAX_SPOT_LIGHTS],
     /// x = sin(environment yaw), y = cos(environment yaw). The same rotation
@@ -1041,6 +1053,9 @@ impl ForwardPass {
         object_set: Arc<DescriptorSet>,
         decals: Subbuffer<GpuDecals>,
         environment: &EnvironmentSettings,
+        fog: Subbuffer<GpuFog>,
+        fog_volume: Arc<ImageView>,
+        fog_sampler: Arc<Sampler>,
     ) -> ForwardSets {
         let lighting_buffer = self
             .uniform_buffer_allocator
@@ -1125,6 +1140,13 @@ impl ForwardPass {
                 // images, and this shader is already at five.
                 WriteDescriptorSet::image_view(6, atlas_view),
                 WriteDescriptorSet::buffer(7, shadow_faces),
+                // The fog volume and the medium that produced it. Both are bound
+                // in every frame — the volume as a 1x1x1 stand-in when the two
+                // dispatches did not run — because the analytic term past the
+                // froxels reads the same block, so there is one path in the
+                // shader rather than a second pipeline.
+                WriteDescriptorSet::image_view_sampler(8, fog_volume, fog_sampler),
+                WriteDescriptorSet::buffer(9, fog),
             ],
             [],
         )

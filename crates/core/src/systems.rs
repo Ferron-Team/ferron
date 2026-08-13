@@ -10,9 +10,8 @@ use crate::gfx::{
     RenderItem, SceneLighting, SpotLight,
 };
 use crate::scene::{
-    AmbientLight, Camera, Culling, Decal, DecalSettings, FogSettings, Light, LocalTransform,
-    MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialBlends, MaterialHandle, MeshBounds, MeshHandle, Spin,
-    WorldTransform,
+    AmbientLight, Camera, Culling, Decal, DecalSettings, Light, LocalTransform, MAX_CONE_ANGLE,
+    MIN_CONE_ANGLE, MaterialBlends, MaterialHandle, MeshBounds, MeshHandle, Spin, WorldTransform,
 };
 
 pub fn spin(world: &World, dt: f32) {
@@ -518,23 +517,12 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
     out.sun = defaults.sun;
     out.shininess = defaults.shininess;
     out.specular_strength = defaults.specular_strength;
-    out.fog_color = defaults.fog_color;
-    out.fog_density = defaults.fog_density;
-    out.fog_height_falloff = defaults.fog_height_falloff;
-    out.fog_height = defaults.fog_height;
     out.point_lights.clear();
     out.spot_lights.clear();
 
     if let Some(ambient) = world.get_resource::<AmbientLight>() {
         out.ambient_color = ambient.color;
         out.ambient_nits = ambient.nits;
-    }
-
-    if let Some(fog) = world.get_resource::<FogSettings>() {
-        out.fog_color = fog.color;
-        out.fog_density = fog.density;
-        out.fog_height_falloff = fog.height_falloff;
-        out.fog_height = fog.height;
     }
 
     let mut has_sun = false;

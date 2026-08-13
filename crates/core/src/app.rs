@@ -647,6 +647,7 @@ impl ApplicationHandler for App {
                 let bloom = *self.world.resource::<BloomSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
                 let environment = self.world.resource::<EnvironmentSettings>().clone();
+                let fog = *self.world.resource::<FogSettings>();
                 if environment.reload_requested {
                     self.world
                         .resource_mut::<EnvironmentSettings>()
@@ -710,6 +711,7 @@ impl ApplicationHandler for App {
                         &bloom,
                         &hdr,
                         &environment,
+                        &fog,
                         dt,
                         &self.debug_lines,
                         profiler_frame,

@@ -10,8 +10,8 @@ pub use headless::HeadlessBackend;
 use crate::geom::Aabb;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
-    HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, RefractionSettings, SsaoSettings,
-    SsrSettings, SubsurfaceSettings, TaaSettings, TransparencySettings,
+    FogSettings, HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, RefractionSettings,
+    SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings, TransparencySettings,
 };
 use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
@@ -271,11 +271,6 @@ pub struct SceneLighting {
     /// Blinn-Phong specular exponent. Higher = smaller, sharper highlight.
     pub shininess: f32,
     pub specular_strength: f32,
-    pub fog_color: Vec3,
-    /// Fog extinction at `fog_height`. Zero disables the effect.
-    pub fog_density: f32,
-    pub fog_height_falloff: f32,
-    pub fog_height: f32,
 }
 
 /// Which queue a material draws in.
@@ -623,10 +618,6 @@ impl Default for SceneLighting {
             spot_lights: Vec::new(),
             shininess: 32.0,
             specular_strength: 0.4,
-            fog_color: Vec3::new(0.55, 0.62, 0.72),
-            fog_density: 0.005,
-            fog_height_falloff: 0.1,
-            fog_height: 0.0,
         }
     }
 }
@@ -681,6 +672,7 @@ pub trait RenderBackend {
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
+        fog: &FogSettings,
         dt: f32,
     );
 }

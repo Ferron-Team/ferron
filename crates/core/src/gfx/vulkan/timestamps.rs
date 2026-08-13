@@ -374,6 +374,7 @@ mod tests {
             auto_exposure: true,
             motion_blur: true,
             dof: true,
+            volumetric_fog: false,
             bloom_mips: MAX_BLOOM_MIPS as u8,
             overlay: true,
             shadow_cascades: MAX_CASCADES as u8,

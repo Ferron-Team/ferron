@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use glam::{Mat3, Mat4, Vec3};
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
+use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, CopyBufferToImageInfo, ImageBlit,
     PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents,
@@ -48,6 +48,8 @@ use vulkano::sync::{self, GpuFuture};
 
 use crate::gfx::sh::{self, SH9};
 use crate::scene::EnvironmentSettings;
+
+use super::fog::GpuFog;
 
 use super::MSAA_SAMPLES;
 use super::context::VkContext;
@@ -300,6 +302,9 @@ impl EnvironmentPass {
         extent: [u32; 2],
         settings: &EnvironmentSettings,
         subsurface: bool,
+        fog: Subbuffer<GpuFog>,
+        fog_volume: Arc<ImageView>,
+        fog_sampler: Arc<Sampler>,
     ) {
         let Some(cube) = self.cube.clone() else {
             return;
@@ -321,6 +326,10 @@ impl EnvironmentPass {
             [
                 WriteDescriptorSet::image_view(0, cube),
                 WriteDescriptorSet::sampler(1, self.cube_sampler.clone()),
+                // The sky is fogged out of the same volume the geometry is, or
+                // the horizon is a seam — see `skybox.frag`.
+                WriteDescriptorSet::image_view_sampler(2, fog_volume, fog_sampler),
+                WriteDescriptorSet::buffer(3, fog),
             ],
             [],
         )
@@ -364,7 +373,12 @@ impl EnvironmentPass {
                 0,
                 SkyboxPush {
                     inv_view_rot_proj: matrix.to_cols_array_2d(),
-                    params: [settings.calibration(self.measured_sky), 0.0, 0.0, 0.0],
+                    params: [
+                        settings.calibration(self.measured_sky),
+                        1.0 / extent[0] as f32,
+                        1.0 / extent[1] as f32,
+                        0.0,
+                    ],
                 },
             )
             .unwrap();
@@ -947,7 +961,11 @@ mod prefilter_fs {
 }
 
 mod skybox_fs {
-    vulkano_shaders::shader! { ty: "fragment", path: "shaders/skybox.frag" }
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "shaders/skybox.frag",
+        include: ["shaders"],
+    }
 }
 
 #[cfg(test)]

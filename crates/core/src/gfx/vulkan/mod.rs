@@ -4,6 +4,7 @@ mod context;
 mod dof;
 mod environment;
 mod exposure;
+mod fog;
 mod forward;
 pub mod frame;
 mod hdr;
@@ -47,7 +48,7 @@ use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::shadows::CascadeSet;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
-    HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, PresentSettings,
+    FogSettings, HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, PresentSettings,
     RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
     TransparencySettings,
 };
@@ -63,6 +64,7 @@ use crate::gfx::graph::{PassKind, ResourceId};
 use self::bloom::BloomPass;
 use self::dof::DofPass;
 use self::exposure::ExposurePass;
+use self::fog::FogPass;
 use self::frame::{Frame, FrameConfig, PassBody};
 use self::hdr::HdrPass;
 use self::line::LinePass;
@@ -145,6 +147,11 @@ pub struct VulkanRenderer {
     /// multiplies its sun term by. Holds only a pipeline and the dither's frame
     /// counter; the mask is graph-owned.
     contact_shadows: ContactShadowPass,
+    /// The air in front of the camera as a froxel grid. Owns the ping-ponged
+    /// scattering history the graph imports, and the block describing the medium
+    /// — which every shading pass binds whether or not the two dispatches ran,
+    /// because the analytic fog past the volume is the same medium.
+    fog: FogPass,
     /// The depth pyramid, the reflection rays, and the composite that swaps the
     /// environment's reflection for them. Holds only pipelines and the resolved
     /// settings; every image it works over is graph-owned.
@@ -272,6 +279,7 @@ impl VulkanRenderer {
         let prepass = GeometryPrepass::new(&ctx);
         let ssao = SsaoPass::new(&ctx);
         let contact_shadows = ContactShadowPass::new(&ctx);
+        let fog = FogPass::new(&ctx);
         let ssr = SsrPass::new(&ctx);
         let subsurface = SubsurfacePass::new(&ctx);
         let oit = OitPass::new(&ctx, forward.pipeline_layout());
@@ -322,6 +330,7 @@ impl VulkanRenderer {
             refraction: true,
             taa: true,
             auto_exposure: true,
+            volumetric_fog: false,
             motion_blur: false,
             dof: false,
             bloom_mips: bloom::mip_count(extent),
@@ -354,6 +363,7 @@ impl VulkanRenderer {
             prepass,
             ssao,
             contact_shadows,
+            fog,
             ssr,
             subsurface,
             oit,
@@ -468,6 +478,13 @@ impl VulkanRenderer {
     /// the frame has — so it asks by `ResourceId` and this decides, rather than
     /// each consumer re-deriving which pass ran last.
     fn view_of(&self, id: ResourceId) -> Arc<ImageView> {
+        if let Some(fog) = self.frame.ids.fog
+            && id == fog.scatter
+        {
+            // Imported and ping-ponged like the TAA history below, and for the
+            // same reason: the scatter pass reads its own previous frame.
+            return self.fog.scatter_view();
+        }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.taa.output_view(),
             _ => self.images.view(id),
@@ -587,6 +604,7 @@ impl RenderBackend for VulkanRenderer {
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
+        fog: &FogSettings,
         dt: f32,
     ) {
         // No overlay path (e.g. export/headless) draws no debug lines and no
@@ -611,6 +629,7 @@ impl RenderBackend for VulkanRenderer {
             bloom,
             hdr,
             environment,
+            fog,
             dt,
             &[],
             None,
@@ -708,6 +727,7 @@ impl VulkanRenderer {
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
+        fog: &FogSettings,
         dt: f32,
         debug_lines: &[DebugLine],
         profiler_frame: u64,
@@ -733,6 +753,7 @@ impl VulkanRenderer {
             bloom,
             hdr,
             environment,
+            fog,
             dt,
             debug_lines,
             Some(profiler_frame),
@@ -762,6 +783,7 @@ impl VulkanRenderer {
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
+        fog: &FogSettings,
         // Seconds since the last frame, for exposure adaptation. Zero converges
         // immediately, which is what a one-shot render wants.
         dt: f32,
@@ -800,6 +822,7 @@ impl VulkanRenderer {
             auto_exposure: hdr.auto_exposure,
             motion_blur: motion_blur.enabled,
             dof: dof.enabled,
+            volumetric_fog: self.fog.enabled(fog),
             // Zero when bloom is off, and also when the window is too small for
             // a chain — so a frame dragged to a sliver drops the passes rather
             // than dispatching over one-texel levels.
@@ -918,6 +941,22 @@ impl VulkanRenderer {
             );
         }
         self.motion_blur.begin_frame(motion_blur, camera);
+        // Whether or not the two dispatches run, and that is the point: the
+        // block resolved here is what every shading pass applies the fog out of,
+        // and past the volume's far plane — or in a frame with no volume at all —
+        // the analytic integral is described by these very same numbers. The
+        // ambient is the same product the lighting block falls back to, so the
+        // air and the surfaces standing in it agree about how bright the sky is.
+        self.fog.begin_frame(
+            &self.ctx,
+            fog,
+            lighting,
+            shadows,
+            &view,
+            camera.position,
+            lighting.ambient_color * lighting.ambient_nits,
+            self.swapchain.extent,
+        );
         // Sourced from the compiled frame, not from the setting: a window too
         // small for a chain leaves bloom enabled but unbuilt, and a non-zero
         // strength would then blend the 1x1 black stand-in into the image and
@@ -1102,6 +1141,13 @@ impl VulkanRenderer {
             forward_object_set.clone(),
             decal_block.clone(),
             environment,
+            // The same allocation both fog dispatches bind, and the same
+            // stand-in volume when they did not run: one description of the
+            // medium, three places that read it.
+            self.fog.uniforms(),
+            self.fog
+                .volume_or_fallback(self.frame.ids.fog.map(|ids| self.images.view(ids.volume))),
+            self.fog.sampler(),
         );
 
         // The whole frame, in the order the compiler derived. Nothing below
@@ -1219,6 +1265,22 @@ impl VulkanRenderer {
                             self.environment.specular_view(),
                             self.environment.sampler(),
                             self.images.view(ids.output),
+                        );
+                    }
+                    PassBody::FogScatter => {
+                        self.fog
+                            .record_scatter(&mut builder, &self.ctx, shadow_view.clone());
+                    }
+                    PassBody::FogIntegrate => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .fog
+                            .expect("fog passes without their volumes");
+                        self.fog.record_integrate(
+                            &mut builder,
+                            &self.ctx,
+                            self.images.view(ids.volume),
                         );
                     }
                     PassBody::SubsurfaceBlurHorizontal | PassBody::SubsurfaceBlurVertical => {
@@ -1618,6 +1680,11 @@ impl VulkanRenderer {
                         extent,
                         environment,
                         subsurface,
+                        self.fog.uniforms(),
+                        self.fog.volume_or_fallback(
+                            self.frame.ids.fog.map(|ids| self.images.view(ids.volume)),
+                        ),
+                        self.fog.sampler(),
                     );
                     // Debug lines share the forward subpass: depth-tested against
                     // the scene, drawn on top of it, before the pass ends.
@@ -1670,6 +1737,8 @@ impl VulkanRenderer {
                 | PassBody::SsrSource
                 | PassBody::SsrTrace
                 | PassBody::SsrResolve
+                | PassBody::FogScatter
+                | PassBody::FogIntegrate
                 | PassBody::SubsurfaceBlurHorizontal
                 | PassBody::SubsurfaceBlurVertical
                 | PassBody::SubsurfaceComposite

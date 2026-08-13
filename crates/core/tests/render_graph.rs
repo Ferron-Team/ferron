@@ -57,6 +57,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -84,6 +85,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 4,
@@ -110,6 +112,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: 0,
                 overlay: true,
                 shadow_cascades: 0,
@@ -134,6 +137,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -160,6 +164,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: false,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -185,9 +190,40 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: 1,
                 overlay: true,
                 shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
+        // The froxel fog, with the cascades it exists to read. Worth baselining
+        // for two things the rest of the suite cannot show. The scatter pass is
+        // an *import* read and written by one pass, which is the shape the
+        // reprojection needs and the only one in the frame besides TAA's. And
+        // the fog is the one effect whose result a *geometry* pass consumes: the
+        // forward pass declares the volume as an input, so the two dispatches
+        // land ahead of shading rather than in the composite chain after it, and
+        // a diff that moved them would be a diff in what the geometry can see.
+        (
+            "editor frame, volumetric fog with cascades",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                contact_shadows: false,
+                ssr: false,
+                subsurface: false,
+                transparency: true,
+                refraction: false,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
+                volumetric_fog: true,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
             },
@@ -211,6 +247,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: true,
                 dof: true,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -237,6 +274,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: true,
                 dof: true,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -263,6 +301,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -287,6 +326,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -313,6 +353,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 4,
@@ -337,6 +378,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: false,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: 0,
                 overlay: true,
                 shadow_cascades: 0,
@@ -362,6 +404,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 4,
@@ -387,6 +430,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
@@ -414,6 +458,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: true,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 4,
@@ -439,6 +484,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: false,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: 0,
                 overlay: true,
                 shadow_cascades: 0,
@@ -465,6 +511,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: true,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 4,
@@ -489,6 +536,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: false,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: 0,
                 overlay: true,
                 shadow_cascades: 0,
@@ -518,6 +566,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 4,
@@ -543,6 +592,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: false,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: 0,
                 overlay: true,
                 shadow_cascades: 0,
@@ -564,6 +614,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 auto_exposure: true,
                 motion_blur: false,
                 dof: false,
+                volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: false,
                 shadow_cascades: 2,
@@ -666,6 +717,7 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             auto_exposure: true,
             motion_blur: false,
             dof: false,
+            volumetric_fog: false,
             bloom_mips: BLOOM_MIPS,
             overlay: true,
             shadow_cascades: count,
@@ -711,6 +763,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         auto_exposure: true,
         motion_blur: false,
         dof: false,
+        volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
         shadow_cascades: 0,
@@ -738,6 +791,105 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         })
         .collect();
     assert!(closing.is_empty(), "{closing:?}");
+}
+
+/// The froxel fog ping-pongs two volumes exactly as TAA ping-pongs two images,
+/// so the same round-trip has to hold: the allocation this frame writes as
+/// `fog_scatter` is the one next frame's scatter pass samples as its history,
+/// and the frame therefore has to leave it in the layout it is declared to enter
+/// in.
+///
+/// Nothing in the compiler can check it — the pairing is a property of how the
+/// executor binds the pair — which is why it is asserted here.
+#[test]
+fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        ssao: true,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: false,
+        refraction: false,
+        taa: false,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: true,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        shadow_cascades: 4,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+    })
+    .unwrap();
+
+    let plan = format!("{}", frame.graph);
+    // The integration reads it, which is what puts it back into the layout the
+    // next frame's history binding expects — so this transition is load-bearing
+    // twice over and not merely an ordering artefact.
+    assert!(
+        plan.contains("fog_scatter General->ShaderReadOnlyOptimal"),
+        "the scatter volume must end the frame sampled, not left in General:\n{plan}",
+    );
+    let closing: Vec<_> = frame
+        .graph
+        .final_barriers()
+        .iter()
+        .filter(|barrier| frame.graph.resource_name(barrier.resource) == "fog_scatter")
+        .collect();
+    assert!(closing.is_empty(), "{closing:?}");
+}
+
+/// The fog is the one effect here whose output a *geometry* pass consumes, so
+/// both dispatches have to finish before anything shades — and after the
+/// cascades, which the scatter pass reads to put the shadow maps into the air.
+///
+/// Both halves come out of what `declare` says the passes access rather than out
+/// of where they were written, which is exactly why a test is worth having: the
+/// day the forward pass stops declaring the volume, the fog would still compile
+/// and would silently be read a frame late.
+#[test]
+fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        ssao: true,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: true,
+        refraction: true,
+        taa: false,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: true,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        shadow_cascades: 4,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+    })
+    .unwrap();
+
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&pass| frame.graph.pass_name(pass))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} was not scheduled:\n{order:?}"))
+    };
+
+    assert!(at("shadow_cascade_3") < at("fog_scatter"), "{order:?}");
+    assert!(at("fog_scatter") < at("fog_integrate"), "{order:?}");
+    for shading in ["forward", "oit_accumulate", "refraction_draw"] {
+        assert!(at("fog_integrate") < at(shading), "{shading}: {order:?}");
+    }
 }
 
 /// Transparency's two nodes have to land between the reflections and the
@@ -768,6 +920,7 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         auto_exposure: true,
         motion_blur: false,
         dof: false,
+        volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
         shadow_cascades: 0,
@@ -821,6 +974,7 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         auto_exposure: false,
         motion_blur: false,
         dof: false,
+        volumetric_fog: false,
         bloom_mips: 0,
         overlay: true,
         shadow_cascades: 0,
@@ -876,6 +1030,7 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         auto_exposure: false,
         motion_blur: false,
         dof: false,
+        volumetric_fog: false,
         bloom_mips: 0,
         overlay: true,
         shadow_cascades: 0,
@@ -951,6 +1106,7 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         auto_exposure: true,
         motion_blur: false,
         dof: false,
+        volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
         shadow_cascades: 0,
@@ -1005,6 +1161,7 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         auto_exposure: false,
         motion_blur: false,
         dof: false,
+        volumetric_fog: false,
         bloom_mips: 0,
         overlay: true,
         shadow_cascades: 0,
@@ -1051,6 +1208,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         auto_exposure: true,
         motion_blur: true,
         dof: true,
+        volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
         shadow_cascades: 0,
@@ -1117,6 +1275,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         auto_exposure: true,
         motion_blur: false,
         dof: false,
+        volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
         shadow_cascades: 0,
