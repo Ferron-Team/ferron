@@ -7,3 +7,4 @@ scene.orrin
 # Sponza is ~40 MB of somebody else's CC BY asset; scripts/fetch-sponza.sh puts
 # it here on demand.
 /assets/sponza/
+.DS_Store
