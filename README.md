@@ -20,13 +20,16 @@ Join the [discord](https://discord.gg/sY8YBGFmRy) to discuss the development or 
 ## Quick start
 
 ```bash
-# Run the engine on its built-in demo
+# Build the C# side once, then run the engine on its built-in demo
+dotnet build scripting/Orrin
+dotnet build scripting/DemoGame
 cargo run -p orrin-core
-
-# With C# scripting (requires the .NET SDK)
-dotnet build scripting/Orrin -c Debug
-cargo run -p orrin-core --features scripting
 ```
+
+Scripting is compiled in by default. The engine still starts without the .NET
+SDK — it prints why scripting is off and runs the scene — and
+`cargo run -p orrin-core --no-default-features` builds it out entirely, for a
+machine with no .NET and no network to fetch `nethost` from.
 
 ### Starting a game
 

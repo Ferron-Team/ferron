@@ -13,22 +13,39 @@ vulkano.workspace = true
 vulkano-shaders.workspace = true
 winit.workspace = true
 glam.workspace = true
+gltf.workspace = true
 image.workspace = true
 egui.workspace = true
 egui_winit_vulkano.workspace = true
+# SVG image loader for the editor's Lucide icon set. egui renders no SVG itself.
+egui_extras = { version = "0.31", features = ["svg"] }
+serde.workspace = true
+# User themes are hand-authored TOML; editor preferences are machine-written RON
+# (a dock layout is a tree of enums, which TOML cannot express).
+toml.workspace = true
+ron = "0.10"
 sysinfo = "0.33"
 # Filesystem watching for rebuild-on-save; only pulled in with `scripting`.
 notify = { version = "8", optional = true }
 # Raw VK_EXT_memory_budget query for VRAM usage; pinned to vulkano 0.35's ash.
 ash = "0.38"
+egui_dock = { version = "0.16", features = ["serde"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [features]
-# Opt-in C# scripting. Off by default so the standard workspace build and CI
-# don't pull in orrin-script (netcorehost + the nethost download). The build
-# watcher rides along: rebuild-on-save has nothing to reload without scripting.
+default = ["scripting"]
+# C# scripting, on by default: it is what the engine *is*, and a second-class
+# build shape is one nobody compiles until it has already rotted.
+#
+# It is still a feature rather than a plain dependency, for one reason worth the
+# `#[cfg]`s: orrin-script pulls netcorehost, which downloads nethost from NuGet
+# at build time. `--no-default-features` is the build for a machine with no
+# network and no .NET, and CI compiles that shape too so it cannot rot either.
+#
+# The build watcher rides along: rebuild-on-save has nothing to reload without
+# scripting.
 scripting = ["dep:orrin-script", "dep:orrin-build", "dep:notify"]
 
 [[bench]]

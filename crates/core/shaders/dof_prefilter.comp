@@ -1,0 +1,71 @@
+#version 460
+
+// Depth of field, step one: half the frame, carrying its own circle of
+// confusion.
+//
+// The gather that follows is the expensive pass — every one of its taps costs a
+// dependent texture read — so it runs at half resolution over an image that
+// already knows how blurred each texel wants to be. Packing the CoC into alpha
+// is what makes that one fetch instead of two, and the sign of it is what tells
+// the near field from the far field downstream.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_color;
+layout(set = 0, binding = 1) uniform sampler2D u_depth;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_target;
+layout(push_constant) uniform Push {
+    // CoC radius per unit of (1 - focus/depth), in half-res pixels.
+    float coc_scale;
+    float focus_distance;
+    float near;
+    float far;
+    // The largest CoC radius the gather's kernel can reach. Anything past it
+    // would be scattered further than the gather looks, so it is clamped here
+    // rather than silently truncated there.
+    float max_radius;
+} dof;
+
+// Undo the projection's depth curve. The jitter TAA bakes into the projection
+// touches only clip x and y, so this is the same distance whether or not the
+// frame was jittered.
+float linear_depth(float d) {
+    return dof.near * dof.far / max(dof.far - d * (dof.far - dof.near), 1e-6);
+}
+
+float circle_of_confusion(float d) {
+    return dof.coc_scale * (1.0 - dof.focus_distance / max(linear_depth(d), 1e-4));
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_target);
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    ivec2 full_size = textureSize(u_color, 0);
+    ivec2 base = texel * 2;
+
+    vec3 color = vec3(0.0);
+    float coc = 0.0;
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            ivec2 at = min(base + ivec2(x, y), full_size - 1);
+            color += texelFetch(u_color, at, 0).rgb;
+            // The *largest* of the four, not their average. A thin foreground
+            // element — a railing, a strand of hair — occupies one of these four
+            // texels, and averaging its CoC against three background ones drops
+            // it out of the near field entirely at half resolution, which reads
+            // as the object snapping in and out of focus as it moves.
+            float candidate = circle_of_confusion(texelFetch(u_depth, at, 0).r);
+            if (abs(candidate) > abs(coc)) {
+                coc = candidate;
+            }
+        }
+    }
+
+    imageStore(
+        u_target, texel,
+        vec4(color * 0.25, clamp(coc, -dof.max_radius, dof.max_radius)));
+}

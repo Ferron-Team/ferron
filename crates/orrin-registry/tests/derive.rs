@@ -89,10 +89,7 @@ fn nesting_composes() {
         label: Label("x".to_owned()),
         waypoints: vec![Vec3::ZERO, Vec3::ONE],
     });
-    assert_eq!(
-        encoded.field("label"),
-        Some(&Value::String("x".to_owned()))
-    );
+    assert_eq!(encoded.field("label"), Some(&Value::String("x".to_owned())));
     assert_eq!(
         encoded.field("health").and_then(|h| h.field("max")),
         Some(&Value::F32(2.0))
@@ -164,16 +161,76 @@ fn skipped_variant_fields_behave_the_same() {
 #[test]
 fn a_missing_field_names_itself() {
     let err = Health::from_value(&Value::strukt([("current", Value::F32(1.0))])).unwrap_err();
-    assert_eq!(err.to_string(), "field `max`: expected a value, found nothing");
+    assert_eq!(
+        err.to_string(),
+        "field `max`: expected a value, found nothing"
+    );
 }
 
 #[test]
 fn a_nested_failure_reports_the_full_path() {
     let broken = Value::strukt([
-        ("health", Value::strukt([("current", Value::F32(1.0)), ("max", Value::Bool(true))])),
+        (
+            "health",
+            Value::strukt([("current", Value::F32(1.0)), ("max", Value::Bool(true))]),
+        ),
         ("label", Value::String("x".to_owned())),
         ("waypoints", Value::List(Vec::new())),
     ]);
     let err = Nested::from_value(&broken).unwrap_err();
     assert_eq!(err.path.to_string(), "health.max");
+}
+
+/// A component that grew two fields after scenes were already saved against it:
+/// one whose old meaning is the type's own default, and one whose old meaning is
+/// a specific value the `Default` impl cannot supply.
+#[derive(Reflect, Debug, PartialEq)]
+struct Grown {
+    original: f32,
+    #[reflect(default)]
+    added: f32,
+    #[reflect(default = true)]
+    added_on: bool,
+}
+
+/// The whole point of `default`: a document written before the field existed
+/// still loads, and loads as whatever the field's absence used to mean. Without
+/// it the entity fails outright, which is the difference between an engine that
+/// can add a field to a shipped component and one that cannot.
+#[test]
+fn a_defaulted_field_survives_a_document_that_predates_it() {
+    let old = Value::strukt([("original", Value::F32(2.0))]);
+    assert_eq!(
+        Grown::from_value(&old),
+        Ok(Grown {
+            original: 2.0,
+            added: 0.0,
+            added_on: true,
+        })
+    );
+}
+
+/// It is only a fallback for *absence*. A field that is present and of the wrong
+/// type is a broken document rather than an old one, and quietly substituting a
+/// default there would hide the break.
+#[test]
+fn a_defaulted_field_still_rejects_a_wrong_type() {
+    let broken = Value::strukt([
+        ("original", Value::F32(2.0)),
+        ("added", Value::String("nope".to_owned())),
+    ]);
+    let err = Grown::from_value(&broken).unwrap_err();
+    assert_eq!(err.path.to_string(), "added");
+}
+
+/// And it is still written on save, so the file round-trips and the next reader
+/// does not need the fallback at all.
+#[test]
+fn a_defaulted_field_is_still_written() {
+    let grown = Grown {
+        original: 1.0,
+        added: 3.0,
+        added_on: false,
+    };
+    assert_eq!(Grown::from_value(&grown.to_value()), Ok(grown));
 }

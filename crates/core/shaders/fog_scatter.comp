@@ -1,0 +1,91 @@
+#version 460
+
+// What each froxel of air scatters toward the camera, and how much it blocks.
+//
+// One invocation per froxel. The whole feature's cost is here: a cascade lookup
+// per froxel is what puts the shadow maps into the air, and it is the only
+// reason a shaft of sunlight through a window has an edge. The integration that
+// turns this into something a fragment can read is the pass after it.
+//
+// Written into a volume whose *previous* frame is an input, so the depth jitter
+// below is averaged rather than seen. Without that this is a slideshow of
+// sixty-four planes; with it the volume resolves finer than its own slice count,
+// for the reason TAA resolves finer than its own pixel grid.
+
+#include "fog.glsl"
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0) uniform Fog {
+    GpuFog f;
+} u;
+
+// The cascades, kept as a separate image and comparison sampler for the reason
+// `shading.glsl` keeps them apart: Metal caps sampler states per stage far below
+// sampled images.
+layout(set = 0, binding = 1) uniform texture2DArray u_shadow_maps;
+layout(set = 0, binding = 2) uniform samplerShadow u_shadow_cmp;
+
+// Last frame's volume, in last frame's froxel space. Linear and clamped: the
+// reprojection almost never lands on a texel centre, and past the edges the
+// clamp is what makes a froxel that has just entered the frustum fall back to
+// its own measurement rather than to a neighbour's.
+layout(set = 0, binding = 3) uniform sampler3D u_history;
+
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image3D u_scatter;
+
+void main() {
+    ivec3 size = imageSize(u_scatter);
+    ivec3 coord = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(coord, size))) {
+        return;
+    }
+
+    FogParams f = u.f.fog;
+
+    vec2 uv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+    // Jittered along the slice, not centred in it. The jitter is the frame's,
+    // so every froxel in the volume moves together and the history below is
+    // what averages the sequence — offsetting each froxel independently would
+    // be noise the reprojection could not undo.
+    float t = (float(coord.z) + f.temporal.y) / float(size.z);
+
+    vec3 dir = fog_ray_direction(f, uv);
+    float view_dist = fog_slice_depth(f, t);
+    vec3 world_pos = f.camera_pos.xyz + dir * view_dist;
+
+    float density = fog_density(f, world_pos);
+
+    vec3 L = f.sun_direction.xyz;
+    // Biased along the light rather than along a normal, because there is no
+    // surface here — see `cascade_shadow`. The `dot(N, L)` early-out a surface
+    // takes has no meaning for a point of air, which is exactly why this calls
+    // the shared core rather than `shading.glsl`'s `sun_shadow`.
+    float sun_visibility = cascade_sun_shadow(
+        u.f.cascades, u_shadow_maps, u_shadow_cmp, world_pos, L, L, view_dist
+    );
+
+    // `rgb` is scattered radiance per metre and `a` is extinction per metre, so
+    // the pass below can integrate the two together over a slice's own length.
+    vec4 current = vec4(density * fog_inscattered(f, dir, sun_visibility), density);
+
+    if (f.temporal.z < 0.5) {
+        vec4 clip = f.prev_view_proj * vec4(world_pos, 1.0);
+        if (clip.w > 0.0) {
+            vec2 prev_uv = (clip.xy / clip.w) * 0.5 + 0.5;
+            float prev_dist = length(world_pos - f.prev_camera_pos.xyz);
+            vec3 prev = vec3(prev_uv, fog_depth_slice(f, prev_dist));
+            // Only where the froxel was actually in last frame's volume. The
+            // slice coordinate is clamped by `fog_depth_slice` rather than
+            // rejected, so what this rejects is the froxel that was off-screen
+            // — which has no history rather than a clamped one.
+            if (all(greaterThanEqual(prev_uv, vec2(0.0)))
+                && all(lessThanEqual(prev_uv, vec2(1.0)))) {
+                vec4 history = textureLod(u_history, prev, 0.0);
+                current = mix(current, history, f.temporal.x);
+            }
+        }
+    }
+
+    imageStore(u_scatter, coord, current);
+}

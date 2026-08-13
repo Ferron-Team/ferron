@@ -18,8 +18,8 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Frames kept for aggregation; matches `FrameStats::HISTORY` so the table and
@@ -31,6 +31,8 @@ const HISTORY: usize = 240;
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
+
+static GPU_PASSES: AtomicBool = AtomicBool::new(true);
 
 /// Nanoseconds since the profiler's epoch. Also the conversion target for GPU
 /// timestamps, which arrive in device ticks.
@@ -46,6 +48,27 @@ pub fn is_enabled() -> bool {
 /// scope. Toggling mid-frame is safe but produces one frame of ragged nesting.
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the *named* GPU passes are timed, as opposed to the frame as a whole.
+///
+/// A second switch because the two costs are nothing alike. The whole-frame pair
+/// is two timestamps and measures the thing anybody actually wants. Per-pass
+/// timing is two more around every node — sixty of them in a full frame — and
+/// each is a `BottomOfPipe` write, which means adjacent independent passes that
+/// the GPU would otherwise overlap are made to drain in sequence. So the
+/// per-pass numbers can be individually right and sum to more than the frame
+/// they came from, and the difference between the whole-frame time with this on
+/// and with it off *is* the overlap the schedule is currently getting.
+///
+/// Gated under [`is_enabled`], not beside it: this narrows GPU collection rather
+/// than replacing it, so switching profiling off switches this off too.
+pub fn gpu_passes_enabled() -> bool {
+    GPU_PASSES.load(Ordering::Relaxed)
+}
+
+pub fn set_gpu_passes_enabled(enabled: bool) {
+    GPU_PASSES.store(enabled, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -232,7 +255,11 @@ impl Profiler {
     /// `false` if that frame has already aged out of the ring, which is the
     /// normal outcome for a readback that stalled for hundreds of frames.
     pub fn push_gpu_span(&mut self, frame_index: u64, span: Span) -> bool {
-        match self.ring.iter_mut().find(|frame| frame.index == frame_index) {
+        match self
+            .ring
+            .iter_mut()
+            .find(|frame| frame.index == frame_index)
+        {
             Some(frame) => {
                 frame.gpu.push(span);
                 true
@@ -349,7 +376,12 @@ mod tests {
     static SERIAL: Mutex<()> = Mutex::new(());
 
     fn span(name: &'static str, depth: u16, start_ns: u64, end_ns: u64) -> Span {
-        Span { name, depth, start_ns, end_ns }
+        Span {
+            name,
+            depth,
+            start_ns,
+            end_ns,
+        }
     }
 
     #[test]
@@ -373,10 +405,7 @@ mod tests {
         let frame = profiler.latest().unwrap();
         let depths: Vec<_> = frame.cpu.iter().map(|s| (s.name, s.depth)).collect();
         // Inner scopes close first, so they land ahead of their parent.
-        assert_eq!(
-            depths,
-            vec![("inner", 1), ("sibling", 1), ("outer", 0)]
-        );
+        assert_eq!(depths, vec![("inner", 1), ("sibling", 1), ("outer", 0)]);
     }
 
     #[test]

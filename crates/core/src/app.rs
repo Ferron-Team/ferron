@@ -1,13 +1,14 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use vulkano::VulkanLibrary;
 use vulkano::instance::debug::{
     DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger,
     DebugUtilsMessengerCallback, DebugUtilsMessengerCreateInfo,
 };
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::swapchain::Surface;
-use vulkano::VulkanLibrary;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -15,17 +16,24 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera_controller::CameraController;
 use crate::editor::Editor;
+use crate::gfx::punctual::{MAX_SHADOW_LIGHTS, ShadowAtlas};
+use crate::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
+use crate::gfx::vulkan::ShadowFrame;
 use crate::gfx::vulkan::VulkanRenderer;
-use crate::gfx::{RenderBackend, RenderItem, SceneLighting};
+use crate::gfx::{DrawList, RenderBackend, SceneLighting};
 use crate::profile::Profiler;
 use crate::profile_scope;
-use crate::scene::entities::{build_default_scene, spawn_stress_scene, StressSpec};
+use crate::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
 use crate::scene::{
-    AmbientLight, Camera, Culling, DebugLine, DebugLines, HdrSettings, InputState, LogBuffer,
-    SsaoSettings, Time,
+    AmbientLight, BloomSettings, Camera, ContactShadowSettings, Culling, DebugLine, DebugLines,
+    DecalSettings, Diagnostics, DofSettings, EnvironmentSettings, FogSettings, HdrSettings,
+    InputState, LogBuffer, LogLevel, MotionBlurSettings, PresentSettings, RefractionSettings,
+    ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings, Time,
+    TransparencySettings, load_hdri,
 };
 use crate::stats::FrameStats;
 use crate::systems;
+use crate::systems::FrameGeometry;
 use orrin_ecs::World;
 use orrin_registry::Registry;
 
@@ -47,8 +55,22 @@ pub struct App {
     /// establishes a baseline. Delta is `now - last_instant`, never a
     /// difference of two large "seconds since start" floats (which quantizes).
     last_instant: Option<Instant>,
-    render_items: Vec<RenderItem>,
+    /// This frame's renderables and the draw orders over them. Kept on the app
+    /// so its `Vec`s keep their capacity across frames instead of reallocating.
+    geometry: FrameGeometry,
     lighting: SceneLighting,
+    /// This frame's decals. Kept alongside `lighting` for the same reason it is
+    /// a field rather than a local: extraction refills it every frame and the
+    /// allocation is reused.
+    decals: Vec<crate::gfx::DecalInstance>,
+    /// This frame's cascade matrices. The caster orders live in `geometry`,
+    /// which was culled against exactly these.
+    cascades: CascadeSet,
+    /// Which punctual lights got atlas tiles this frame, where those tiles are,
+    /// and the matrix each face is drawn with. Fitted between extracting the
+    /// lighting and extracting the geometry, because the caster lists are culled
+    /// against the very lights it chose.
+    atlas: ShadowAtlas,
     /// This frame's debug lines, copied out of the `DebugLines` resource so the
     /// renderer borrow doesn't overlap the world borrow.
     debug_lines: Vec<DebugLine>,
@@ -59,9 +81,11 @@ pub struct App {
     #[cfg(feature = "scripting")]
     build_watcher: Option<crate::build_watcher::BuildWatcher>,
     /// The Orrin project this run was launched inside, if any. `None` means
-    /// the engine is running standalone on its built-in demo scene.
-    #[cfg(feature = "scripting")]
+    /// the engine is running standalone on its built-in demo scene — and, for
+    /// the editor, that there is nowhere to keep themes or a layout.
     project: Option<orrin_project::Project>,
+    /// Which built-in scene this run opens, from `ORRIN_SCENE`.
+    scene: SceneChoice,
     /// Extra profiling load from `ORRIN_STRESS`; `None` for a normal run.
     stress: Option<StressSpec>,
     /// Kept alive for the process: dropping the messenger stops validation
@@ -149,15 +173,18 @@ impl App {
             registry: Registry::new(),
             camera_controller: CameraController::new(),
             last_instant: None,
-            render_items: Vec::new(),
+            geometry: FrameGeometry::default(),
             lighting: SceneLighting::default(),
+            decals: Vec::new(),
+            cascades: CascadeSet::default(),
+            atlas: ShadowAtlas::default(),
             debug_lines: Vec::new(),
             #[cfg(feature = "scripting")]
             scripting: None,
             #[cfg(feature = "scripting")]
             build_watcher: None,
-            #[cfg(feature = "scripting")]
             project,
+            scene: SceneChoice::from_env(),
             stress: StressSpec::from_env().filter(|spec| !spec.is_empty()),
             _debug_messenger: debug_messenger,
         };
@@ -181,7 +208,33 @@ impl App {
         world.insert_resource(Time::new());
         world.insert_resource(AmbientLight::default());
         world.insert_resource(SsaoSettings::default());
+        world.insert_resource(SsrSettings::default());
+        world.insert_resource(SubsurfaceSettings::default());
+        world.insert_resource(TransparencySettings::default());
+        world.insert_resource(DecalSettings::default());
+        world.insert_resource(RefractionSettings::default());
+        world.insert_resource(ShadowSettings::default());
+        world.insert_resource(ContactShadowSettings::default());
         world.insert_resource(HdrSettings::default());
+        world.insert_resource(BloomSettings::default());
+        world.insert_resource(TaaSettings::default());
+        world.insert_resource(MotionBlurSettings::default());
+        world.insert_resource(DofSettings::default());
+        world.insert_resource(FogSettings::default());
+        // `ORRIN_HDRI` names an environment relative to the assets directory,
+        // the same env-var-over-default shape the scripts directory and entry
+        // type resolve by. It exists because nothing persists the choice yet:
+        // a scene file cannot name an environment until resources are part of
+        // what a scene saves, and until then this is how a run gets one without
+        // a click.
+        let hdri = std::env::var("ORRIN_HDRI").unwrap_or_default();
+        world.insert_resource(EnvironmentSettings {
+            reload_requested: !hdri.trim().is_empty(),
+            hdri,
+            ..Default::default()
+        });
+        world.insert_resource(PresentSettings::default());
+        world.insert_resource(Diagnostics::default());
         world.insert_resource(FrameStats::new());
         world.insert_resource(Profiler::default());
         world.insert_resource(InputState::new());
@@ -323,10 +376,14 @@ impl ApplicationHandler for App {
         );
         let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
         let size = window.inner_size();
-        let mut renderer =
-            VulkanRenderer::new(&self.instance, surface.clone(), [size.width, size.height]);
+        let mut renderer = VulkanRenderer::new(
+            &self.instance,
+            surface.clone(),
+            [size.width, size.height],
+            *self.world.resource::<PresentSettings>(),
+        );
 
-        build_default_scene(&mut self.world, &mut renderer);
+        self.scene.build(&mut self.world, &mut renderer);
         if let Some(spec) = self.stress {
             spawn_stress_scene(&mut self.world, &spec);
         }
@@ -344,7 +401,15 @@ impl ApplicationHandler for App {
             self.build_watcher = scripts.watcher;
         }
 
-        let editor = Editor::new(event_loop, surface, renderer.queue(), renderer.color_format());
+        let editor = Editor::new(
+            event_loop,
+            surface,
+            renderer.queue(),
+            renderer.color_format(),
+            self.project.as_ref(),
+        );
+
+        print_run_banner(&self.world, &renderer, self.scene);
 
         self.active = Some(Active {
             window,
@@ -363,15 +428,36 @@ impl ApplicationHandler for App {
             return;
         };
 
+        // Ahead of egui, and it has to be: the switch this answers is the one that
+        // takes egui out of the frame, so it cannot be a key egui is asked about
+        // first. F1 rather than a checkbox for the same reason — a UI that is off
+        // cannot offer the control that turns it back on.
+        if pressed_overlay_toggle(&event) {
+            let mut diagnostics = self.world.resource_mut::<Diagnostics>();
+            diagnostics.overlay = !diagnostics.overlay;
+        }
+        let overlay_on = self.world.resource::<Diagnostics>().overlay;
+
         // The editor sees events first; when it doesn't want one, the camera
         // controller and the script-facing InputState may. All three apply the
         // same egui gate.
-        let egui_wants = active.editor.on_window_event(&event);
+        //
+        // Skipped entirely with the overlay off, and not merely ignored: egui
+        // accumulates window events into the input it hands over at the start of
+        // each frame, so feeding a UI that never runs one is an unbounded queue as
+        // well as work nobody reads. It also means "overlay off" measures the
+        // editor's absence rather than its silence.
+        let egui_wants = if overlay_on {
+            active.editor.on_window_event(&event)
+        } else {
+            false
+        };
         self.world
             .resource_mut::<InputState>()
             .on_window_event(&event, egui_wants);
         let was_looking = self.camera_controller.looking();
-        self.camera_controller.process_window_event(&event, egui_wants);
+        self.camera_controller
+            .process_window_event(&event, egui_wants);
         if self.camera_controller.looking() != was_looking {
             let looking = self.camera_controller.looking();
             active.window.set_cursor_visible(!looking);
@@ -413,6 +499,13 @@ impl ApplicationHandler for App {
                 {
                     profile_scope!("spin");
                     systems::spin(&self.world, delta);
+                }
+
+                // Collision reads world transforms, so they have to be current
+                // as of the last thing that wrote a local one — `spin`.
+                {
+                    profile_scope!("propagate");
+                    crate::scene::propagate_transforms(&mut self.world);
                 }
 
                 // After the transform-mutating systems and before the script
@@ -464,7 +557,14 @@ impl ApplicationHandler for App {
                 }
 
                 // Before extraction: the UI may spawn/despawn/edit entities.
-                {
+                //
+                // Not run at all with the overlay off. That is deliberate and it
+                // is the whole measurement: `Editor::run` opens an egui pass that
+                // only `Editor::draw` closes, so running one without drawing it
+                // would leave the pass unbalanced — and the UI's own layout and
+                // tessellation are most of what the editor costs, so skipping the
+                // draw alone would answer a question nobody asked.
+                if overlay_on {
                     profile_scope!("editor");
                     active.editor.run(&mut self.world, &self.registry);
                 }
@@ -474,14 +574,62 @@ impl ApplicationHandler for App {
                 self.camera_controller
                     .update(&mut self.world.resource_mut::<Camera>(), delta);
 
+                // A second pass, because collision resolution, the script tick,
+                // and the editor have all written local transforms since the
+                // first one. Extraction reads world transforms, so without this
+                // the frame would draw everything one frame behind.
+                {
+                    profile_scope!("propagate");
+                    crate::scene::propagate_transforms(&mut self.world);
+                }
+
                 {
                     profile_scope!("extract");
                     // The frustum has to be the one this frame draws with, so
                     // the aspect comes from the swapchain the pass will use.
                     let extent = active.renderer.extent();
                     let aspect = extent[0] as f32 / extent[1].max(1) as f32;
-                    systems::extract_renderables(&self.world, aspect, &mut self.render_items);
                     systems::extract_lighting(&self.world, &mut self.lighting);
+                    // Beside the lighting and for the same reason: a decal is
+                    // scene data two existing passes read, not a queue.
+                    systems::extract_decals(&self.world, aspect, &mut self.decals);
+                    // Cascades are fitted before extraction because the caster
+                    // lists are culled against them: a shadow pass needs what
+                    // reaches its box, which is not what the camera can see.
+                    let shadow_settings = *self.world.resource::<ShadowSettings>();
+                    self.cascades = if shadow_settings.enabled {
+                        cascades(
+                            &self.world.resource::<Camera>().clone(),
+                            aspect,
+                            self.lighting.sun.direction,
+                            &shadow_settings.cascade_config(),
+                        )
+                    } else {
+                        CascadeSet::default()
+                    };
+                    // Same reason the cascades are fitted first, and it has to
+                    // be after `extract_lighting`: the atlas spends its tiles on
+                    // the lights that frame produced, and the caster lists are
+                    // culled against the reach of exactly those.
+                    self.atlas = match shadow_settings.atlas_config() {
+                        Some(config) => crate::gfx::punctual::fit(
+                            &self.lighting,
+                            self.world.resource::<Camera>().position,
+                            &config,
+                        ),
+                        None => ShadowAtlas::default(),
+                    };
+                    // One sweep for every question: the camera's list, every
+                    // cascade's, and every punctual light's are orderings over
+                    // the same derived items, so both fits have to happen before
+                    // it rather than after.
+                    systems::extract_geometry(
+                        &self.world,
+                        aspect,
+                        &self.cascades,
+                        &self.atlas,
+                        &mut self.geometry,
+                    );
                     // Copy this frame's debug lines out (they're Copy) so the render
                     // borrow below doesn't overlap the world borrow.
                     self.debug_lines.clear();
@@ -490,26 +638,100 @@ impl ApplicationHandler for App {
                 }
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
+                let contact_shadows = *self.world.resource::<ContactShadowSettings>();
+                let ssr = *self.world.resource::<SsrSettings>();
+                let subsurface = *self.world.resource::<SubsurfaceSettings>();
+                let transparency = *self.world.resource::<TransparencySettings>();
+                let refraction = *self.world.resource::<RefractionSettings>();
+                let taa = *self.world.resource::<TaaSettings>();
+                let motion_blur = *self.world.resource::<MotionBlurSettings>();
+                let dof = *self.world.resource::<DofSettings>();
+                let shadow_settings = *self.world.resource::<ShadowSettings>();
+                let bloom = *self.world.resource::<BloomSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
+                let environment = self.world.resource::<EnvironmentSettings>().clone();
+                let fog = *self.world.resource::<FogSettings>();
+                if environment.reload_requested {
+                    self.world
+                        .resource_mut::<EnvironmentSettings>()
+                        .reload_requested = false;
+                    let message = load_environment(
+                        &mut active.renderer,
+                        self.project.as_ref(),
+                        &environment.hdri,
+                    );
+                    let frame = self.world.resource::<Time>().frame_count();
+                    self.world
+                        .resource_mut::<LogBuffer>()
+                        .push(message.0, message.1, frame);
+                }
                 // Stamped into this frame's GPU queries so the readback, some
                 // frames later, can file its spans against the right frame.
                 let profiler_frame = self.world.resource::<Profiler>().frame_index();
+                let dt = self.world.resource::<Time>().delta_time();
+
+                // Asked for every frame rather than only on a change: the renderer
+                // compares against what it applied and recreates the swapchain
+                // only when the two differ, so this is a comparison and not a
+                // teardown.
+                active
+                    .renderer
+                    .set_present(*self.world.resource::<PresentSettings>());
 
                 let Active {
                     renderer, editor, ..
                 } = active;
-                let mut overlay = |before, image| editor.draw(before, image);
+                let mut draw_overlay = |before, image| editor.draw(before, image);
+                let overlay: Option<crate::gfx::vulkan::Overlay<'_>> = if overlay_on {
+                    Some(&mut draw_overlay)
+                } else {
+                    None
+                };
                 {
                     profile_scope!("render submit");
+                    // Borrowed once here: `ShadowFrame` holds `DrawList`s into
+                    // `geometry`, so the array has to outlive the call.
+                    let caster_lists: [DrawList<'_>; MAX_CASCADES] =
+                        std::array::from_fn(|i| self.geometry.cascade(i));
+                    let punctual_lists: [DrawList<'_>; MAX_SHADOW_LIGHTS] =
+                        std::array::from_fn(|i| self.geometry.punctual(i));
                     renderer.render_with_overlay(
-                        &self.render_items,
+                        self.geometry.visible(),
+                        self.geometry.transparent(),
+                        self.geometry.refractive(),
+                        &self.decals,
                         &self.lighting,
                         &camera,
                         &ssao,
+                        &contact_shadows,
+                        &ssr,
+                        &subsurface,
+                        &transparency,
+                        &refraction,
+                        &taa,
+                        &motion_blur,
+                        &dof,
+                        &bloom,
                         &hdr,
+                        &environment,
+                        &fog,
+                        dt,
                         &self.debug_lines,
                         profiler_frame,
-                        &mut overlay,
+                        // Either half is reason enough to hand one over: the sun
+                        // and the punctual lights are independent, and a scene
+                        // with cascades off and a lamp casting is an ordinary
+                        // thing to want.
+                        (self.cascades.count > 0 || !self.atlas.faces.is_empty()).then(|| {
+                            ShadowFrame {
+                                cascades: &self.cascades,
+                                casters: &caster_lists,
+                                atlas: &self.atlas,
+                                punctual_casters: &punctual_lists,
+                                settings: &shadow_settings,
+                            }
+                        }),
+                        overlay,
                     );
                 }
 
@@ -549,7 +771,9 @@ impl ApplicationHandler for App {
         event: DeviceEvent,
     ) {
         self.camera_controller.process_device_event(&event);
-        self.world.resource_mut::<InputState>().on_device_event(&event);
+        self.world
+            .resource_mut::<InputState>()
+            .on_device_event(&event);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
@@ -557,6 +781,67 @@ impl ApplicationHandler for App {
             active.window.request_redraw();
         }
     }
+}
+
+/// Whether this event is the press that toggles the editor overlay.
+///
+/// Read off the raw winit event rather than through [`InputState`], because that
+/// table is the one C# `KeyCode` mirrors field for field — an editor keybind is
+/// no reason to grow a scripting ABI.
+fn pressed_overlay_toggle(event: &WindowEvent) -> bool {
+    use winit::event::{ElementState, KeyEvent};
+    use winit::keyboard::{KeyCode, PhysicalKey};
+
+    matches!(
+        event,
+        WindowEvent::KeyboardInput {
+            event: KeyEvent {
+                physical_key: PhysicalKey::Code(KeyCode::F1),
+                state: ElementState::Pressed,
+                repeat: false,
+                ..
+            },
+            ..
+        }
+    )
+}
+
+/// Print what this run measures with, once, at startup.
+///
+/// Every one of these changes a frame-time number without changing a pixel, so a
+/// figure quoted without them is not reproducible: a debug build with validation
+/// on and a release build with it off differ by more than most of the work in the
+/// renderer. The banner exists so a pasted log is a complete description of the
+/// run it came from.
+fn print_run_banner(world: &World, renderer: &VulkanRenderer, scene: SceneChoice) {
+    let present = match renderer.applied_present() {
+        Some((mode, images)) => format!("{mode:?}, {images} images"),
+        None => "offscreen".to_string(),
+    };
+    let extent = renderer.extent();
+
+    println!(
+        "Run config: {} build | debug assertions {} | validation {} | present {} | \
+         {}x{} | MSAA {:?} | overlay {} | GPU pass timings {} | scene {}",
+        if cfg!(debug_assertions) {
+            "unoptimised"
+        } else {
+            "optimised"
+        },
+        on_off(cfg!(debug_assertions)),
+        on_off(should_validate()),
+        present,
+        extent[0],
+        extent[1],
+        crate::gfx::vulkan::MSAA_SAMPLES,
+        on_off(world.resource::<Diagnostics>().overlay),
+        on_off(crate::profile::gpu_passes_enabled()),
+        scene.label(),
+    );
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
 }
 
 const VALIDATION_LAYER: &str = "VK_LAYER_KHRONOS_validation";
@@ -593,7 +878,9 @@ fn attach_debug_messenger(instance: &Arc<Instance>) -> DebugUtilsMessenger {
             };
             eprintln!(
                 "[vulkan {label}] {}{}",
-                data.message_id_name.map(|name| format!("{name}: ")).unwrap_or_default(),
+                data.message_id_name
+                    .map(|name| format!("{name}: "))
+                    .unwrap_or_default(),
                 data.message
             );
             let _ = message_type;
@@ -616,4 +903,51 @@ fn attach_debug_messenger(instance: &Arc<Instance>) -> DebugUtilsMessenger {
         )
     }
     .expect("failed to create the validation messenger")
+}
+
+/// Bake the environment from `hdri`, and report what happened in one line.
+///
+/// The path resolves against the project's assets directory, or `assets/`
+/// beside the working directory when there is no project — the same
+/// manifest-else-built-in-default shape the scripts directory resolves by.
+///
+/// A failure changes nothing: the session keeps the environment it already had,
+/// the way a rejected script build keeps the code it had. That matters more
+/// here than it looks, because the alternative to "keep the old sky" is "no sky
+/// and black metals" for a typo in a filename.
+fn load_environment(
+    renderer: &mut VulkanRenderer,
+    project: Option<&orrin_project::Project>,
+    hdri: &str,
+) -> (LogLevel, String) {
+    let hdri = hdri.trim();
+    if hdri.is_empty() {
+        return (
+            LogLevel::Warning,
+            "no environment file named; give a path relative to the assets directory".to_string(),
+        );
+    }
+
+    let assets_dir =
+        project.map_or_else(|| PathBuf::from("assets"), |project| project.assets_dir());
+
+    match load_hdri(&assets_dir, hdri) {
+        Ok(image) => {
+            renderer.load_environment(&image.pixels, image.width, image.height);
+            (
+                LogLevel::Info,
+                format!(
+                    "environment baked from `{hdri}` ({}x{})",
+                    image.width, image.height
+                ),
+            )
+        }
+        Err(error) => {
+            // Also to the terminal: a run without the editor open has no
+            // console panel to read, and a silently missing environment looks
+            // identical to one that loaded and happened to be dark.
+            eprintln!("orrin: {error}");
+            (LogLevel::Error, error.to_string())
+        }
+    }
 }

@@ -1,0 +1,414 @@
+//! Transparency: weighted-blended order-independent transparency
+//! (McGuire & Bavoil 2013), as two graph nodes.
+//!
+//! The accumulation pass rasterises every blended surface into two targets whose
+//! blend equations commute, so no sort exists to get wrong and nothing pops when
+//! two surfaces cross. The composite divides one by its own coverage and mixes
+//! it over the lit frame. `shaders/oit.frag` documents the algebra.
+//!
+//! Two things about the *pass* are worth knowing here.
+//!
+//! It draws with the forward pass's own pipeline layout. `oit.frag` includes the
+//! same `shading.glsl` `forward.frag` does, so its five descriptor sets are the
+//! forward pass's five, binding for binding — sharing the layout is what lets
+//! the executor build them once and bind them to both, and makes it impossible
+//! for the two to drift into shading the same material differently.
+//!
+//! And it depth-tests against the *prepass* depth rather than the forward pass's
+//! multisampled one, which is why `frame::declare` counts transparency among the
+//! things that keep the prepass alive. The forward pass's depth is a memoryless
+//! attachment — tile-only on Apple hardware, undefined the moment its render
+//! pass ends — so a second pass cannot read it without giving up that property
+//! and the DRAM it saves. The prepass depth is already resident because SSAO,
+//! TAA and the rest sample it.
+
+use std::sync::Arc;
+
+use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
+use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::device::Device;
+use vulkano::format::Format;
+use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
+use vulkano::image::view::ImageView;
+use vulkano::image::{ImageLayout, SampleCount};
+use vulkano::pipeline::compute::ComputePipelineCreateInfo;
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
+use vulkano::pipeline::graphics::color_blend::{
+    AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
+};
+use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
+use vulkano::pipeline::graphics::multisample::MultisampleState;
+use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
+use vulkano::pipeline::graphics::vertex_input::{Vertex as _, VertexDefinition};
+use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
+use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+use vulkano::pipeline::{
+    ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+    PipelineShaderStageCreateInfo,
+};
+use vulkano::render_pass::{
+    AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass,
+    RenderPassCreateInfo, Subpass, SubpassDescription,
+};
+
+use crate::gfx::{DrawList, Vertex};
+
+use super::VulkanRenderer;
+use super::context::VkContext;
+use super::forward::ForwardSets;
+use super::hdr::HDR_FORMAT;
+use super::swapchain::DEPTH_FORMAT;
+use super::taa::FrameView;
+
+/// Side of the composite's compute workgroup.
+const TILE: u32 = 8;
+
+/// `rgb` = the sum of weighted premultiplied radiance, `a` = the sum of weighted
+/// coverage. Float and wide because both sums are unbounded above: the weight in
+/// `oit.frag` is clamped per fragment, not per pixel.
+pub(super) const ACCUM_FORMAT: Format = HDR_FORMAT;
+
+/// Transmittance: the running product of `1 - alpha`, one channel and eight bits
+/// of it. The paper's own recommendation — the value is a fraction in `[0, 1]`
+/// that a composite multiplies by, and a quarter of a byte per pixel buys
+/// nothing a viewer can see.
+pub(super) const REVEAL_FORMAT: Format = Format::R8_UNORM;
+
+pub struct OitPass {
+    /// One subpass, two colour targets and the prepass depth attached read-only.
+    /// Built by hand rather than through `single_pass_renderpass!`, because that
+    /// macro hard-codes a depth attachment's reference layout to
+    /// `DepthStencilAttachmentOptimal` — and this pass declares
+    /// [`Access::DepthAttachmentRead`](crate::gfx::graph::Access::DepthAttachmentRead),
+    /// so the graph leaves the image in `DepthStencilReadOnlyOptimal`. A render
+    /// pass that disagreed with the barrier plan is precisely the class of bug
+    /// the graph exists to make impossible.
+    pub(super) render_pass: Arc<RenderPass>,
+    pipeline: Arc<GraphicsPipeline>,
+    composite_pipeline: Arc<ComputePipeline>,
+    /// Nearest and clamped: the composite reads all three of its inputs at
+    /// exactly its own pixel, so there is nothing to filter.
+    nearest_clamp: Arc<Sampler>,
+}
+
+impl OitPass {
+    /// `forward_layout` is the forward pipeline's layout, shared rather than
+    /// derived — see the module docs.
+    pub fn new(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Self {
+        let device = &ctx.device;
+        let render_pass = build_render_pass(device);
+        let pipeline = build_pipeline(device, &render_pass, forward_layout);
+        let composite_pipeline = build_composite_pipeline(device);
+        let nearest_clamp = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                ..SamplerCreateInfo::default()
+            },
+        )
+        .unwrap();
+
+        Self {
+            render_pass,
+            pipeline,
+            composite_pipeline,
+            nearest_clamp,
+        }
+    }
+
+    /// Accumulate every blended surface. Recorded inside this pass's own render
+    /// pass; `sets` are the forward pass's, which this pipeline's layout is.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        renderer: &VulkanRenderer,
+        draws: DrawList<'_>,
+        sets: &ForwardSets,
+        view: &FrameView,
+        extent: [u32; 2],
+        object_base: u32,
+    ) {
+        builder
+            .set_viewport(
+                0,
+                [Viewport {
+                    offset: [0.0, 0.0],
+                    extent: [extent[0] as f32, extent[1] as f32],
+                    depth_range: 0.0..=1.0,
+                }]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap()
+            .bind_pipeline_graphics(self.pipeline.clone())
+            .unwrap()
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                self.pipeline.layout().clone(),
+                0,
+                sets.as_vec(),
+            )
+            .unwrap();
+
+        for run in draws.runs() {
+            let item = draws.item(run.start);
+            let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
+                continue;
+            };
+            // The transparent rows follow the opaque ones in the shared object
+            // buffer, so a run's base is its start plus where that block began.
+            let push = super::forward::PushConstants::new(
+                view.view_proj,
+                item.material.0,
+                object_base + run.start as u32,
+            );
+            builder
+                .push_constants(self.pipeline.layout().clone(), 0, push)
+                .unwrap()
+                .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
+                .unwrap()
+                .bind_index_buffer(mesh.index_buffer.clone())
+                .unwrap();
+            unsafe {
+                builder
+                    .draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0)
+                    .unwrap()
+            };
+        }
+    }
+
+    /// Put what the accumulation gathered over the lit frame.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_composite(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        ctx: &VkContext,
+        scene: Arc<ImageView>,
+        accum: Arc<ImageView>,
+        reveal: Arc<ImageView>,
+        target: Arc<ImageView>,
+    ) {
+        let set = DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            self.composite_pipeline.layout().set_layouts()[0].clone(),
+            [
+                WriteDescriptorSet::image_view_sampler(0, scene, self.nearest_clamp.clone()),
+                WriteDescriptorSet::image_view_sampler(1, accum, self.nearest_clamp.clone()),
+                WriteDescriptorSet::image_view_sampler(2, reveal, self.nearest_clamp.clone()),
+                WriteDescriptorSet::image_view(3, target.clone()),
+            ],
+            [],
+        )
+        .unwrap();
+
+        builder
+            .bind_pipeline_compute(self.composite_pipeline.clone())
+            .unwrap()
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                self.composite_pipeline.layout().clone(),
+                0,
+                set,
+            )
+            .unwrap();
+
+        let extent = target.image().extent();
+        // SAFETY: the dispatch covers exactly `extent`, and the shader discards
+        // invocations past `imageSize`, so nothing writes outside the image. The
+        // descriptors bound above match the shader's layout, and the graph
+        // declared every resource this pass touches, so its barriers precede it.
+        unsafe {
+            builder
+                .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
+                .unwrap()
+        };
+    }
+}
+
+/// The accumulation pass's render pass.
+///
+/// The depth attachment is referenced in `DepthStencilReadOnlyOptimal` and never
+/// transitions: it enters and leaves in the layout the graph put it in, and the
+/// pipeline below writes no depth. That is the whole of the contract with
+/// `Access::DepthAttachmentRead` — a reference layout of
+/// `DepthStencilAttachmentOptimal` would make the render pass transition an
+/// image the barrier plan says nobody wrote, and the readers after this one
+/// would find it in a layout they were not told about.
+fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
+    let color = |format: Format| AttachmentDescription {
+        format,
+        samples: SampleCount::Sample1,
+        load_op: AttachmentLoadOp::Clear,
+        store_op: AttachmentStoreOp::Store,
+        initial_layout: ImageLayout::ColorAttachmentOptimal,
+        final_layout: ImageLayout::ColorAttachmentOptimal,
+        ..Default::default()
+    };
+
+    let create_info = RenderPassCreateInfo {
+        attachments: vec![
+            color(ACCUM_FORMAT),
+            color(REVEAL_FORMAT),
+            AttachmentDescription {
+                format: DEPTH_FORMAT,
+                samples: SampleCount::Sample1,
+                load_op: AttachmentLoadOp::Load,
+                // Nothing was written, so there is nothing to discard — and
+                // `DontCare` would license a driver to leave the prepass depth
+                // undefined for the passes that read it after this one.
+                store_op: AttachmentStoreOp::Store,
+                initial_layout: ImageLayout::DepthStencilReadOnlyOptimal,
+                final_layout: ImageLayout::DepthStencilReadOnlyOptimal,
+                ..Default::default()
+            },
+        ],
+        subpasses: vec![SubpassDescription {
+            color_attachments: vec![
+                Some(AttachmentReference {
+                    attachment: 0,
+                    layout: ImageLayout::ColorAttachmentOptimal,
+                    ..Default::default()
+                }),
+                Some(AttachmentReference {
+                    attachment: 1,
+                    layout: ImageLayout::ColorAttachmentOptimal,
+                    ..Default::default()
+                }),
+            ],
+            depth_stencil_attachment: Some(AttachmentReference {
+                attachment: 2,
+                layout: ImageLayout::DepthStencilReadOnlyOptimal,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    RenderPass::new(device.clone(), create_info).unwrap()
+}
+
+fn build_pipeline(
+    device: &Arc<Device>,
+    render_pass: &Arc<RenderPass>,
+    layout: &Arc<PipelineLayout>,
+) -> Arc<GraphicsPipeline> {
+    // The forward pass's vertex shader, unchanged: a blended surface is the same
+    // geometry with the same per-object rows, and `shading.glsl` reads the same
+    // varyings from it.
+    let vs = super::forward::vertex_shader(device);
+    let fs = fs::load(device.clone())
+        .unwrap()
+        .entry_point("main")
+        .unwrap();
+
+    let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
+    let stages = [
+        PipelineShaderStageCreateInfo::new(vs),
+        PipelineShaderStageCreateInfo::new(fs),
+    ];
+    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
+
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
+                // Both faces, unlike every other geometry pass. A closed opaque
+                // solid hides its own back faces; a transparent one does not,
+                // and culling them is what makes a glass sphere look like a
+                // decal of one.
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            depth_stencil_state: Some(DepthStencilState {
+                // Tested against the opaque scene, never written: two blended
+                // surfaces must not occlude each other, or the order they were
+                // submitted in would decide which survived — the exact
+                // dependence this algorithm exists to remove.
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::Less,
+                }),
+                ..Default::default()
+            }),
+            color_blend_state: Some(ColorBlendState {
+                attachments: vec![
+                    // accum: plain addition. Commutative, which is the property
+                    // that makes the draw order irrelevant.
+                    ColorBlendAttachmentState {
+                        blend: Some(AttachmentBlend {
+                            src_color_blend_factor: BlendFactor::One,
+                            dst_color_blend_factor: BlendFactor::One,
+                            color_blend_op: BlendOp::Add,
+                            src_alpha_blend_factor: BlendFactor::One,
+                            dst_alpha_blend_factor: BlendFactor::One,
+                            alpha_blend_op: BlendOp::Add,
+                        }),
+                        ..Default::default()
+                    },
+                    // reveal: `dst = dst * (1 - src)`. Multiplication, which is
+                    // commutative for the same reason — and why the target is
+                    // cleared to 1.0 rather than to 0.
+                    ColorBlendAttachmentState {
+                        blend: Some(AttachmentBlend {
+                            src_color_blend_factor: BlendFactor::Zero,
+                            dst_color_blend_factor: BlendFactor::OneMinusSrcColor,
+                            color_blend_op: BlendOp::Add,
+                            src_alpha_blend_factor: BlendFactor::Zero,
+                            dst_alpha_blend_factor: BlendFactor::OneMinusSrcAlpha,
+                            alpha_blend_op: BlendOp::Add,
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout.clone())
+        },
+    )
+    .unwrap()
+}
+
+fn build_composite_pipeline(device: &Arc<Device>) -> Arc<ComputePipeline> {
+    let stage = PipelineShaderStageCreateInfo::new(
+        composite_cs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap(),
+    );
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    ComputePipeline::new(
+        device.clone(),
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .unwrap()
+}
+
+mod fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "shaders/oit.frag",
+        include: ["shaders"],
+    }
+}
+
+mod composite_cs {
+    vulkano_shaders::shader! { ty: "compute", path: "shaders/oit_composite.comp" }
+}

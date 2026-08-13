@@ -35,7 +35,21 @@ use crate::profile::{Profiler, Span};
 /// Passes timed per frame, including the reserved whole-frame pair. Costs
 /// `2 * MAX_PASSES` queries per slot whether used or not; passes beyond it are
 /// dropped rather than mis-attributed.
-const MAX_PASSES: usize = 16;
+///
+/// The busiest frame that ships is four shadow cascades, the punctual atlas, the
+/// prepass, two SSAO passes, the contact-shadow march, the forward pass, three
+/// diffusion passes, four reflection passes, two transparency passes, three
+/// refraction passes, the temporal resolve, four lens passes, three shutter
+/// passes, two metering dispatches, an eleven-pass bloom chain and the tonemap,
+/// plus the whole-frame pair. Bloom is what made the old 16 too small, and it
+/// grows with `MAX_BLOOM_MIPS`: a chain of `n` levels is `2n - 1` passes, so
+/// raising that cap means raising this one.
+/// `the_busiest_frame_fits_the_query_pool` is what keeps this number honest —
+/// and it is why 40 was not enough: that test used to switch three features off,
+/// so the frame it called busiest was one nothing runs, while the editor's own
+/// default frame with every feature on overruns the pool and silently drops the
+/// passes at the end of the chain.
+const MAX_PASSES: usize = 64;
 
 /// Frame slots in rotation. Two would be correct only while `previous_frame_end`
 /// is a single fence that retires frame N-1 before N records; three removes that
@@ -175,21 +189,38 @@ impl GpuTimestamps {
         // Reserved first, so it is always query 0/1 and query 0 is guaranteed
         // written — `drain_completed` uses it as the frame's tick origin. Its
         // closing stamp comes from `end_frame`, which knows that fixed position.
-        drop(self.begin_pass(builder, WHOLE_FRAME_PASS));
+        //
+        // Reserved through `stamp` rather than `begin_pass`, because it must not
+        // answer to the per-pass switch: the whole-frame pair is the one number
+        // that has to survive turning per-pass timing off, since comparing the
+        // two is the entire point of being able to.
+        if crate::profile::is_enabled() {
+            drop(self.stamp(builder, WHOLE_FRAME_PASS));
+        }
     }
 
     /// Stamp the opening timestamp for `name` and reserve its pair.
     ///
-    /// `None` when profiling is off or `MAX_PASSES` is exhausted, so call sites
-    /// stay `if let Some(..)` and never test for support themselves.
+    /// `None` when profiling is off, when per-pass timing is off, or when
+    /// `MAX_PASSES` is exhausted — so call sites stay `if let Some(..)` and never
+    /// test for support themselves.
     pub fn begin_pass(
         &mut self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         name: &'static str,
     ) -> Option<PassToken> {
-        if !crate::profile::is_enabled() {
+        if !crate::profile::is_enabled() || !crate::profile::gpu_passes_enabled() {
             return None;
         }
+        self.stamp(builder, name)
+    }
+
+    /// The half of [`begin_pass`](Self::begin_pass) past the switches.
+    fn stamp(
+        &mut self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        name: &'static str,
+    ) -> Option<PassToken> {
         let slot = &mut self.slots[self.write];
         if slot.passes.len() >= MAX_PASSES {
             debug_assert!(false, "more than {MAX_PASSES} timed passes in one frame");
@@ -308,5 +339,69 @@ impl GpuTimestamps {
     /// frame.
     pub fn last_frame_ms(&self) -> f32 {
         self.last_frame_ms
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx::graph::PassKind;
+    use crate::gfx::shadows::MAX_CASCADES;
+    use crate::gfx::vulkan::bloom::{MAX_BLOOM_MIPS, mip_count};
+    use crate::gfx::vulkan::frame::{FrameConfig, declare};
+
+    /// The query pool is sized ahead of knowing what will run, so a frame that
+    /// outgrows it drops timings off the end rather than failing to render — the
+    /// kind of regression nobody notices until a pass is missing from the
+    /// profiler. Bloom is what first made 16 too small; this asserts the busiest
+    /// frame that can ship still fits, whatever the chain grows to next.
+    ///
+    /// Every structural flag is on, and that is the point: three of them used to
+    /// be off here, which made the assertion about a frame nobody renders while
+    /// the editor's own default — transparency and refraction included — quietly
+    /// overran the pool.
+    #[test]
+    fn the_busiest_frame_fits_the_query_pool() {
+        let config = FrameConfig {
+            color_format: vulkano::format::Format::B8G8R8A8_SRGB,
+            ssao: true,
+            contact_shadows: true,
+            ssr: true,
+            subsurface: true,
+            transparency: true,
+            refraction: true,
+            taa: true,
+            auto_exposure: true,
+            motion_blur: true,
+            dof: true,
+            volumetric_fog: false,
+            bloom_mips: MAX_BLOOM_MIPS as u8,
+            overlay: true,
+            shadow_cascades: MAX_CASCADES as u8,
+            shadow_resolution: 2048,
+            shadow_atlas: 4096,
+        };
+        let frame = declare(config).expect("the busiest frame must compile");
+
+        // Raw passes own their submission and are never timed, so they do not
+        // draw from the pool. The whole-frame pair does.
+        let timed = 1 + frame
+            .graph
+            .order()
+            .iter()
+            .filter(|&&id| frame.graph.pass_kind(id) != PassKind::Raw)
+            .count();
+
+        assert!(
+            timed <= MAX_PASSES,
+            "the busiest frame times {timed} passes but the pool holds {MAX_PASSES}",
+        );
+    }
+
+    /// The cap must actually be reachable by a real window, or the chain silently
+    /// runs shorter than it was tuned for.
+    #[test]
+    fn a_common_display_gets_the_full_bloom_chain() {
+        assert_eq!(mip_count([2560, 1440]), MAX_BLOOM_MIPS as u8);
     }
 }

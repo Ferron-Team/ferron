@@ -76,8 +76,9 @@ impl Reflect for i32 {
     fn from_value(value: &Value) -> Result<Self, ValueError> {
         match value {
             Value::I32(v) => Ok(*v),
-            Value::U32(v) => i32::try_from(*v)
-                .map_err(|_| ValueError::invalid("an i32", format!("{v}"))),
+            Value::U32(v) => {
+                i32::try_from(*v).map_err(|_| ValueError::invalid("an i32", format!("{v}")))
+            }
             other => Err(ValueError::mismatch("i32", other)),
         }
     }
@@ -91,8 +92,9 @@ impl Reflect for u32 {
     fn from_value(value: &Value) -> Result<Self, ValueError> {
         match value {
             Value::U32(v) => Ok(*v),
-            Value::I32(v) => u32::try_from(*v)
-                .map_err(|_| ValueError::invalid("a u32", format!("{v}"))),
+            Value::I32(v) => {
+                u32::try_from(*v).map_err(|_| ValueError::invalid("a u32", format!("{v}")))
+            }
             other => Err(ValueError::mismatch("u32", other)),
         }
     }
@@ -127,6 +129,23 @@ pub fn take<T: Reflect>(value: &Value, field: &str) -> Result<T, ValueError> {
         return Err(ValueError::missing(field));
     };
     T::from_value(inner).map_err(|e| e.at_field(field))
+}
+
+/// Read one named field, or `fallback` if the document does not have it.
+///
+/// This is how a component grows a field without orphaning every scene saved
+/// before it existed. [`take`] is right for a field that has always been there —
+/// its absence means the document is wrong, and saying so beats inventing a
+/// value. It is exactly wrong for a field added later, where absence means the
+/// file predates it and the type's own default is the correct reading.
+///
+/// A field *present* but of the wrong type is still an error either way: that is
+/// a broken document, not an old one.
+pub fn take_or<T: Reflect>(value: &Value, field: &str, fallback: T) -> Result<T, ValueError> {
+    match value.field(field) {
+        Some(inner) => T::from_value(inner).map_err(|e| e.at_field(field)),
+        None => Ok(fallback),
+    }
 }
 
 #[cfg(test)]

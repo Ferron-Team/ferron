@@ -3,14 +3,16 @@ use glam::Vec3;
 use orrin_ecs::{Entity, World};
 use orrin_registry::Registry;
 
-use crate::scene::{
-    self, entities, Assets, LogBuffer, LogLevel, MaterialHandle, Time, Transform,
-};
+use crate::scene::{self, Assets, LogBuffer, LogLevel, MaterialHandle, Time, Transform, entities};
 
 /// Where the editor's Save/Load buttons read and write. Relative to the
 /// process's working directory — a real file picker and a project-relative
 /// `scenes/` directory belong with the asset database.
 pub const DEFAULT_SCENE_PATH: &str = "scene.orrin";
+
+/// Shown where a project name would go when the engine was launched outside
+/// one. Says what the session *is* rather than leaving the slot blank.
+const NO_PROJECT: &str = "built-in demo";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SceneRequest {
@@ -18,6 +20,59 @@ pub enum SceneRequest {
     /// Replaces the current contents: every live entity is despawned first.
     Load,
 }
+
+/// Which set of ribbon groups is showing. Plain data with no references, like
+/// the rest of the editor's state — `docs/architecture.md` §2.1 wants this in
+/// the ECS eventually, and that rule is what keeps the move cheap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RibbonTab {
+    Home,
+    Scene,
+    Render,
+    Scripts,
+    Assets,
+}
+
+impl RibbonTab {
+    pub const ALL: [Self; 5] = [
+        Self::Home,
+        Self::Scene,
+        Self::Render,
+        Self::Scripts,
+        Self::Assets,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Home => "Home",
+            Self::Scene => "Scene",
+            Self::Render => "Render",
+            Self::Scripts => "Scripts",
+            Self::Assets => "Assets",
+        }
+    }
+}
+
+/// What a transform gizmo would edit. The mode is real state and is remembered;
+/// the handles that would read it are Phase 3, so today it drives a readout and
+/// nothing else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GizmoMode {
+    Select,
+    Move,
+    Rotate,
+    Scale,
+}
+
+/// Whether gizmo axes follow the entity or the scene.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GizmoSpace {
+    Local,
+    World,
+}
+
+/// What a gizmo drag would quantise to, when snapping is on.
+pub const SNAP_STEP: f32 = 0.25;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SpawnKind {
@@ -34,8 +89,26 @@ pub enum SpawnKind {
 pub struct EditorState {
     pub selected: Option<Entity>,
     pub scene_path: String,
+    /// What the top bar calls this session. Not the window title and not a
+    /// path — just the name, so a run says which project it is inside.
+    pub project_name: String,
+    /// The hierarchy's search box. Lives here rather than in the panel so it
+    /// survives the frame, and so a filtered tree stays filtered.
+    pub hierarchy_query: String,
+    pub ribbon_tab: RibbonTab,
+    pub gizmo_mode: GizmoMode,
+    pub gizmo_space: GizmoSpace,
+    pub snap: bool,
     spawn_request: Option<SpawnKind>,
     despawn_request: Option<Entity>,
+    /// `(child, new parent)`, with `None` meaning "detach to a root". Requested
+    /// rather than applied inline for the same reason as the two above: the
+    /// hierarchy panel is iterating a snapshot of the tree while it builds, and
+    /// a reparent reshapes exactly that.
+    reparent_request: Option<(Entity, Option<Entity>)>,
+    /// Not serviced by `apply` either: restyling has to happen between frames,
+    /// so the editor drains it after the UI pass rather than during it.
+    theme_request: Option<String>,
     /// Serviced by `apply` for the same reason spawn/despawn are: loading
     /// despawns every entity, and a `ScriptComponent`'s `Drop` tears down a
     /// managed object, which may only happen outside a dispatch window.
@@ -53,8 +126,16 @@ impl Default for EditorState {
         Self {
             selected: None,
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
+            project_name: NO_PROJECT.to_owned(),
+            hierarchy_query: String::new(),
+            ribbon_tab: RibbonTab::Home,
+            gizmo_mode: GizmoMode::Select,
+            gizmo_space: GizmoSpace::World,
+            snap: false,
             spawn_request: None,
             despawn_request: None,
+            reparent_request: None,
+            theme_request: None,
             scene_request: None,
             #[cfg(feature = "scripting")]
             script_reload_request: false,
@@ -63,6 +144,16 @@ impl Default for EditorState {
 }
 
 impl EditorState {
+    pub fn new(project: Option<&orrin_project::Project>) -> Self {
+        Self {
+            project_name: project.map_or_else(
+                || NO_PROJECT.to_owned(),
+                |project| project.name().to_owned(),
+            ),
+            ..Self::default()
+        }
+    }
+
     pub fn request_spawn(&mut self, kind: SpawnKind) {
         self.spawn_request = Some(kind);
     }
@@ -73,6 +164,18 @@ impl EditorState {
 
     pub fn request_despawn(&mut self, entity: Entity) {
         self.despawn_request = Some(entity);
+    }
+
+    pub fn request_reparent(&mut self, child: Entity, parent: Option<Entity>) {
+        self.reparent_request = Some((child, parent));
+    }
+
+    pub fn request_theme(&mut self, name: impl Into<String>) {
+        self.theme_request = Some(name.into());
+    }
+
+    pub fn take_theme_request(&mut self) -> Option<String> {
+        self.theme_request.take()
     }
 
     #[cfg(feature = "scripting")]
@@ -92,9 +195,17 @@ impl EditorState {
             }
         }
         if let Some(entity) = self.despawn_request.take() {
-            world.despawn(entity);
+            crate::scene::despawn_recursive(world, entity);
             if self.selected == Some(entity) {
                 self.selected = None;
+            }
+        }
+        if let Some((child, parent)) = self.reparent_request.take() {
+            // `keep_world`: a drag in the tree changes who owns an object, not
+            // where it is. Without it, dropping something onto a distant parent
+            // would fling it across the scene.
+            if let Err(error) = crate::scene::reparent(world, child, parent, true) {
+                log(world, LogLevel::Warning, error.to_string());
             }
         }
         if let Some(request) = self.scene_request.take() {
@@ -145,7 +256,10 @@ fn load_scene(world: &mut World, registry: &Registry, path: &str) -> (LogLevel, 
         log(world, LogLevel::Warning, issue.to_string());
     }
     match issues.len() {
-        0 => (LogLevel::Info, format!("loaded {count} entities from {path}")),
+        0 => (
+            LogLevel::Info,
+            format!("loaded {count} entities from {path}"),
+        ),
         n => (
             LogLevel::Warning,
             format!("loaded {count} entities from {path}; {n} component(s) kept but not applied"),
@@ -181,12 +295,16 @@ fn spawn(world: &mut World, kind: SpawnKind) -> Option<Entity> {
                 material,
             ))
         }
+        // Physical fixtures, matching `Light::default`: a bright shop light and an
+        // overcast sun. Both are large numbers and neither is arbitrary — a light
+        // spawned at the old unitless 8.0 would now be an 8 lumen indicator lamp,
+        // which is a feature that looks broken rather than a light that looks dim.
         SpawnKind::PointLight => Some(entities::spawn_point_light(
             world,
             "Point Light",
             Vec3::new(0.0, 3.0, 0.0),
             Vec3::ONE,
-            8.0,
+            4000.0,
             10.0,
         )),
         SpawnKind::DirectionalLight => Some(entities::spawn_directional_light(
@@ -194,7 +312,7 @@ fn spawn(world: &mut World, kind: SpawnKind) -> Option<Entity> {
             "Directional Light",
             Vec3::new(-0.4, -1.0, -0.6),
             Vec3::ONE,
-            1.0,
+            20_000.0,
         )),
     }
 }

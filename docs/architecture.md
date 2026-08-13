@@ -70,6 +70,14 @@ This should land alongside the Phase 5 material system, because a material syste
 
 The material system defines a single energy-conserving PBR parameterization (base colour, metallic, roughness, emission, normals, transmission later) and treats the forward+ rasterizer and the future path tracer as two integrators over the same materials and lights. Lights are defined in physical units (lumens, lux) from the first release, because retrofitting units later means re-tuning every scene anyone has ever authored.
 
+Environments are calibrated rather than scaled, which is what makes a downloaded HDRI usable beside photometric lights: the control states the sky's luminance in cd/m², the bake measures the source's own, and the renderer scales by the ratio — so the authored number is a fact about the weather rather than about the file. The check that it is right is external to the engine: calibrate a capture's sky to 2 000 cd/m² and its sun disc should land near a real sun's 1.6e9, because a good capture's internal ratios are already physical and only its absolute scale is missing.
+
+Physical units have landed, ahead of the bindless table. A sun carries lux, a point or spot light lumens, ambient and emission cd/m², and the conversion to the candela the shader wants lives with the component so both integrators divide by the same 4π. The frame is therefore in real luminance end to end, which is what makes the EV100 exposure model mean what it says and the histogram window a statement about the world rather than a guess. The break was taken deliberately and loudly: the old unitless `intensity` field is gone rather than reinterpreted, so a scene authored against it fails to load naming the field instead of loading three orders of magnitude too dark.
+
+Decals belong to the material model rather than to the rasteriser, and are built that way: a decal box rewrites a surface's albedo, normal and specular parameters *before* anything is integrated, in one shared file that the forward pass, the two non-opaque queues and the geometry prepass all include. That is what puts a stamp under the shadows and the reflections instead of over them — and it is what §3.4's path tracer will have to do too, at the same point in its own surface evaluation, for exactly the reason it has to agree about how bright a bulb is. A decal composited onto the raster image afterwards would be a term the two integrators could never be compared on.
+
+Alpha-masked materials are the same argument at a smaller scale. Which pixels of a leaf card exist is a property of the material, so it is answered identically in every pass that rasterises the surface — with alpha to coverage where there are MSAA samples to spend on it and a hard test where there are not, cutting along the same line either way.
+
 The payoff is that content made during the showcase years never gets re-authored, and the two integrators can be compared pixel for pixel. Which leads to the most useful early step:
 
 ### 3.4 A reference path tracer, early and slow
@@ -144,7 +152,7 @@ Phase 2 (external projects and hot reload): route all scene mutation through the
 
 Phase 3 (editor usability and asset pipeline): the asset pipeline issue implements section 5.1 in its future-proof shape, which is the same scope the milestone already describes. Scene persistence serializes through the mutation pipeline into the deterministic format with a version header.
 
-Phases 4 and 5 (visuals, materials, shippability): restructure existing passes into the render graph before adding shadows, not after. The material system implements the bindless table and physical light units. Export packaging consumes the content-addressed cache.
+Phases 4 and 5 (visuals, materials, shippability): restructure existing passes into the render graph before adding shadows, not after. The material system implements the bindless table; physical light units are done, taken early for the reason §3.3 gives — the cost of that change is proportional to how much content exists when it lands. Export packaging consumes the content-addressed cache.
 
 Phase 6, first half of 2027: render graph inspector and frame capture; the reference path tracer, which is the visible payoff for the Phase 4 and 5 groundwork; skeletal animation components designed into the ECS before more systems assume static meshes; and a physics decision, which realistically means integrating Rapier rather than growing the Phase 1 collision system into a physics engine.
 

@@ -1,0 +1,152 @@
+#version 460
+
+// Motion blur, step three: reconstruct what the sensor saw while the shutter
+// was open.
+//
+// Each pixel walks the strongest blur vector in its neighbourhood and asks, at
+// every step, whether the sample it lands on has any business being here. Three
+// terms answer that, and the reason there are three is that a moving edge has
+// three distinct sides (McGuire et al. 2012):
+//
+//  * A blurred sample *in front of* this pixel spreads its light over the
+//    pixel — that is the case a per-pixel blur misses entirely, and it is what
+//    lets a fast object smear onto the still background behind it.
+//  * A sharp sample *behind* a blurred pixel is background revealed by the
+//    exposure, so this pixel gathers it in proportion to its own motion.
+//  * Two samples moving alike at similar depth are the same surface, and simply
+//    average.
+//
+// The depth comparisons are soft rather than a test, because a hard one puts a
+// visible outline exactly where the effect is supposed to be smoothest.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_color;
+layout(set = 0, binding = 1) uniform sampler2D u_velocity;
+layout(set = 0, binding = 2) uniform sampler2D u_depth;
+layout(set = 0, binding = 3) uniform sampler2D u_neighbour;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D u_target;
+layout(set = 0, binding = 5) uniform Params {
+    mat4 inv_view_proj;
+    mat4 prev_view_proj;
+    // x = shutter fraction, y = max blur radius in pixels, z = near, w = far.
+    vec4 params;
+} mb;
+
+const int TAPS = 15;
+
+// How far apart in metres two surfaces must be before they count as separate
+// depths. Below it they blend, which is what keeps a curved surface from
+// developing a seam where it passes its own silhouette.
+const float SOFT_DEPTH_EXTENT = 0.1;
+
+float linear_depth(float d) {
+    float near = mb.params.z;
+    float far = mb.params.w;
+    return near * far / max(far - d * (far - near), 1e-6);
+}
+
+// Identical to the tile pass's, and it has to be: a pixel whose sky motion this
+// disagreed about would gather along one vector and be weighted against another.
+vec2 blur_vector(ivec2 at, ivec2 size) {
+    float depth = texelFetch(u_depth, at, 0).r;
+    vec2 uv = (vec2(at) + 0.5) / vec2(size);
+
+    vec2 velocity;
+    if (depth >= 1.0) {
+        vec4 world = mb.inv_view_proj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+        vec4 previous = mb.prev_view_proj * vec4(world.xyz / world.w, 1.0);
+        velocity = uv - ((previous.xy / previous.w) * 0.5 + 0.5);
+    } else {
+        velocity = texelFetch(u_velocity, at, 0).rg;
+    }
+
+    vec2 pixels = velocity * vec2(size) * mb.params.x;
+    float length_pixels = length(pixels);
+    float limit = mb.params.y;
+    return length_pixels > limit ? pixels * (limit / length_pixels) : pixels;
+}
+
+// 1 where `a` is nearer than `b`, 0 where it is further, ramped across
+// SOFT_DEPTH_EXTENT in between.
+float soft_depth_compare(float a, float b) {
+    return clamp(1.0 - (b - a) / SOFT_DEPTH_EXTENT, 0.0, 1.0);
+}
+
+// How much of a surface moving `speed` pixels lands `distance` away: all of it
+// at the centre, none at the end of its streak.
+float cone(float distance, float speed) {
+    return clamp(1.0 - distance / speed, 0.0, 1.0);
+}
+
+// Whether `distance` is inside the streak at all, with a soft edge — the term
+// that recognises two samples as one surface moving together.
+float cylinder(float distance, float speed) {
+    return 1.0 - smoothstep(0.95 * speed, 1.05 * speed, distance);
+}
+
+// Interleaved gradient noise: a per-pixel offset that breaks the tap pattern
+// into something the eye reads as film grain rather than as banding. Fifteen
+// taps along a long streak is otherwise fifteen visible copies of the object.
+float dither(vec2 position) {
+    return fract(52.9829189 * fract(dot(position, vec2(0.06711056, 0.00583715))));
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_target);
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    vec3 center_color = texelFetch(u_color, texel, 0).rgb;
+    vec2 uv = (vec2(texel) + 0.5) / vec2(size);
+
+    vec2 dominant = texture(u_neighbour, uv).rg;
+    float dominant_speed = length(dominant);
+    // Under half a pixel of motion anywhere nearby there is nothing to
+    // reconstruct, and gathering anyway would only soften a still frame.
+    if (dominant_speed < 0.5) {
+        imageStore(u_target, texel, vec4(center_color, 1.0));
+        return;
+    }
+
+    float center_depth = linear_depth(texelFetch(u_depth, texel, 0).r);
+    // Floored at half a pixel so a stationary centre still divides: a pixel with
+    // no motion of its own is exactly the case this pass exists to serve, since
+    // it is the background a moving object sweeps over.
+    float center_speed = max(length(blur_vector(texel, size)), 0.5);
+
+    float jitter = dither(vec2(texel)) - 0.5;
+    vec3 sum = vec3(0.0);
+    float total = 0.0;
+
+    for (int i = 0; i < TAPS; ++i) {
+        // Centred on the pixel and spanning the shutter either side of it, so a
+        // moving object stays where it is and grows a streak in both directions
+        // rather than appearing to lag behind itself.
+        float t = (float(i) + 0.5 + jitter) / float(TAPS) - 0.5;
+        ivec2 at = clamp(texel + ivec2(round(dominant * t)), ivec2(0), size - 1);
+
+        float sample_depth = linear_depth(texelFetch(u_depth, at, 0).r);
+        float sample_speed = max(length(blur_vector(at, size)), 0.5);
+        float distance = abs(t) * dominant_speed;
+
+        float foreground = soft_depth_compare(center_depth, sample_depth);
+        float background = soft_depth_compare(sample_depth, center_depth);
+
+        float weight = foreground * cone(distance, sample_speed)
+                     + background * cone(distance, center_speed)
+                     + cylinder(distance, sample_speed)
+                       * cylinder(distance, center_speed) * 2.0;
+
+        sum += texelFetch(u_color, at, 0).rgb * weight;
+        total += weight;
+    }
+
+    // Every tap can be rejected — a still pixel beside a fast object whose blur
+    // does not quite reach it — and the frame must keep its own colour there
+    // rather than go black.
+    vec3 result = total > 1e-4 ? sum / total : center_color;
+    imageStore(u_target, texel, vec4(result, 1.0));
+}

@@ -5,19 +5,20 @@
 //! table with `..orrin_script::default_api()`.
 
 use std::cell::RefCell;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use glam::{Quat, Vec3};
+use glam::{Mat4, Quat, Vec3};
 
 use orrin_ecs::{Entity, FxHashMap, World};
-use orrin_script::{CCollision, CEntity, CTransform, OrrinApi, GameAssemblyStatus, ScriptHost};
+use orrin_script::{CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost};
 
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::{
     Assets, Collider, ColliderShape, DebugLines, InputState, LocalTransform, LogBuffer, LogLevel,
-    MaterialHandle, MeshHandle, Name, ScriptComponent, Tag, Time, Transform,
+    MaterialHandle, MeshHandle, Name, Parent, ScriptComponent, Tag, Time, Transform,
+    WorldTransform,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -61,6 +62,121 @@ extern "C" fn set_transform(entity: CEntity, value: *const CTransform) -> bool {
         transform.translation = Vec3::from_array(value.position);
         transform.rotation = Quat::from_array(value.rotation);
         transform.scale = Vec3::from_array(value.scale);
+        true
+    })
+}
+
+// The world transform is a `Mat4` engine-side and a `CTransform` across the
+// ABI, so this hands back the closest translation/rotation/scale fit to it.
+// Exact for any chain of rotations and uniform scales; lossy once a
+// non-uniformly scaled ancestor has introduced shear, which no TRS triple can
+// spell. Scripts that need an exact world quantity should read the position,
+// which is always the matrix's translation column.
+extern "C" fn get_world_transform(entity: CEntity, out: *mut CTransform) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    orrin_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        let Some(world_transform) = world.get::<WorldTransform>(entity) else {
+            return false;
+        };
+        let (scale, rotation, translation) = world_transform.0.to_scale_rotation_translation();
+        // SAFETY: `out` is a valid, writable `CTransform` supplied by C#.
+        unsafe {
+            *out = CTransform {
+                position: translation.to_array(),
+                rotation: rotation.to_array(),
+                scale: scale.to_array(),
+            };
+        }
+        true
+    })
+}
+
+/// Write a world-space transform by composing it with the inverse of the
+/// parent's, so a script never has to know it has a parent at all.
+///
+/// Reads a `WorldTransform` produced by the last propagation, which for a script
+/// is the one after `spin`. A script that moves a parent and then world-places
+/// its child in the same tick composes against the parent's previous position.
+extern "C" fn set_world_transform(entity: CEntity, value: *const CTransform) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: `value` is a valid `CTransform` supplied by C#.
+    let value = unsafe { *value };
+    orrin_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        let target = Mat4::from_scale_rotation_translation(
+            Vec3::from_array(value.scale),
+            Quat::from_array(value.rotation),
+            Vec3::from_array(value.position),
+        );
+        let parent_world = crate::scene::parent_world_matrix(world, entity);
+        let local = parent_world.inverse() * target;
+
+        let Some(mut transform) = world.get_mut::<LocalTransform>(entity) else {
+            return false;
+        };
+        let (scale, rotation, translation) = local.to_scale_rotation_translation();
+        transform.translation = translation;
+        transform.rotation = rotation;
+        transform.scale = scale;
+        true
+    })
+}
+
+extern "C" fn get_parent(entity: CEntity) -> CEntity {
+    orrin_script::with_world(CEntity::NULL, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        match world.get::<Parent>(entity).map(|p| p.get()) {
+            Some(parent) if world.is_alive(parent) => CEntity {
+                index: parent.index,
+                generation: parent.generation,
+            },
+            _ => CEntity::NULL,
+        }
+    })
+}
+
+/// Validate now, apply after the dispatch window.
+///
+/// Reparenting attaches or detaches a component, so it is a structural change
+/// and cannot run mid-dispatch. Validating eagerly is what keeps the return
+/// value meaningful: a script learns immediately that it asked for a cycle,
+/// rather than finding out by the move silently not happening.
+extern "C" fn set_parent(child: CEntity, parent: CEntity, keep_world: bool) -> bool {
+    orrin_script::with_world(false, |world| {
+        let child = Entity {
+            index: child.index,
+            generation: child.generation,
+        };
+        // `CEntity::NULL` is all-zeroes and slot 0 is reserved, so a zero index
+        // is the null sentinel — the same test as C# `Entity.IsValid`.
+        let parent = (parent.index != 0).then_some(Entity {
+            index: parent.index,
+            generation: parent.generation,
+        });
+        if crate::scene::can_reparent(world, child, parent).is_err() {
+            return false;
+        }
+        COMMANDS.with(|commands| {
+            commands.borrow_mut().push(Command::Reparent {
+                child,
+                parent,
+                keep_world,
+            })
+        });
         true
     })
 }
@@ -149,13 +265,20 @@ extern "C" fn find_by_tag(tag: *const c_char, out: *mut CEntity) -> bool {
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
     let tag = unsafe { CStr::from_ptr(tag) }.to_string_lossy();
     orrin_script::with_world(false, |world| {
-        let found = world.query::<&Tag>().find(|_, t| t.as_str() == tag.as_ref());
+        let found = world
+            .query::<&Tag>()
+            .find(|_, t| t.as_str() == tag.as_ref());
 
         match found {
             Some(e) => {
                 // SAFETY: `out` was null-checked above; C# passes a pointer to
                 // a single stack-allocated Entity slot (see Native.FindByTag).
-                unsafe { *out = CEntity { index: e.index, generation: e.generation } }
+                unsafe {
+                    *out = CEntity {
+                        index: e.index,
+                        generation: e.generation,
+                    }
+                }
                 true
             }
             None => false,
@@ -173,7 +296,10 @@ extern "C" fn find_all_by_tag(tag: *const c_char, out: *mut CEntity, capacity: i
         let mut matches: Vec<CEntity> = Vec::new();
         world.query::<&Tag>().for_each(|e, t| {
             if t.as_str() == tag.as_ref() {
-                matches.push(CEntity { index: e.index, generation: e.generation });
+                matches.push(CEntity {
+                    index: e.index,
+                    generation: e.generation,
+                });
             }
         });
 
@@ -240,7 +366,9 @@ extern "C" fn set_tag(entity: CEntity, tag: *const c_char) -> bool {
         return false;
     }
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
-    let tag = unsafe { CStr::from_ptr(tag) }.to_string_lossy().into_owned();
+    let tag = unsafe { CStr::from_ptr(tag) }
+        .to_string_lossy()
+        .into_owned();
     orrin_script::with_world(false, |world| {
         let entity = Entity {
             index: entity.index,
@@ -264,17 +392,27 @@ fn queue_add_collider(entity: CEntity, collider: Collider) -> bool {
             return false;
         }
         COMMANDS.with(|commands| {
-            commands.borrow_mut().push(Command::AddCollider { entity, collider })
+            commands
+                .borrow_mut()
+                .push(Command::AddCollider { entity, collider })
         });
         true
     })
 }
 
-extern "C" fn add_box_collider(entity: CEntity, hx: f32, hy: f32, hz: f32, is_trigger: bool) -> bool {
+extern "C" fn add_box_collider(
+    entity: CEntity,
+    hx: f32,
+    hy: f32,
+    hz: f32,
+    is_trigger: bool,
+) -> bool {
     queue_add_collider(
         entity,
         Collider {
-            shape: ColliderShape::Box { half_extents: Vec3::new(hx, hy, hz) },
+            shape: ColliderShape::Box {
+                half_extents: Vec3::new(hx, hy, hz),
+            },
             is_trigger,
         },
     )
@@ -314,7 +452,9 @@ extern "C" fn set_material(entity: CEntity, material: *const c_char) -> bool {
             return false;
         };
         COMMANDS.with(|commands| {
-            commands.borrow_mut().push(Command::SetMaterial { entity, material })
+            commands
+                .borrow_mut()
+                .push(Command::SetMaterial { entity, material })
         });
         true
     })
@@ -325,7 +465,9 @@ extern "C" fn add_script(entity: CEntity, type_name: *const c_char) -> bool {
         return false;
     }
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
-    let type_name = unsafe { CStr::from_ptr(type_name) }.to_string_lossy().into_owned();
+    let type_name = unsafe { CStr::from_ptr(type_name) }
+        .to_string_lossy()
+        .into_owned();
     orrin_script::with_world(false, |world| {
         let entity = Entity {
             index: entity.index,
@@ -335,7 +477,9 @@ extern "C" fn add_script(entity: CEntity, type_name: *const c_char) -> bool {
             return false;
         }
         COMMANDS.with(|commands| {
-            commands.borrow_mut().push(Command::AttachScript { entity, type_name })
+            commands
+                .borrow_mut()
+                .push(Command::AttachScript { entity, type_name })
         });
         true
     })
@@ -360,12 +504,30 @@ enum Command {
     Despawn(Entity),
     // Adding a component changes which entities queries match, so it defers
     // like the other structural edits; a same-tick FindByTag won't see it.
-    SetTag { entity: Entity, tag: String },
-    AddCollider { entity: Entity, collider: Collider },
-    SetMaterial { entity: Entity, material: MaterialHandle },
+    SetTag {
+        entity: Entity,
+        tag: String,
+    },
+    AddCollider {
+        entity: Entity,
+        collider: Collider,
+    },
+    SetMaterial {
+        entity: Entity,
+        material: MaterialHandle,
+    },
     // Applied by `Scripting::apply_commands` (needs the host to create the
     // managed instance); the new behaviour gets OnEnable/OnStart next tick.
-    AttachScript { entity: Entity, type_name: String },
+    AttachScript {
+        entity: Entity,
+        type_name: String,
+    },
+    // `None` detaches. Validated at the call, applied here — see `set_parent`.
+    Reparent {
+        child: Entity,
+        parent: Option<Entity>,
+        keep_world: bool,
+    },
 }
 
 thread_local! {
@@ -452,9 +614,13 @@ fn log_at(level: LogLevel, message: *const c_char) {
         return;
     }
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
-    let text = unsafe { CStr::from_ptr(message) }.to_string_lossy().into_owned();
+    let text = unsafe { CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned();
     let buffered = orrin_script::with_world(false, |world| {
-        let frame = world.get_resource::<Time>().map_or(0, |time| time.frame_count());
+        let frame = world
+            .get_resource::<Time>()
+            .map_or(0, |time| time.frame_count());
         match world.get_resource_mut::<LogBuffer>() {
             Some(mut log) => {
                 log.push(level, text.clone(), frame);
@@ -502,9 +668,17 @@ extern "C" fn debug_draw_line(
     duration: f32,
 ) {
     orrin_script::with_world((), |world| {
-        let now = world.get_resource::<Time>().map_or(0.0, |time| time.elapsed_time());
+        let now = world
+            .get_resource::<Time>()
+            .map_or(0.0, |time| time.elapsed_time());
         if let Some(mut lines) = world.get_resource_mut::<DebugLines>() {
-            lines.push(Vec3::new(fx, fy, fz), Vec3::new(tx, ty, tz), [r, g, b, a], now, duration);
+            lines.push(
+                Vec3::new(fx, fy, fz),
+                Vec3::new(tx, ty, tz),
+                [r, g, b, a],
+                now,
+                duration,
+            );
         }
     });
 }
@@ -536,6 +710,10 @@ fn build_api() -> OrrinApi {
         log_warn,
         log_error,
         debug_draw_line,
+        get_world_transform,
+        set_world_transform,
+        get_parent,
+        set_parent,
         ..orrin_script::default_api()
     }
 }
@@ -565,7 +743,11 @@ pub enum ReloadOutcome {
 impl std::fmt::Display for ReloadOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Swapped { restored, lost, leaked } => {
+            Self::Swapped {
+                restored,
+                lost,
+                leaked,
+            } => {
                 write!(f, "scripts reloaded: {restored} restored")?;
                 if *lost > 0 {
                     write!(f, ", {lost} dropped (type no longer in the assembly)")?;
@@ -576,7 +758,10 @@ impl std::fmt::Display for ReloadOutcome {
                 Ok(())
             }
             Self::Rejected(status) => {
-                write!(f, "reload rejected ({status}); still running the previous build")
+                write!(
+                    f,
+                    "reload rejected ({status}); still running the previous build"
+                )
             }
         }
     }
@@ -587,7 +772,11 @@ impl ReloadOutcome {
     /// developer asked for new code and is still looking at the old.
     pub fn level(&self) -> LogLevel {
         match self {
-            Self::Swapped { lost: 0, leaked: false, .. } => LogLevel::Info,
+            Self::Swapped {
+                lost: 0,
+                leaked: false,
+                ..
+            } => LogLevel::Info,
             Self::Swapped { .. } => LogLevel::Warning,
             Self::Rejected(_) => LogLevel::Warning,
         }
@@ -714,7 +903,17 @@ impl Scripting {
         let host = match ScriptHost::boot(&build_api(), bindings_dir) {
             Ok(host) => host,
             Err(err) => {
-                eprintln!("scripting disabled: {err}");
+                // Named, and with the fix attached, because scripting is a
+                // default feature: this is the first thing a machine with no
+                // .NET prints, and the bare hostfxr error underneath it is
+                // "No such file or directory (os error 2)".
+                eprintln!(
+                    "scripting disabled: could not host the .NET runtime from {} ({err})\n\
+                     \x20 the engine runs without it. Install the .NET SDK and \
+                     `dotnet build scripting/Orrin`, or build with \
+                     `--no-default-features` to leave scripting out entirely.",
+                    bindings_dir.display(),
+                );
                 return None;
             }
         };
@@ -793,16 +992,18 @@ impl Scripting {
         }
 
         let mut pending: Vec<Reloading> = Vec::new();
-        world.query::<&ScriptComponent>().for_each(|entity, script| {
-            pending.push(Reloading {
-                entity,
-                handle: script.handle,
-                type_name: script.type_name.clone(),
-                enabled: script.enabled,
-                started: script.started,
-                snapshot: 0,
-            })
-        });
+        world
+            .query::<&ScriptComponent>()
+            .for_each(|entity, script| {
+                pending.push(Reloading {
+                    entity,
+                    handle: script.handle,
+                    type_name: script.type_name.clone(),
+                    enabled: script.enabled,
+                    started: script.started,
+                    snapshot: 0,
+                })
+            });
 
         for script in pending.iter_mut() {
             script.snapshot = self.host.capture_state(script.handle);
@@ -848,7 +1049,11 @@ impl Scripting {
         // Last, so it only drops the snapshots belonging to the `lost` scripts.
         self.host.discard_states();
 
-        ReloadOutcome::Swapped { restored, lost, leaked }
+        ReloadOutcome::Swapped {
+            restored,
+            lost,
+            leaked,
+        }
     }
 
     /// Attach a C# `Behaviour` (by assembly-qualified type name) to `entity`.
@@ -927,21 +1132,23 @@ impl Scripting {
     pub fn tick(&self, world: &mut World, delta_time: f32) {
         let mut pending = self.pending.take();
         pending.clear();
-        world.query::<&ScriptComponent>().for_each(|entity, script| {
-            // Already-faulted scripts are inert: never collected, never
-            // dispatched to, until something clears the flag.
-            if script.faulted {
-                return;
-            }
-            pending.push(Pending {
-                entity,
-                handle: script.handle,
-                started: script.started,
-                enabled: script.enabled,
-                active: script.active,
-                faulted: false,
-            })
-        });
+        world
+            .query::<&ScriptComponent>()
+            .for_each(|entity, script| {
+                // Already-faulted scripts are inert: never collected, never
+                // dispatched to, until something clears the flag.
+                if script.faulted {
+                    return;
+                }
+                pending.push(Pending {
+                    entity,
+                    handle: script.handle,
+                    started: script.started,
+                    enabled: script.enabled,
+                    active: script.active,
+                    faulted: false,
+                })
+            });
         if pending.is_empty() {
             self.pending.replace(pending);
             return;
@@ -961,7 +1168,12 @@ impl Scripting {
         let mut routing = self.routing.take();
         routing.clear();
         if !events.is_empty() {
-            routing.extend(pending.iter().enumerate().map(|(i, script)| (script.entity, i)));
+            routing.extend(
+                pending
+                    .iter()
+                    .enumerate()
+                    .map(|(i, script)| (script.entity, i)),
+            );
         }
 
         orrin_script::with_active_world(world, || {
@@ -1007,7 +1219,10 @@ impl Scripting {
                     }
                     let normal = if flip { -event.normal } else { event.normal };
                     let collision = CCollision {
-                        other: CEntity { index: other.index, generation: other.generation },
+                        other: CEntity {
+                            index: other.index,
+                            generation: other.generation,
+                        },
                         point: event.point.to_array(),
                         normal: normal.to_array(),
                     };
@@ -1076,7 +1291,9 @@ impl Scripting {
                     world.insert(entity, material);
                 }
                 Command::Despawn(entity) => {
-                    world.despawn(entity);
+                    // Takes the subtree with it, so a script that despawns a
+                    // parent does not leave its children behind.
+                    crate::scene::despawn_recursive(world, entity);
                 }
                 Command::SetTag { entity, tag } => {
                     // `insert` is a stale-handle no-op, so a despawn queued earlier
@@ -1088,6 +1305,16 @@ impl Scripting {
                 }
                 Command::SetMaterial { entity, material } => {
                     world.insert(entity, material);
+                }
+                Command::Reparent {
+                    child,
+                    parent,
+                    keep_world,
+                } => {
+                    // Re-validated by `reparent` itself: the world has moved on
+                    // since the call, and the parent may have been despawned by
+                    // an earlier command in this same drain.
+                    let _ = crate::scene::reparent(world, child, parent, keep_world);
                 }
                 Command::AttachScript { entity, type_name } => {
                     // Creates the managed instance now; the enable/start pair

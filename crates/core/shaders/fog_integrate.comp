@@ -1,0 +1,71 @@
+#version 460
+
+// Marches each froxel column front to back, turning per-metre scattering into
+// the running pair a fragment can apply: radiance accumulated so far, and the
+// transmittance behind it.
+//
+// One invocation per *column*, not per froxel, and that is forced rather than
+// chosen. Slice `n` needs the transmittance that slice `n - 1` ended with, and a
+// pass per slice reading the level before it from the same resource is a cycle
+// by the rule that makes readers follow writers — the same reason `hiz_build`
+// writes its whole pyramid in one dispatch. So the loop lives inside the
+// invocation, where the dependency is a local variable.
+
+#include "fog.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform Fog {
+    GpuFog f;
+} u;
+
+// Nearest, and it matters: this reads exactly the froxel it is integrating, and
+// a bilinear tap would smear a neighbouring column's extinction into a
+// transmittance that is about to be multiplied along the whole ray.
+layout(set = 0, binding = 1) uniform sampler3D u_scatter;
+
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image3D u_volume;
+
+void main() {
+    ivec3 size = imageSize(u_volume);
+    ivec2 column = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(column, size.xy))) {
+        return;
+    }
+
+    FogParams f = u.f.fog;
+
+    vec3 accumulated = vec3(0.0);
+    float transmittance = 1.0;
+    // The slice's own front boundary, not the jittered point the scatter pass
+    // sampled at: the jitter moves where the medium was *measured*, while the
+    // length it is integrated over stays the slice's. Letting the jitter into
+    // this too would make the volume's total optical depth wobble frame to
+    // frame, which the history would then average into a haze that breathes.
+    float front = fog_slice_depth(f, 0.0);
+
+    for (int slice = 0; slice < size.z; ++slice) {
+        float back = fog_slice_depth(f, float(slice + 1) / float(size.z));
+        float thickness = back - front;
+        front = back;
+
+        vec4 s = texelFetch(u_scatter, ivec3(column, slice), 0);
+        float extinction = s.a;
+        float slice_transmittance = exp(-extinction * thickness);
+
+        // The closed form of `∫ σs·L·exp(-σt·x) dx` over the slice. Integrating
+        // rather than taking the sample times the length is what keeps a dense
+        // near slice from over-contributing: inside one froxel of thick fog the
+        // front of it already shadows the back.
+        vec3 integrated =
+            (s.rgb - s.rgb * slice_transmittance) / max(extinction, 1e-5);
+
+        accumulated += integrated * transmittance;
+        transmittance *= slice_transmittance;
+
+        // Every slice, not just the last: a fragment reads the depth it sits at,
+        // so the volume has to hold the integral up to *each* slice rather than
+        // the total.
+        imageStore(u_volume, ivec3(column, slice), vec4(accumulated, transmittance));
+    }
+}

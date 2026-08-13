@@ -1,10 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# orrin-script hosts CoreCLR (downloads nethost at build time, targets .NET 10),
-# so it's kept out of the default workspace build/CI. Build it explicitly:
-#   cargo build --manifest-path crates/orrin-script/Cargo.toml
-exclude = ["crates/orrin-script"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,7 +17,24 @@ vulkano = "0.35"
 vulkano-shaders = "0.35"
 winit = "0.30"
 glam = { version = "0.30", features = ["bytemuck"] }
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# `hdr` is the Radiance decoder the environment bake reads; it is what makes an
+# equirectangular HDRI loadable at all, since every LDR format clips the sun.
+# `png` and `jpeg` are what an imported glTF's textures actually ship as.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "hdr"] }
+# glTF 2.0 import. `default-features = false` drops the crate's own `import`
+# feature, which would pull base64, urlencoding and a second, fully-featured
+# `image` — the model loader resolves buffer and image URIs itself and decodes
+# through the trimmed `image` above, so the codec set stays the one chosen here
+# rather than whatever a dependency's defaults enable.
+#
+# `KHR_texture_transform` is on only so the importer can *detect* it: this
+# renderer has no per-material UV transform, and a file using one would sample at
+# the wrong texel offsets with nothing to say so.
+gltf = { version = "1", default-features = false, features = [
+    "utils",
+    "names",
+    "KHR_texture_transform",
+] }
 egui = "0.31"
 egui_winit_vulkano = "0.28"
 serde = { version = "1", features = ["derive"] }

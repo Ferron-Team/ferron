@@ -7,11 +7,13 @@
 //! isn't.
 
 use glam::Vec3;
-use orrin_core::gfx::RenderItem;
+use orrin_core::gfx::punctual::ShadowAtlas;
+use orrin_core::gfx::shadows::CascadeSet;
+use orrin_core::scene::propagate_transforms;
 use orrin_core::scene::{
     Camera, CpuMesh, Culling, LocalTransform, MeshBounds, MeshHandle, Transform,
 };
-use orrin_core::systems::extract_renderables;
+use orrin_core::systems::{FrameGeometry, extract_geometry};
 use orrin_ecs::World;
 
 const GRID: i32 = 10;
@@ -42,7 +44,11 @@ fn demo_world() -> World {
         .spawn_entity()
         .with(LocalTransform::from(Transform {
             translation: Vec3::new(0.0, -0.75, 0.0),
-            scale: Vec3::new(GRID as f32 * SPACING * 1.5, 0.5, GRID as f32 * SPACING * 1.5),
+            scale: Vec3::new(
+                GRID as f32 * SPACING * 1.5,
+                0.5,
+                GRID as f32 * SPACING * 1.5,
+            ),
             ..Default::default()
         }))
         .with(CUBE);
@@ -59,11 +65,20 @@ fn demo_camera() -> Camera {
     }
 }
 
-fn visible(world: &World, camera: Camera) -> usize {
+/// Propagates before extracting, exactly as the frame does — extraction reads
+/// world transforms and only propagation produces them.
+fn visible(world: &mut World, camera: Camera) -> usize {
     *world.resource_mut::<Camera>() = camera;
-    let mut items: Vec<RenderItem> = Vec::new();
-    extract_renderables(world, ASPECT, &mut items);
-    items.len()
+    propagate_transforms(world);
+    let mut geometry = FrameGeometry::default();
+    extract_geometry(
+        world,
+        ASPECT,
+        &CascadeSet::default(),
+        &ShadowAtlas::default(),
+        &mut geometry,
+    );
+    geometry.visible().len()
 }
 
 #[test]
@@ -71,7 +86,7 @@ fn the_demo_camera_frames_the_whole_scene() {
     let mut world = demo_world();
     world.insert_resource(demo_camera());
 
-    assert_eq!(visible(&world, demo_camera()), RENDERABLES);
+    assert_eq!(visible(&mut world, demo_camera()), RENDERABLES);
 }
 
 #[test]
@@ -85,7 +100,7 @@ fn turning_the_camera_around_culls_everything() {
         target: camera.position * 2.0,
         ..camera
     };
-    assert_eq!(visible(&world, behind), 0);
+    assert_eq!(visible(&mut world, behind), 0);
 }
 
 #[test]
@@ -98,7 +113,7 @@ fn standing_inside_the_grid_culls_what_is_behind_you() {
         target: Vec3::new(100.0, 1.0, 0.0),
         ..Camera::default()
     };
-    let count = visible(&world, inside);
+    let count = visible(&mut world, inside);
     assert!(
         count > 0 && count < RENDERABLES,
         "facing one way inside the grid should drop roughly the half behind the camera, got {count}"
@@ -117,5 +132,5 @@ fn a_distant_scene_is_still_drawn() {
         target: Vec3::ZERO,
         ..Camera::default()
     };
-    assert_eq!(visible(&world, far_back), RENDERABLES);
+    assert_eq!(visible(&mut world, far_back), RENDERABLES);
 }

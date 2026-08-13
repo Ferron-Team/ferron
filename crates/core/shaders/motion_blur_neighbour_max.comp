@@ -1,0 +1,44 @@
+#version 460
+
+// Motion blur, step two: the largest motion in each tile's 3x3 neighbourhood.
+//
+// One dilation, and the reason for it is geometric. A blur vector as long as a
+// tile can carry an object's light a whole tile away, into a neighbour that saw
+// none of that motion itself. Reading only the tile a pixel sits in therefore
+// leaves a visible seam on the tile grid wherever a fast object crosses one;
+// taking the maximum over the surrounding ring means every pixel a blur can
+// reach already knows about it.
+//
+// Only one ring is needed, and that is a property of the clamp above rather
+// than an approximation: the gather spreads a vector half its length either
+// side of centre, and the previous pass capped every vector at two tiles — so
+// light reaches exactly one tile, and never the ring beyond it.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_tiles;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_target;
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_target);
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    vec2 longest = vec2(0.0);
+    float longest_length = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 at = clamp(texel + ivec2(x, y), ivec2(0), size - 1);
+            vec2 candidate = texelFetch(u_tiles, at, 0).rg;
+            float candidate_length = length(candidate);
+            if (candidate_length > longest_length) {
+                longest_length = candidate_length;
+                longest = candidate;
+            }
+        }
+    }
+
+    imageStore(u_target, texel, vec4(longest, 0.0, 0.0));
+}

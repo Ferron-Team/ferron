@@ -11,8 +11,12 @@
 //! produces are indistinguishable from a live one's.
 
 use crate::geom::Aabb;
-use crate::gfx::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
-use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings};
+use crate::gfx::{DecalInstance, DrawList, Material, RenderBackend, SceneLighting, TextureHandle};
+use crate::scene::{
+    BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
+    FogSettings, HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, RefractionSettings,
+    SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings, TransparencySettings,
+};
 
 /// Counts uploads and derives mesh bounds; does no GPU work of any kind.
 #[derive(Default)]
@@ -65,15 +69,32 @@ impl RenderBackend for HeadlessBackend {
         handle
     }
 
+    fn load_environment(&mut self, _pixels: &[f32], _width: u32, _height: u32) {}
+
     fn resize(&mut self, _extent: [u32; 2]) {}
 
     fn render(
         &mut self,
-        _items: &[RenderItem],
+        _draws: DrawList<'_>,
+        _transparent: DrawList<'_>,
+        _refractive: DrawList<'_>,
+        _decals: &[DecalInstance],
         _lighting: &SceneLighting,
         _camera: &Camera,
         _ssao: &SsaoSettings,
+        _contact_shadows: &ContactShadowSettings,
+        _ssr: &SsrSettings,
+        _subsurface: &SubsurfaceSettings,
+        _transparency: &TransparencySettings,
+        _refraction: &RefractionSettings,
+        _taa: &TaaSettings,
+        _motion_blur: &MotionBlurSettings,
+        _dof: &DofSettings,
+        _bloom: &BloomSettings,
         _hdr: &HdrSettings,
+        _environment: &EnvironmentSettings,
+        _fog: &FogSettings,
+        _dt: f32,
     ) {
     }
 }

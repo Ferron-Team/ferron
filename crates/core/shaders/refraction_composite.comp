@@ -1,0 +1,37 @@
+#version 460
+
+// Screen-space refraction, resolve half: put what the draw pass gathered over
+// the lit frame.
+//
+// A plain premultiplied `over`, because the draw pass already did the hard part.
+// Every refractive surface fetched its own background out of the pyramid built
+// from `u_scene` and returned it composited, so what arrives here is radiance
+// that has *replaced* whatever was behind it, carrying the coverage that says
+// how much of the pixel it replaced.
+//
+// Reads the frame's colour rather than accumulating into it, for the reason the
+// transparency and depth-of-field composites do: graph resources are
+// unversioned, so a pass that both read and wrote the frame's colour would make
+// "readers after all writers" point in two directions and the compiler would
+// report a cycle.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_scene;
+// rgb = premultiplied radiance, a = coverage. Cleared to zero, so a pixel no
+// refractive surface covered leaves the frame exactly as it found it.
+layout(set = 0, binding = 1) uniform sampler2D u_accum;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_output;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_output);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+
+    vec3 scene = texelFetch(u_scene, pixel, 0).rgb;
+    vec4 accum = texelFetch(u_accum, pixel, 0);
+
+    imageStore(u_output, pixel, vec4(accum.rgb + scene * (1.0 - accum.a), 1.0));
+}

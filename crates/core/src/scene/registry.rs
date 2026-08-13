@@ -20,6 +20,15 @@ pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 pub const MESH: ComponentId = ComponentId::new("orrin.mesh");
 pub const MATERIAL: ComponentId = ComponentId::new("orrin.material");
 
+/// Reserved for the same reason, and resolved the same way one level up.
+///
+/// `Parent` holds an `orrin_ecs::Entity` — a slot handle whose meaning is this
+/// session's spawn history — so writing one to disk would name a different
+/// entity, or none, the next time the scene is opened. The file stores the
+/// parent's [`EntityId`](orrin_registry::EntityId) instead, which needs the
+/// world to translate in both directions and so cannot live in a `Reflect` impl.
+pub const PARENT: ComponentId = ComponentId::new("orrin.parent");
+
 /// Describe every component the engine itself owns to `registry`.
 ///
 /// The counterpart a game assembly exports under the same name, called again
@@ -31,10 +40,21 @@ pub const MATERIAL: ComponentId = ComponentId::new("orrin.material");
 /// - `MeshHandle` / `MaterialHandle` index a runtime asset table, so writing
 ///   one to disk would bake a session-local number into a scene. They register
 ///   once assets have stable ids.
+/// - `Decal` names its three maps by `TextureHandle`, which is an upload index
+///   and so session-local for exactly the reason the two handles above are. It
+///   registers alongside them, once assets have stable ids.
 /// - `ScriptComponent` owns a `GCHandle` whose `Drop` is the single managed
 ///   teardown path. It joins as a *bridge* to the C# property bag, never as an
 ///   ordinary component — a registry `write` replaces the component wholesale,
 ///   which here would free a live handle.
+/// - `WorldTransform` is derived from `LocalTransform` every frame, so a saved
+///   value would be overwritten before anything could read it. Writing one to a
+///   scene would also record a *result* beside the inputs that produce it, which
+///   is the kind of redundancy a file format cannot keep consistent.
+/// - `Parent` holds a session-local entity handle. It *is* persisted, under the
+///   reserved [`PARENT`] id, but as the parent's `EntityId` — a translation that
+///   needs the world in both directions, so it happens in `scene::persist`
+///   alongside the asset references, for exactly the same reason.
 pub fn register_components(registry: &mut Registry) {
     registry.register::<LocalTransform>(TRANSFORM, "Transform");
     registry.register::<Name>(NAME, "Name");
@@ -116,7 +136,7 @@ entity #1
         register_components(&mut registry);
         let mut world = World::new();
         let entity = world.spawn();
-        world.insert(entity, Light::point(Vec3::ONE, 8.0, 10.0));
+        world.insert(entity, Light::point(Vec3::ONE, 800.0, 10.0));
 
         let mut out = String::new();
         orrin_registry::write_entity(&mut out, &registry, &world, entity);
@@ -126,8 +146,9 @@ entity #1
             "\
 entity #1
   orrin.light = Point
+    casts_shadows = true
     color = (1.0, 1.0, 1.0)
-    intensity = 8.0
+    lumens = 800.0
     range = 10.0
 "
         );
@@ -135,12 +156,64 @@ entity #1
 
     #[test]
     fn an_unknown_variant_names_itself() {
-        let stale = Value::enumeration("Spot", [("angle", Value::F32(30.0))]);
+        let stale = Value::enumeration("Area", [("width", Value::F32(30.0))]);
         let err = Light::from_value(&stale).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "expected one of: Directional, Point, found `Spot`"
+            "expected one of: Directional, Point, Spot, found `Area`"
         );
+    }
+
+    /// A point light saved before `casts_shadows` existed still loads, and loads
+    /// as a caster — which is what it was, since every light cast before the
+    /// switch was there to say otherwise. Without the `#[reflect(default)]` on
+    /// that field this is a missing-field error and the whole entity is lost, so
+    /// the guarantee is worth a test of its own rather than trusting the derive.
+    #[test]
+    fn a_light_saved_before_the_shadow_switch_still_loads() {
+        let old = Value::enumeration(
+            "Point",
+            [
+                ("color", Vec3::ONE.to_value()),
+                ("lumens", Value::F32(800.0)),
+                ("range", Value::F32(10.0)),
+            ],
+        );
+        let light = Light::from_value(&old).expect("an older point light must still load");
+        assert!(matches!(
+            light,
+            Light::Point {
+                casts_shadows: true,
+                ..
+            }
+        ));
+    }
+
+    /// The other half of the bargain in `Light`'s doc comment: a light authored
+    /// against the pre-photometric `intensity` field must fail loudly rather than
+    /// load dark.
+    ///
+    /// This is the one migration the engine deliberately does *not* smooth over.
+    /// Reading `intensity = 8` as eight lumens would load a scene lit at about a
+    /// thousandth of what its author saw, with nothing anywhere saying why — and
+    /// a plausible-looking scene that is simply black is far more expensive to
+    /// diagnose than an error naming the field. Hence the rename rather than a
+    /// reinterpretation, and hence a test: the *absence* of a compatibility path
+    /// is the feature, and nothing else would stop someone adding one back.
+    #[test]
+    fn a_light_saved_before_physical_units_refuses_to_load() {
+        let unitless = Value::enumeration(
+            "Point",
+            [
+                ("color", Vec3::ONE.to_value()),
+                ("intensity", Value::F32(8.0)),
+                ("range", Value::F32(10.0)),
+            ],
+        );
+        let err = Light::from_value(&unitless)
+            .expect_err("an intensity-based light must not load as lumens");
+        assert_eq!(err.path.to_string(), "lumens");
+        assert_eq!(err.found, "nothing");
     }
 
     /// The reason `Spin` cannot be derived: `apply` feeds `axis` to
@@ -154,8 +227,10 @@ entity #1
         assert_eq!(err.path.to_string(), "axis");
         assert_eq!(err.expected, "a non-zero axis");
 
-        let unnormalized =
-            Value::strukt([("axis", Vec3::new(0.0, 4.0, 0.0).to_value()), ("speed", Value::F32(1.0))]);
+        let unnormalized = Value::strukt([
+            ("axis", Vec3::new(0.0, 4.0, 0.0).to_value()),
+            ("speed", Value::F32(1.0)),
+        ]);
         let spin = Spin::from_value(&unnormalized).unwrap();
         assert_eq!(spin.to_value().field("axis"), Some(&Vec3::Y.to_value()));
     }
@@ -196,7 +271,10 @@ entity #1
         register_components(&mut registry);
 
         assert_eq!(Name::new("x").to_value(), Tag::new("x").to_value());
-        assert_ne!(registry.of::<Name>().unwrap().id, registry.of::<Tag>().unwrap().id);
+        assert_ne!(
+            registry.of::<Name>().unwrap().id,
+            registry.of::<Tag>().unwrap().id
+        );
     }
 
     #[test]
@@ -229,8 +307,8 @@ entity #1
             ("rotation", Quat::IDENTITY.to_value()),
             ("scale", Vec3::ONE.to_value()),
         ]);
-        let err = (registry.get(&TRANSFORM).unwrap().write)(&mut world, entity, &broken)
-            .unwrap_err();
+        let err =
+            (registry.get(&TRANSFORM).unwrap().write)(&mut world, entity, &broken).unwrap_err();
         assert_eq!(
             err.to_string(),
             "field `translation`: expected vec3, found bool"

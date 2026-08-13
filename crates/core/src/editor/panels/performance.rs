@@ -1,76 +1,145 @@
 use orrin_ecs::World;
 
+use super::figures;
+use crate::editor::theme;
 use crate::profile::{self, Lane, Profiler, Row};
-use crate::scene::Culling;
+use crate::scene::{Culling, Diagnostics, PresentSettings, VsyncMode};
 use crate::stats::FrameStats;
 
-pub fn show(ctx: &egui::Context, world: &World) {
+pub fn body(ui: &mut egui::Ui, world: &World) {
     let Some(stats) = world.get_resource::<FrameStats>() else {
         return;
     };
+    ui.label(
+        egui::RichText::new(format!("{:.0} FPS", stats.fps()))
+            .size(24.0)
+            .strong(),
+    );
+    ui.label(figures(format!("CPU: {:.2} ms (avg)", stats.frame_ms())).color(theme::CPU));
+    ui.label(match stats.gpu_ms() {
+        Some(ms) => figures(format!("GPU: {ms:.2} ms")).color(theme::GPU),
+        None => figures("GPU: n/a").color(theme::GPU),
+    });
 
-    const CPU_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 200, 255);
-    const GPU_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 170, 80);
+    if !stats.history().is_empty() {
+        let (min, max) = stats.min_max_ms();
+        ui.label(figures(format!("CPU min {min:.2} · max {max:.2} ms")));
+    }
 
-    egui::Window::new("Performance")
-        .default_pos(egui::pos2(12.0, 12.0))
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new(format!("{:.0} FPS", stats.fps()))
-                    .size(24.0)
-                    .strong(),
-            );
-            ui.colored_label(CPU_COLOR, format!("CPU: {:.2} ms (avg)", stats.frame_ms()));
-            match stats.gpu_ms() {
-                Some(ms) => ui.colored_label(GPU_COLOR, format!("GPU: {ms:.2} ms")),
-                None => ui.colored_label(GPU_COLOR, "GPU: n/a"),
-            };
+    let rss_mb = stats.memory_bytes() as f64 / (1024.0 * 1024.0);
+    ui.label(figures(format!("Memory (RSS): {rss_mb:.1} MB")));
+    let total_gb = stats.vram_total() as f64 / (1024.0 * 1024.0 * 1024.0);
+    match stats.vram_used() {
+        Some(used) => {
+            let used_mb = used as f64 / (1024.0 * 1024.0);
+            ui.label(figures(format!("VRAM: {used_mb:.0} MB / {total_gb:.1} GB")));
+        }
+        None => {
+            ui.label(figures(format!("VRAM: {total_gb:.1} GB (usage n/a)")));
+        }
+    }
 
-            if !stats.history().is_empty() {
-                let (min, max) = stats.min_max_ms();
-                ui.label(format!("CPU min {min:.2} · max {max:.2} ms"));
+    if let Some(mut culling) = world.get_resource_mut::<Culling>() {
+        ui.label(figures(format!(
+            "Draws: {} / {} ({} culled)",
+            culling.visible(),
+            culling.total(),
+            culling.culled(),
+        )));
+        ui.checkbox(&mut culling.enabled, "Frustum culling")
+            .on_hover_text("Off draws everything — the A/B for a suspected culling bug.");
+    }
+
+    ui.add_space(4.0);
+    graph(ui, &stats, theme::CPU, theme::GPU);
+
+    if let Some(profiler) = world.get_resource::<Profiler>() {
+        ui.add_space(6.0);
+        ui.separator();
+
+        let mut enabled = profile::is_enabled();
+        if ui.checkbox(&mut enabled, "Collect phase timings").changed() {
+            profile::set_enabled(enabled);
+        }
+        if enabled {
+            // `vertical` and not `indent`: a tool body draws into whatever `Ui` it
+            // is handed, and egui refuses to indent a horizontal one — which is
+            // exactly the `Ui` `every_tool_body_draws_without_its_own_container`
+            // hands it.
+            ui.vertical(|ui| {
+                let mut passes = profile::gpu_passes_enabled();
+                if ui.checkbox(&mut passes, "Time each GPU pass").changed() {
+                    profile::set_gpu_passes_enabled(passes);
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Off leaves the whole-frame GPU time and drops the table. \
+                         The difference between the two whole-frame numbers is the \
+                         pass overlap the per-pass timestamps prevent.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+            phases(ui, &profiler, Lane::Cpu, "CPU phases", theme::CPU);
+            phases(ui, &profiler, Lane::Gpu, "GPU passes", theme::GPU);
+        }
+    }
+
+    measurement(ui, world);
+}
+
+/// The knobs that move a frame-time number without moving a pixel.
+///
+/// Grouped, and grouped *here* rather than beside the effects they sit next to in
+/// the frame, because they are read together: a figure from this panel means
+/// nothing without them, which is also why the startup banner prints the same
+/// list.
+fn measurement(ui: &mut egui::Ui, world: &World) {
+    ui.add_space(6.0);
+    ui.separator();
+
+    // Open by default, unlike most sections that could be: these are the controls
+    // a frame-time figure has to be read against, and a collapsed one is a value
+    // nobody checked before writing the number down.
+    egui::CollapsingHeader::new("Measurement")
+        .default_open(true)
+        .show(ui, |ui| {
+            if let Some(mut present) = world.get_resource_mut::<PresentSettings>() {
+                let label = |mode: VsyncMode| match mode {
+                    VsyncMode::Fifo => "Fifo (vsync)",
+                    VsyncMode::Mailbox => "Mailbox (uncapped)",
+                    VsyncMode::Immediate => "Immediate (uncapped, tears)",
+                };
+                egui::ComboBox::from_label("Present mode")
+                    .selected_text(label(present.vsync))
+                    .show_ui(ui, |ui| {
+                        for mode in [VsyncMode::Fifo, VsyncMode::Mailbox, VsyncMode::Immediate] {
+                            ui.selectable_value(&mut present.vsync, mode, label(mode));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Immediate is the one to measure in: it never withholds an image, \
+                         so the frame time is the renderer's own rather than a queue depth. \
+                         A mode the surface doesn't support falls back to Fifo.",
+                    );
+
+                ui.add(egui::Slider::new(&mut present.images, 2..=4).text("Swapchain images"))
+                    .on_hover_text(
+                        "Three is what an uncapped mode wants — with two, the CPU blocks in \
+                     the acquire as soon as one image is queued and the other is being \
+                     drawn. Clamped to what the surface advertises.",
+                    );
             }
 
-            let rss_mb = stats.memory_bytes() as f64 / (1024.0 * 1024.0);
-            ui.label(format!("Memory (RSS): {rss_mb:.1} MB"));
-            let total_gb = stats.vram_total() as f64 / (1024.0 * 1024.0 * 1024.0);
-            match stats.vram_used() {
-                Some(used) => {
-                    let used_mb = used as f64 / (1024.0 * 1024.0);
-                    ui.label(format!("VRAM: {used_mb:.0} MB / {total_gb:.1} GB"));
-                }
-                None => {
-                    ui.label(format!("VRAM: {total_gb:.1} GB (usage n/a)"));
-                }
-            }
-
-            if let Some(mut culling) = world.get_resource_mut::<Culling>() {
-                ui.label(format!(
-                    "Draws: {} / {} ({} culled)",
-                    culling.visible(),
-                    culling.total(),
-                    culling.culled(),
-                ));
-                ui.checkbox(&mut culling.enabled, "Frustum culling")
-                    .on_hover_text("Off draws everything — the A/B for a suspected culling bug.");
-            }
-
-            ui.add_space(4.0);
-            graph(ui, &stats, CPU_COLOR, GPU_COLOR);
-
-            if let Some(profiler) = world.get_resource::<Profiler>() {
-                ui.add_space(6.0);
-                ui.separator();
-
-                let mut enabled = profile::is_enabled();
-                if ui.checkbox(&mut enabled, "Collect phase timings").changed() {
-                    profile::set_enabled(enabled);
-                }
-                if enabled {
-                    phases(ui, &profiler, Lane::Cpu, "CPU phases", CPU_COLOR);
-                    phases(ui, &profiler, Lane::Gpu, "GPU passes", GPU_COLOR);
-                }
+            if let Some(mut diagnostics) = world.get_resource_mut::<Diagnostics>() {
+                ui.checkbox(&mut diagnostics.overlay, "Editor overlay (F1)")
+                    .on_hover_text(
+                        "Off takes the editor out of the frame entirely — no UI run, no \
+                         egui input, no overlay pass — so what remains is the scene's own \
+                         cost. F1 brings it back, since this checkbox goes with it.",
+                    );
             }
         });
 }
@@ -125,11 +194,19 @@ fn lane_total(rows: &[Row]) -> f32 {
     if let Some(frame) = rows.iter().find(|row| row.name == "frame") {
         return frame.last_ms;
     }
-    rows.iter().filter(|row| row.depth == 0).map(|row| row.last_ms).sum()
+    rows.iter()
+        .filter(|row| row.depth == 0)
+        .map(|row| row.last_ms)
+        .sum()
 }
 
 // Reference lines mark 60 fps (16.7 ms) and 30 fps (33.3 ms).
-fn graph(ui: &mut egui::Ui, stats: &FrameStats, cpu_color: egui::Color32, gpu_color: egui::Color32) {
+fn graph(
+    ui: &mut egui::Ui,
+    stats: &FrameStats,
+    cpu_color: egui::Color32,
+    gpu_color: egui::Color32,
+) {
     let cpu = stats.history();
     let gpu = stats.gpu_history();
     let size = egui::vec2(ui.available_width().max(220.0), 64.0);
@@ -148,10 +225,7 @@ fn graph(ui: &mut egui::Ui, stats: &FrameStats, cpu_color: egui::Color32, gpu_co
     let scale_ms = peak.max(33.3);
     let y_for = |ms: f32| rect.bottom() - rect.height() * (ms / scale_ms).clamp(0.0, 1.0);
 
-    for (ms, color) in [
-        (16.67, egui::Color32::from_rgb(60, 120, 60)),
-        (33.33, egui::Color32::from_rgb(130, 95, 40)),
-    ] {
+    for (ms, color) in [(16.67, theme::GUIDE_60), (33.33, theme::GUIDE_30)] {
         if ms <= scale_ms {
             painter.hline(rect.x_range(), y_for(ms), egui::Stroke::new(1.0, color));
         }

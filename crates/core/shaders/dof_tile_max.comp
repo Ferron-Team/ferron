@@ -1,0 +1,53 @@
+#version 460
+
+// Depth of field, step two: the largest circle of confusion in each tile.
+//
+// The gather has a fixed tap count, so what it costs is fixed and what it *buys*
+// depends entirely on how wide it spreads those taps. Spread them over the
+// largest circle the lens can ever produce and a pixel whose circle is a tenth
+// of that catches one tap in fifty — a single sample, which is not a blur at
+// all, and a frame that looks untouched at every aperture but the widest. So the
+// kernel has to be sized to the blur actually present, and this is where that
+// number comes from.
+//
+// Near and far are tracked apart because they are gathered apart, and a tile can
+// easily hold a wide near circle and a tight far one — sizing the far kernel by
+// the near maximum would starve it exactly the way a global maximum does.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_prefiltered;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_target;
+
+// Side of a tile, in half-resolution texels. Must equal the shift the graph
+// sizes this image by, and must be at least the prefilter's clamp — the gather
+// dilates over one ring, so a tile narrower than the widest circle would let a
+// foreground object spill into a tile that never heard about it.
+const int TILE = 32;
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_target);
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    ivec2 source_size = textureSize(u_prefiltered, 0);
+    ivec2 base = texel * TILE;
+
+    float far_max = 0.0;
+    float near_max = 0.0;
+    for (int y = 0; y < TILE; ++y) {
+        for (int x = 0; x < TILE; ++x) {
+            ivec2 at = base + ivec2(x, y);
+            if (any(greaterThanEqual(at, source_size))) {
+                continue;
+            }
+            float coc = texelFetch(u_prefiltered, at, 0).a;
+            far_max = max(far_max, max(coc, 0.0));
+            near_max = max(near_max, max(-coc, 0.0));
+        }
+    }
+
+    imageStore(u_target, texel, vec4(far_max, near_max, 0.0, 0.0));
+}

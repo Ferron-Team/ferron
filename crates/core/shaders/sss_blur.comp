@@ -1,0 +1,135 @@
+#version 460
+
+// One axis of the subsurface diffusion.
+//
+// The pass runs twice with `direction` swapped, which is what makes an O(n^2)
+// gather an O(n) one — legitimate because the kernel below is a Gaussian, and a
+// Gaussian is the one radially symmetric kernel that separates exactly. The
+// weights are per channel, so the two axes together reproduce three kernels of
+// different widths for the price of one set of taps: that is the whole reason the
+// effect is affordable, and the reason red bleeds furthest costs nothing extra.
+//
+// What arrives here is only the radiance that physically left the surface
+// somewhere other than where it arrived — `shading.glsl` split it out, and every
+// specular lobe stayed behind. Blurring the lit frame instead would smear
+// highlights, which is the difference between skin and a photograph of skin
+// through a greasy lens.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// `rgb` = diffusible radiance, `a` = the widest channel's mean free path in
+// metres. The second pass reads the same alpha out of the first pass's output,
+// which is why the store below carries it through unchanged.
+layout(set = 0, binding = 0) uniform sampler2D u_source;
+layout(set = 0, binding = 1) uniform sampler2D u_depth;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_target;
+
+layout(push_constant) uniform Push {
+    // xy = the axis to walk, in texels; z = near plane, w = far plane.
+    vec4 direction;
+    // rgb = each channel's reach as a fraction of the widest, w = the
+    // world-to-pixel scale at unit depth.
+    vec4 profile;
+    // x = the widest kernel this pass may open, in pixels.
+    vec4 params;
+} push;
+
+// Taps per side. Fourteen samples plus the centre is enough for a kernel this
+// smooth — the profile is a Gaussian and the radius rarely exceeds a few dozen
+// pixels, so the taps are dense compared to the detail they carry. The cost is
+// paid twice, once per axis, and only on pixels that scatter.
+const int TAPS = 7;
+
+// Matches `linear_depth` in the depth-of-field and motion-blur shaders, because
+// it is the same depth buffer read the same way.
+float linear_depth(float d) {
+    float near = push.direction.z;
+    float far = push.direction.w;
+    return near * far / max(far - d * (far - near), 1e-6);
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_target);
+    if (texel.x >= size.x || texel.y >= size.y) {
+        return;
+    }
+
+    vec4 center = texelFetch(u_source, texel, 0);
+
+    // A zero radius is a pixel no scattering material covered. Nothing to
+    // spread, and the store keeps the frame's own zero there so the composite
+    // adds nothing — which is the entire mask this feature needs.
+    if (center.a <= 0.0) {
+        imageStore(u_target, texel, center);
+        return;
+    }
+
+    float z = linear_depth(texelFetch(u_depth, texel, 0).r);
+
+    // Metres across the surface into pixels on the screen: a length
+    // perpendicular to the view at depth `z` subtends `length * scale / z` of
+    // them. The clamp is a performance control, not a physical one — a scattering
+    // surface pressed against the lens would otherwise open a kernel the width of
+    // the frame.
+    float radius = min(center.a * push.profile.w / max(z, 1e-4), push.params.x);
+    if (radius < 0.5) {
+        // Narrower than the texel it is centred on. Every tap would land back
+        // here, so the gather is a no-op with a rounding error in it.
+        imageStore(u_target, texel, center);
+        return;
+    }
+
+    // Each channel's standard deviation, in metres. Half the mean free path, so
+    // the kernel's own two-sigma edge is where the taps stop — a Gaussian carries
+    // about 95% of its weight inside that, and the remainder is the tail this
+    // truncation drops.
+    vec3 sigma = max(push.profile.rgb, vec3(1e-3)) * center.a * 0.5;
+    vec3 denom = 2.0 * sigma * sigma;
+
+    // The centre tap weighs one in every channel by construction, which is what
+    // keeps a pixel whose neighbours are all rejected equal to what it came in as.
+    vec3 sum = center.rgb;
+    vec3 weight_sum = vec3(1.0);
+
+    vec2 step = push.direction.xy * (radius / float(TAPS));
+    float step_world = center.a / float(TAPS);
+
+    for (int i = 1; i <= TAPS; ++i) {
+        // Metres along the surface this tap sits from the centre, if the surface
+        // were perpendicular to the view.
+        float lateral = float(i) * step_world;
+
+        for (int side = -1; side <= 1; side += 2) {
+            ivec2 at = clamp(
+                texel + ivec2(round(step * float(i * side))), ivec2(0), size - ivec2(1)
+            );
+            vec4 tap = texelFetch(u_source, at, 0);
+
+            // Only from pixels that scatter. A tap on the wall behind a cheek
+            // carries no diffusible radiance to bleed in — its rgb is zero — so
+            // admitting it would not brighten anything, it would divide the
+            // cheek's own light by weight that contributed none and darken the
+            // silhouette. Rejecting and renormalising is what keeps the edge of a
+            // scattering object as bright as its middle.
+            if (tap.a <= 0.0) {
+                continue;
+            }
+
+            // The distance light actually had to travel between the two points,
+            // not the distance across the image. That single substitution is the
+            // depth-aware term: two pixels adjacent on screen but metres apart in
+            // depth are metres apart for the exponential too, so it rejects them
+            // by itself. A separate silhouette heuristic would be this quantity,
+            // approximated.
+            float dz = linear_depth(texelFetch(u_depth, at, 0).r) - z;
+            float r2 = lateral * lateral + dz * dz;
+
+            vec3 weight = exp(-vec3(r2) / denom);
+            sum += tap.rgb * weight;
+            weight_sum += weight;
+        }
+    }
+
+    imageStore(u_target, texel, vec4(sum / weight_sum, center.a));
+}

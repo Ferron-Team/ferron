@@ -10,8 +10,8 @@ use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
 };
 use vulkano::instance::Instance;
-use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::memory::MemoryHeapFlags;
+use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::swapchain::Surface;
 use vulkano::{Version, VulkanObject};
 
@@ -24,9 +24,16 @@ pub struct VkContext {
 }
 
 impl VkContext {
-    pub fn new(instance: &Arc<Instance>, surface: &Arc<Surface>) -> Self {
+    /// `surface` is `None` for an offscreen context — one that renders into an
+    /// ordinary image and never presents. The only thing it changes is device
+    /// selection: with no surface there is nothing to ask for presentation
+    /// support, and no swapchain extension to require. Everything downstream is
+    /// identical, which is the point — an offscreen render has to go through the
+    /// same device, the same features and the same passes as a windowed one, or
+    /// it would not be evidence about the windowed one.
+    pub fn new(instance: &Arc<Instance>, surface: Option<&Arc<Surface>>) -> Self {
         let mut device_extensions = DeviceExtensions {
-            khr_swapchain: true,
+            khr_swapchain: surface.is_some(),
             ..DeviceExtensions::empty()
         };
 
@@ -45,7 +52,25 @@ impl VkContext {
         let swizzle = physical_device
             .supported_features()
             .image_view_format_swizzle;
-        if physical_device.supported_extensions().khr_portability_subset {
+
+        let anisotropy = physical_device.supported_features().sampler_anisotropy;
+
+        // Without it every attachment of a pipeline must blend identically, and
+        // the transparency accumulation's two do not: one sums and the other
+        // multiplies, which is exactly what makes its draw order irrelevant.
+        // Universally supported on desktop and on Metal; asserted rather than
+        // fallen back on, because there is no second blend equation to fall back
+        // to.
+        assert!(
+            physical_device.supported_features().independent_blend,
+            "this device cannot blend two attachments differently, which the \
+             transparency pass requires",
+        );
+
+        if physical_device
+            .supported_extensions()
+            .khr_portability_subset
+        {
             device_extensions.khr_portability_subset = true;
         }
 
@@ -66,6 +91,8 @@ impl VkContext {
                 enabled_extensions: device_extensions,
                 enabled_features: DeviceFeatures {
                     image_view_format_swizzle: swizzle,
+                    sampler_anisotropy: anisotropy,
+                    independent_blend: true,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
@@ -128,8 +155,7 @@ impl VkContext {
         // vulkano makes the same call internally.
         let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
         {
-            let mut props2 =
-                vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
             unsafe {
                 (instance.fns().v1_1.get_physical_device_memory_properties2)(
                     phys.handle(),
@@ -145,7 +171,7 @@ impl VkContext {
 
 fn select_physical_device(
     instance: &Arc<Instance>,
-    surface: &Arc<Surface>,
+    surface: Option<&Arc<Surface>>,
     extensions: &DeviceExtensions,
 ) -> (Arc<PhysicalDevice>, u32) {
     instance
@@ -158,7 +184,12 @@ fn select_physical_device(
                 .enumerate()
                 .position(|(i, q)| {
                     q.queue_flags.intersects(QueueFlags::GRAPHICS)
-                        && p.surface_support(i as u32, surface).unwrap_or(false)
+                        // A graphics queue is the whole requirement offscreen.
+                        // Presentation support is a property of a surface, and
+                        // there is no surface to hold it against.
+                        && surface.is_none_or(|surface| {
+                            p.surface_support(i as u32, surface).unwrap_or(false)
+                        })
                 })
                 .map(|i| (p, i as u32))
         })

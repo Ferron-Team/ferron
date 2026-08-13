@@ -1,0 +1,124 @@
+#version 460
+
+// Depth of field, step three: scatter, performed as a gather.
+//
+// What a lens physically does is scatter — every point in the scene throws its
+// light over a disc, and discs from different depths overlap. A GPU cannot
+// scatter cheaply, so this inverts the question: instead of asking where each
+// texel's light lands, each texel asks which of its neighbours threw light onto
+// it. A neighbour `q` at distance `d` contributes exactly when its own circle of
+// confusion reaches that far, which is the one test in each loop below.
+//
+// Energy comes out right because of how the weight is formed rather than by
+// normalising afterwards. A texel spreading over a disc of radius `r` puts
+// `1/(pi r^2)` of itself on each unit of area, so a wide circle contributes
+// faintly and a tight one strongly, and a uniformly blurred region sums to
+// exactly one. That is what makes the accumulated alpha a *coverage* the
+// composite can blend by, rather than a tap count that would need a magic
+// divisor.
+//
+// The kernel is sized from the tile pass rather than from the widest circle the
+// lens can produce, and that is not a refinement — it is what makes the effect
+// exist at ordinary apertures. The taps are a fixed budget spread over the
+// kernel, so a kernel wider than the blur puts almost all of them outside it:
+// at a circle an eighth of the maximum, one tap in fifty lands inside and the
+// gather returns the pixel it started with.
+//
+// The two fields are separated because they composite differently: a near
+// object's blur spills over what it occludes, and a far object's does not. That
+// asymmetry is real optics — the foreground is between the lens and the
+// background, so its light genuinely lands on top — and it is the half of the
+// effect that makes an image read as a photograph.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_prefiltered;
+layout(set = 0, binding = 1) uniform sampler2D u_tiles;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_near;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D u_far;
+
+// Side of a tile, in half-resolution texels. Matches the tile pass's.
+const int TILE = 32;
+
+// Taps over the disc. The spiral below is low-discrepancy at every prefix, so
+// this trades quality for cost smoothly rather than falling off a cliff.
+const int TAPS = 48;
+
+// Successive turns of the golden angle never repeat and never line up, which is
+// what keeps the samples from forming the spokes a fixed angular step produces —
+// and spokes in a bokeh disc read as a cheap star filter.
+const float GOLDEN_ANGLE = 2.39996323;
+
+// Below half a texel there is no circle to speak of, and the kernel would
+// collapse onto the centre tap.
+const float MIN_RADIUS = 0.5;
+
+// One field's worth of gathering. `sign` selects which: +1 accepts the far
+// field's positive circles and -1 the near field's negative ones, so the single
+// loop serves both and they cannot drift apart.
+vec4 gather(vec2 uv, vec2 texel_size, float radius, float sign) {
+    vec4 sum = vec4(0.0);
+    float area = radius * radius;
+
+    for (int i = 0; i < TAPS; ++i) {
+        // sqrt of the sequence, so the samples are uniform over the disc's
+        // *area*. Stepping the radius linearly instead crowds them at the
+        // centre, and a bokeh disc with a bright core is the artifact that
+        // gives away a cheap implementation.
+        float t = (float(i) + 0.5) / float(TAPS);
+        float distance = sqrt(t) * radius;
+        float angle = float(i) * GOLDEN_ANGLE;
+        vec2 offset = vec2(cos(angle), sin(angle)) * distance;
+
+        // Signed into this field's own half, so a sample belonging to the other
+        // one is negative here and fails the reach test below.
+        float coc = texture(u_prefiltered, uv + offset * texel_size).a * sign;
+        if (coc < distance) {
+            continue;
+        }
+
+        // Floored at one texel: a sample sharper than a texel would otherwise
+        // be weighted as though it concentrated all its light on this one, and
+        // the division would run away.
+        float weight = area / (float(TAPS) * max(coc * coc, 1.0));
+        sum += vec4(texture(u_prefiltered, uv + offset * texel_size).rgb, 1.0) * weight;
+    }
+    return sum;
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_near);
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    vec2 texel_size = 1.0 / vec2(size);
+    vec2 uv = (vec2(texel) + 0.5) * texel_size;
+
+    // One ring of tiles, for the reason the motion blur gather dilates one: a
+    // circle can reach a tile that contains nothing blurred itself, and reading
+    // only the tile this texel sits in would stop the spill dead on the tile
+    // grid.
+    ivec2 tile_size = textureSize(u_tiles, 0);
+    ivec2 tile = texel / TILE;
+    float far_radius = 0.0;
+    float near_radius = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 maxima =
+                texelFetch(u_tiles, clamp(tile + ivec2(x, y), ivec2(0), tile_size - 1), 0).rg;
+            far_radius = max(far_radius, maxima.x);
+            near_radius = max(near_radius, maxima.y);
+        }
+    }
+
+    // Nothing anywhere near this texel is defocused in that field, so the loop
+    // would spend its taps proving it. The composite reads a zero coverage as
+    // "keep the sharp frame", which is exactly right here.
+    vec4 far = far_radius < MIN_RADIUS ? vec4(0.0) : gather(uv, texel_size, far_radius, 1.0);
+    vec4 near = near_radius < MIN_RADIUS ? vec4(0.0) : gather(uv, texel_size, near_radius, -1.0);
+
+    imageStore(u_near, texel, near);
+    imageStore(u_far, texel, far);
+}
