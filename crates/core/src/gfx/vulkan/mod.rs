@@ -272,7 +272,7 @@ impl VulkanRenderer {
         present: PresentSettings,
         make_target: impl FnOnce(&VkContext, &Arc<RenderPass>, Format, [u32; 2]) -> SwapchainState,
     ) -> Self {
-        let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, hdr::HDR_FORMAT);
+        let forward = ForwardPass::new(&ctx, hdr::HDR_FORMAT);
         let hdr = HdrPass::new(&ctx, format);
         let exposure = ExposurePass::new(&ctx);
         let bloom = BloomPass::new(&ctx);

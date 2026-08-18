@@ -5,6 +5,7 @@ use vulkano::command_buffer::allocator::{
     StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
+use vulkano::descriptor_set::layout::DescriptorBindingFlags;
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
@@ -12,6 +13,7 @@ use vulkano::device::{
 use vulkano::instance::Instance;
 use vulkano::memory::MemoryHeapFlags;
 use vulkano::memory::allocator::StandardMemoryAllocator;
+use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::swapchain::Surface;
 use vulkano::{Version, VulkanObject};
 
@@ -21,9 +23,65 @@ pub struct VkContext {
     pub memory_allocator: Arc<StandardMemoryAllocator>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+    /// Whether a descriptor array may be left partly unwritten.
+    ///
+    /// The material texture array is [`MAX_TEXTURES`] slots wide and a scene
+    /// fills a handful of them. Without this the rest have to be written with a
+    /// stand-in view, and the cost of that is not the write: vulkano records a
+    /// tracked resource use for every element of every array the bound pipeline
+    /// declares, *per draw call*, so a frame of a hundred draws tracks nineteen
+    /// thousand image uses and spends milliseconds of CPU doing it. Writing only
+    /// the textures that exist is what removes them, and a partly written array
+    /// is only legal with this.
+    ///
+    /// Vulkan 1.2 core. A device without it gets the filled array it always had
+    /// — see [`VkContext::texture_array_len`].
+    ///
+    /// [`MAX_TEXTURES`]: crate::gfx::MAX_TEXTURES
+    pub partially_bound: bool,
 }
 
 impl VkContext {
+    /// How many elements of the material texture array to write.
+    ///
+    /// Every slot when the device cannot leave one unwritten, and only the
+    /// textures that exist when it can. Paired with
+    /// [`mark_texture_array_partial`](Self::mark_texture_array_partial): the
+    /// short write is only legal on a layout that declared the binding
+    /// partially bound, so the two must read the same flag, which is why
+    /// neither takes it as an argument.
+    pub fn texture_array_len(&self, loaded: usize) -> usize {
+        if self.partially_bound {
+            loaded.min(crate::gfx::MAX_TEXTURES)
+        } else {
+            crate::gfx::MAX_TEXTURES
+        }
+    }
+
+    /// Declare `set`'s binding 0 — the material texture array, in each of the
+    /// three layouts that has one — as partially bound, when the device allows
+    /// it.
+    ///
+    /// A no-op on a pipeline whose shaders never declared the set, so the plain
+    /// shadow pipeline (depth only, no material sampling) can be handed the same
+    /// call as the masked one it shares a pass with.
+    pub fn mark_texture_array_partial(
+        &self,
+        layout: &mut PipelineDescriptorSetLayoutCreateInfo,
+        set: usize,
+    ) {
+        if !self.partially_bound {
+            return;
+        }
+        if let Some(binding) = layout
+            .set_layouts
+            .get_mut(set)
+            .and_then(|set_layout| set_layout.bindings.get_mut(&0))
+        {
+            binding.binding_flags |= DescriptorBindingFlags::PARTIALLY_BOUND;
+        }
+    }
+
     /// `surface` is `None` for an offscreen context — one that renders into an
     /// ordinary image and never presents. The only thing it changes is device
     /// selection: with no surface there is nothing to ask for presentation
@@ -54,6 +112,15 @@ impl VkContext {
             .image_view_format_swizzle;
 
         let anisotropy = physical_device.supported_features().sampler_anisotropy;
+
+        // Promoted to core in 1.2, and only read there: reaching it through
+        // `VK_EXT_descriptor_indexing` on a 1.1 device would drag in that
+        // extension's own dependencies for a device old enough that the filled
+        // array is the safer shape anyway.
+        let partially_bound = physical_device.api_version() >= Version::V1_2
+            && physical_device
+                .supported_features()
+                .descriptor_binding_partially_bound;
 
         // Without it every attachment of a pipeline must blend identically, and
         // the transparency accumulation's two do not: one sums and the other
@@ -93,6 +160,7 @@ impl VkContext {
                     image_view_format_swizzle: swizzle,
                     sampler_anisotropy: anisotropy,
                     independent_blend: true,
+                    descriptor_binding_partially_bound: partially_bound,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
@@ -117,6 +185,7 @@ impl VkContext {
             memory_allocator,
             command_buffer_allocator,
             descriptor_set_allocator,
+            partially_bound,
         }
     }
 

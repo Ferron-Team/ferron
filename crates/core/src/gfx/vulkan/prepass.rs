@@ -47,6 +47,12 @@ use super::context::VkContext;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
+/// Where `prepass.frag` declares the material texture array. One set later than
+/// the forward pass's, because this pipeline carries a frame block the other
+/// takes from set 0 — the array itself is binding 0 of it either way, which is
+/// what [`VkContext::mark_texture_array_partial`] assumes.
+const TEXTURE_SET: usize = 3;
+
 pub(super) const NORMAL_FORMAT: Format = Format::R8G8B8A8_UNORM;
 
 /// `rgb` = the surface's normal-incidence specular colour, `a` = perceptual
@@ -111,13 +117,13 @@ impl GeometryPrepass {
         let device = &ctx.device;
         let render_pass = build_render_pass(device);
         let pipeline = build_pipeline(
-            device,
+            ctx,
             &render_pass,
             prepass_fs::load(device.clone()).unwrap(),
             false,
         );
         let masked_pipeline = build_pipeline(
-            device,
+            ctx,
             &render_pass,
             prepass_fs_masked::load(device.clone()).unwrap(),
             true,
@@ -223,7 +229,7 @@ impl GeometryPrepass {
         textures: &[Arc<ImageView>],
     ) -> Arc<DescriptorSet> {
         let default_view = textures[0].clone();
-        let texture_array = (0..crate::gfx::MAX_TEXTURES).map(|index| {
+        let texture_array = (0..ctx.texture_array_len(textures.len())).map(|index| {
             textures
                 .get(index)
                 .cloned()
@@ -231,7 +237,7 @@ impl GeometryPrepass {
         });
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[3].clone(),
+            self.pipeline.layout().set_layouts()[TEXTURE_SET].clone(),
             [
                 WriteDescriptorSet::image_view_array(0, 0, texture_array),
                 WriteDescriptorSet::sampler(1, self.sampler.clone()),
@@ -352,11 +358,12 @@ fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
 }
 
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     render_pass: &Arc<RenderPass>,
     fragment: Arc<vulkano::shader::ShaderModule>,
     masked: bool,
 ) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = prepass_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -367,9 +374,11 @@ fn build_pipeline(
         PipelineShaderStageCreateInfo::new(vs),
         PipelineShaderStageCreateInfo::new(fs),
     ];
+    let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
+    ctx.mark_texture_array_partial(&mut layout_info, TEXTURE_SET);
     let layout = PipelineLayout::new(
         device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+        layout_info
             .into_pipeline_layout_create_info(device.clone())
             .unwrap(),
     )

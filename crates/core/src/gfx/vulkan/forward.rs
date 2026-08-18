@@ -30,8 +30,8 @@ use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, MAX_SHADOW_LIGHTS, Shadow
 use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
 use crate::gfx::{
-    BlendMode, DecalInstance, DrawList, MAX_DECALS, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS,
-    MAX_TEXTURES, Material, SceneLighting, Vertex,
+    BlendMode, DecalInstance, DrawList, MAX_DECALS, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, Material,
+    SceneLighting, Vertex,
 };
 use crate::scene::{Camera, EnvironmentSettings};
 
@@ -108,6 +108,12 @@ pub(super) struct GpuObject {
 /// handed the same five descriptor sets.
 pub(super) const SHADOW_SET: usize = 3;
 pub(super) const SHADOW_SAMPLER_BINDING: u32 = 2;
+
+/// Where `shading.glsl` declares the material texture array, and by hand for the
+/// same reason [`SHADOW_SET`] is: what is patched into the layout after
+/// reflection cannot be derived from it. Binding 0 of the set, which is what
+/// [`VkContext::mark_texture_array_partial`] assumes.
+pub(super) const TEXTURE_SET: usize = 2;
 
 /// Default texture indices, matching the order `VulkanRenderer::new` seeds them.
 const WHITE_TEXTURE: u32 = 0;
@@ -619,11 +625,9 @@ pub struct ForwardPass {
 }
 
 impl ForwardPass {
-    pub fn new(
-        device: &Arc<Device>,
-        memory_allocator: &Arc<StandardMemoryAllocator>,
-        color_format: Format,
-    ) -> Self {
+    pub fn new(ctx: &VkContext, color_format: Format) -> Self {
+        let device = &ctx.device;
+        let memory_allocator = &ctx.memory_allocator;
         let render_pass = vulkano::single_pass_renderpass!(
             device.clone(),
             attachments: {
@@ -707,28 +711,28 @@ impl ForwardPass {
         // One sampler for all four pipelines. See `build_pipeline`.
         let shadow_sampler = super::shadow::comparison_sampler(device);
         let pipeline = build_pipeline(
-            device,
+            ctx,
             &render_pass,
             fs::load(device.clone()).unwrap(),
             &shadow_sampler,
             false,
         );
         let subsurface_pipeline = build_pipeline(
-            device,
+            ctx,
             &subsurface_render_pass,
             fs_sss::load(device.clone()).unwrap(),
             &shadow_sampler,
             false,
         );
         let masked_pipeline = build_pipeline(
-            device,
+            ctx,
             &render_pass,
             fs::load(device.clone()).unwrap(),
             &shadow_sampler,
             true,
         );
         let masked_subsurface_pipeline = build_pipeline(
-            device,
+            ctx,
             &subsurface_render_pass,
             fs_sss::load(device.clone()).unwrap(),
             &shadow_sampler,
@@ -870,7 +874,7 @@ impl ForwardPass {
         textures: &[Arc<ImageView>],
     ) -> Arc<DescriptorSet> {
         let default_view = textures[0].clone();
-        let texture_array = (0..MAX_TEXTURES).map(|i| {
+        let texture_array = (0..ctx.texture_array_len(textures.len())).map(|i| {
             textures
                 .get(i)
                 .cloned()
@@ -878,7 +882,7 @@ impl ForwardPass {
         });
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[2].clone(),
+            self.pipeline.layout().set_layouts()[TEXTURE_SET].clone(),
             [
                 WriteDescriptorSet::image_view_array(0, 0, texture_array),
                 WriteDescriptorSet::sampler(1, self.sampler.clone()),
@@ -1538,7 +1542,7 @@ pub(super) fn vertex_shader(device: &Arc<Device>) -> vulkano::shader::EntryPoint
 /// [`ForwardPass::pipeline_layout`], and the five descriptor sets the executor
 /// binds are bound once for whichever opaque variant ran.
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     render_pass: &Arc<RenderPass>,
     fragment: Arc<vulkano::shader::ShaderModule>,
     // Passed in rather than made here, and that is the whole reason this parameter
@@ -1558,6 +1562,7 @@ fn build_pipeline(
     // is masked and one that is not are shaded by the same code.
     masked: bool,
 ) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = vertex_shader(device);
     let fs = fragment.entry_point("main").unwrap();
 
@@ -1578,6 +1583,11 @@ fn build_pipeline(
         .get_mut(&SHADOW_SAMPLER_BINDING)
         .expect("forward.frag must declare the shadow comparison sampler")
         .immutable_samplers = vec![shadow_sampler.clone()];
+    // The material textures, of which a scene writes only the ones it loaded.
+    // Set here rather than beside the write, because it is the *layout* the
+    // short write is legal against — and this layout is also the one the
+    // transparency and refraction pipelines lift, so both inherit it.
+    ctx.mark_texture_array_partial(&mut layout_info, TEXTURE_SET);
 
     let layout = PipelineLayout::new(
         device.clone(),

@@ -37,6 +37,11 @@ use super::VulkanRenderer;
 use super::context::VkContext;
 use super::swapchain::DEPTH_FORMAT;
 
+/// Where `shadow.frag` declares the material texture array, in the masked
+/// variant that alpha-tests; the plain one declares no such set. Binding 0 of
+/// it, which is what [`VkContext::mark_texture_array_partial`] assumes.
+const TEXTURE_SET: usize = 2;
+
 /// Per-run push constants: 68 bytes, comfortably inside the 128-byte guaranteed
 /// `maxPushConstantsSize`. The cascade's matrix rides here rather than in a
 /// uniform buffer because it changes once per pass, not once per draw.
@@ -98,8 +103,8 @@ impl ShadowPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
         let render_pass = depth_only_render_pass(device);
-        let pipeline = build_pipeline(device, &render_pass, false);
-        let masked_pipeline = build_pipeline(device, &render_pass, true);
+        let pipeline = build_pipeline(ctx, &render_pass, false);
+        let masked_pipeline = build_pipeline(ctx, &render_pass, true);
 
         Self {
             render_pass,
@@ -168,7 +173,7 @@ impl ShadowPass {
         sampler: &Arc<Sampler>,
     ) -> Arc<DescriptorSet> {
         let default_view = textures[0].clone();
-        let texture_array = (0..crate::gfx::MAX_TEXTURES).map(|index| {
+        let texture_array = (0..ctx.texture_array_len(textures.len())).map(|index| {
             textures
                 .get(index)
                 .cloned()
@@ -176,7 +181,7 @@ impl ShadowPass {
         });
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
-            self.masked_pipeline.layout().set_layouts()[2].clone(),
+            self.masked_pipeline.layout().set_layouts()[TEXTURE_SET].clone(),
             [
                 WriteDescriptorSet::image_view_array(0, 0, texture_array),
                 WriteDescriptorSet::sampler(1, sampler.clone()),
@@ -453,10 +458,11 @@ fn depth_only_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
 }
 
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     render_pass: &Arc<RenderPass>,
     masked: bool,
 ) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let (vs, fs) = if masked {
         (
             vs_masked::load(device.clone()).unwrap(),
@@ -476,9 +482,14 @@ fn build_pipeline(
         PipelineShaderStageCreateInfo::new(vs),
         PipelineShaderStageCreateInfo::new(fs),
     ];
+    // Only the masked variant samples anything — the plain one writes depth and
+    // nothing else — so on that pipeline this finds no set to mark and does
+    // nothing, which is why it can be called unconditionally.
+    let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
+    ctx.mark_texture_array_partial(&mut layout_info, TEXTURE_SET);
     let layout = PipelineLayout::new(
         device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+        layout_info
             .into_pipeline_layout_create_info(device.clone())
             .unwrap(),
     )
