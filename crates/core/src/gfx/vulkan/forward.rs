@@ -32,7 +32,7 @@ use vulkano::render_pass::{
 use vulkano::image::ImageLayout;
 
 use crate::geom::Aabb;
-use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, MAX_SHADOW_LIGHTS, ShadowAtlas};
+use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
 use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
 use crate::gfx::{
@@ -43,6 +43,7 @@ use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
 use super::fog::GpuFog;
+use super::instances::GpuObject;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
@@ -83,25 +84,6 @@ impl PushConstants {
             object_base,
         }
     }
-}
-
-/// Per-object transforms, indexed by [`PushConstants::object_index`] from a
-/// storage buffer (set 4). std430 matches this `#[repr(C)]` layout exactly
-/// because every field is a 64-byte `mat4` (a multiple of 16).
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
-#[repr(C)]
-pub(super) struct GpuObject {
-    model: [[f32; 4]; 4],
-    /// Inverse-transpose of `model`'s rotation/scale, for transforming normals
-    /// correctly under non-uniform scaling. Stored as a mat4; only the upper-left
-    /// 3x3 is used in the shader.
-    normal_matrix: [[f32; 4]; 4],
-    /// Last frame's `model`, for the motion vector the prepass writes. Uploaded
-    /// for every pass rather than only the one that reads it: the buffer is
-    /// shared, so the row's stride is shared too, and a second layout for the
-    /// passes that ignore this field would be two ways for one object row to be
-    /// wrong.
-    prev_model: [[f32; 4]; 4],
 }
 
 /// Where `forward.frag` declares the cascade comparison sampler. It is bound
@@ -556,21 +538,6 @@ impl GpuShadowFace {
     };
 }
 
-/// This frame's per-object rows, and where each list's block begins in them.
-///
-/// One buffer for every geometry pass in the frame, which is what
-/// `object_transforms` says in the graph. The opaque camera list indexes from
-/// zero and needs no base.
-pub(super) struct ObjectRows {
-    pub buffer: Subbuffer<[GpuObject]>,
-    /// Where the blended items' rows start.
-    pub transparent_base: u32,
-    /// Where the refractive items' rows start.
-    pub refractive_base: u32,
-    pub cascade_bases: [u32; MAX_CASCADES],
-    pub punctual_bases: [u32; MAX_SHADOW_LIGHTS],
-}
-
 /// The five descriptor sets a pass shading into the lit frame binds, in bind
 /// order.
 ///
@@ -653,8 +620,6 @@ pub struct ForwardPass {
     /// more of the lighting uniform: forty-eight matrices is three kilobytes,
     /// and the guaranteed uniform-buffer range is sixteen.
     shadow_face_allocator: SubbufferAllocator,
-    /// Per-frame streaming allocator for the set-4 per-object transform buffer.
-    object_buffer_allocator: SubbufferAllocator,
     /// Per-frame storage for the decal block. Owned here rather than by a decal
     /// module because there is no decal *pass* to own it — the block is frame
     /// data that two existing passes read, which is exactly what the shadow face
@@ -843,16 +808,6 @@ impl ForwardPass {
             },
         );
 
-        let object_buffer_allocator = SubbufferAllocator::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
-
         let shadow_face_allocator = SubbufferAllocator::new(
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -909,7 +864,6 @@ impl ForwardPass {
             multisampled,
             single,
             uniform_buffer_allocator,
-            object_buffer_allocator,
             shadow_face_allocator,
             decal_allocator,
             sampler,
@@ -937,12 +891,16 @@ impl ForwardPass {
     pub(super) fn build_object_set(
         &self,
         ctx: &VkContext,
-        objects: &Subbuffer<[GpuObject]>,
+        rows: &Subbuffer<[GpuObject]>,
+        indices: &Subbuffer<[u32]>,
     ) -> Arc<DescriptorSet> {
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
             self.single.plain.layout().set_layouts()[4].clone(),
-            [WriteDescriptorSet::buffer(0, objects.clone())],
+            [
+                WriteDescriptorSet::buffer(0, rows.clone()),
+                WriteDescriptorSet::buffer(1, indices.clone()),
+            ],
             [],
         )
         .unwrap()
@@ -1056,79 +1014,6 @@ impl ForwardPass {
             }
         }
         buffer
-    }
-
-    /// Build this frame's per-object rows, written straight into the mapped
-    /// subbuffer. Shared by every geometry pass in the frame: they need the same
-    /// rows, and the allocator recycles the storage frame to frame.
-    ///
-    /// One row per item, including items whose mesh is missing, so a run's
-    /// object rows stay contiguous and a run's base is just its start.
-    ///
-    /// The opaque `visible` items go first so the forward and prepass passes
-    /// keep indexing from zero; the blended ones follow, then each cascade's
-    /// casters, then each punctual light's, and the returned bases say where.
-    /// One buffer rather than one per list is what keeps `object_transforms` a
-    /// single resource in the graph rather than a convenient fiction.
-    pub(super) fn upload_objects(
-        &self,
-        visible: DrawList<'_>,
-        transparent: DrawList<'_>,
-        refractive: DrawList<'_>,
-        casters: &[DrawList<'_>],
-        punctual: &[DrawList<'_>],
-    ) -> ObjectRows {
-        let total: usize = visible.len()
-            + transparent.len()
-            + refractive.len()
-            + casters.iter().map(DrawList::len).sum::<usize>()
-            + punctual.iter().map(DrawList::len).sum::<usize>();
-        // allocate_slice rejects length 0; an empty scene still needs a bindable
-        // buffer, so round up to one (unwritten, unread) slot.
-        let buffer = self
-            .object_buffer_allocator
-            .allocate_slice::<GpuObject>(total.max(1) as u64)
-            .unwrap();
-
-        let transparent_base;
-        let refractive_base;
-        let mut cascade_bases = [0u32; MAX_CASCADES];
-        let mut punctual_bases = [0u32; MAX_SHADOW_LIGHTS];
-        {
-            let mut rows = buffer.write().unwrap();
-            let mut next = 0usize;
-            let mut write = |list: &DrawList<'_>, next: &mut usize| {
-                for i in 0..list.len() {
-                    let item = list.item(i);
-                    rows[*next] = GpuObject {
-                        model: item.model.to_cols_array_2d(),
-                        normal_matrix: Mat4::from_mat3(item.normal_matrix).to_cols_array_2d(),
-                        prev_model: item.prev_model.to_cols_array_2d(),
-                    };
-                    *next += 1;
-                }
-            };
-            write(&visible, &mut next);
-            transparent_base = next as u32;
-            write(&transparent, &mut next);
-            refractive_base = next as u32;
-            write(&refractive, &mut next);
-            for (base, list) in cascade_bases.iter_mut().zip(casters) {
-                *base = next as u32;
-                write(list, &mut next);
-            }
-            for (base, list) in punctual_bases.iter_mut().zip(punctual) {
-                *base = next as u32;
-                write(list, &mut next);
-            }
-        }
-        ObjectRows {
-            buffer,
-            transparent_base,
-            refractive_base,
-            cascade_bases,
-            punctual_bases,
-        }
     }
 
     /// Build the five descriptor sets both passes into the lit frame bind, and

@@ -37,7 +37,8 @@ layout(location = 7) out vec3 v_view_pos;
 layout(location = 8) out vec3 v_world_pos;
 
 layout(push_constant) uniform Push {
-    // First object row of this instanced run; gl_InstanceIndex counts from it.
+    // Where this instanced run starts in `instances`; gl_InstanceIndex counts
+    // from it, and the entry found there is the object's row.
     uint object_base;
     // Row of the material table this run draws with; read by the fragment stage.
     uint material_index;
@@ -74,8 +75,17 @@ layout(set = 1, binding = 0, std430) readonly buffer Objects {
     Object objects[];
 };
 
+// This pass's slice of the frame's draw order, as row numbers into `objects`.
+// The indirection is what lets a row be shared: an object the camera sees and
+// four cascades also draw occupies one row named five times, rather than five
+// copies of the same three matrices. `push.object_base` is where this run's
+// slice starts. See `vulkan::instances`.
+layout(set = 1, binding = 1, std430) readonly buffer Instances {
+    uint instances[];
+};
+
 void main() {
-    uint object = push.object_base + uint(gl_InstanceIndex);
+    uint object = instances[push.object_base + uint(gl_InstanceIndex)];
     mat4 model = objects[object].model;
 
     // Same construction as forward.vert, one space along: Gram-Schmidt against

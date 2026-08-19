@@ -181,6 +181,7 @@ pub fn extract_geometry(
     let punctual = &atlas.casters[..atlas.casters.len().min(MAX_SHADOW_LIGHTS)];
     let mut total = 0usize;
 
+    let sweep = crate::profile::scope("sweep");
     world
         .query::<(&WorldTransform, &MeshHandle, Option<&MaterialHandle>)>()
         .for_each(|entity, (transform, mesh, material)| {
@@ -243,6 +244,10 @@ pub fn extract_geometry(
                 bounds: world_bounds,
                 mesh: *mesh,
                 material,
+                // The entity's own slot, which is what makes the row persistent:
+                // it is the same number next frame, so a row the GPU already
+                // holds does not have to be written again.
+                instance: entity.index(),
             });
 
             if visible {
@@ -270,9 +275,12 @@ pub fn extract_geometry(
             }
         });
 
+    drop(sweep);
+
     // Grouping by mesh lets the passes bind vertex/index buffers once per run
     // instead of once per draw, and collapse each run into a single instanced
     // draw.
+    let sorting = crate::profile::scope("sort");
     let key = |items: &[RenderItem], index: &u32| {
         let item = &items[*index as usize];
         (item.mesh.0, item.material.0)
@@ -291,11 +299,14 @@ pub fn extract_geometry(
         list.sort_unstable_by_key(|i| key(&out.items, i));
     }
 
+    drop(sorting);
+
     // Within the grouping, order the runs front to back. Opaque geometry is
     // depth-tested, so this changes no pixel — it changes how many fragments
     // reach the shader, since a nearer run already in the depth buffer rejects
     // the ones behind it before they shade. Runs move whole, so every run is
     // still one instanced draw.
+    let ordering = crate::profile::scope("order runs");
     if let Some(camera) = camera.as_ref() {
         order_runs_front_to_back(&out.items, &mut out.visible, camera.position);
         // The opposite order, and for the opposite reason. Front to back above
@@ -306,6 +317,8 @@ pub fn extract_geometry(
         order_runs_front_to_back(&out.items, &mut out.refractive, camera.position);
         out.refractive.reverse();
     }
+
+    drop(ordering);
 
     out.motion.end();
 

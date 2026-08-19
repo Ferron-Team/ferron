@@ -8,6 +8,7 @@ mod fog;
 mod forward;
 pub mod frame;
 mod hdr;
+mod instances;
 mod line;
 mod motion_blur;
 mod oit;
@@ -57,6 +58,7 @@ use self::contact_shadows::ContactShadowPass;
 use self::context::VkContext;
 use self::environment::EnvironmentPass;
 use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
+use self::instances::InstanceStore;
 use self::oit::OitPass;
 use self::refraction::RefractionPass;
 use crate::gfx::graph::{PassKind, ResourceId};
@@ -133,6 +135,11 @@ pub struct VulkanRenderer {
     pub(crate) ctx: VkContext,
     swapchain: SwapchainState,
     forward: ForwardPass,
+    /// The per-object matrices, which live on the GPU between frames rather than
+    /// being repacked into a fresh buffer every one. Owned here rather than by
+    /// the forward pass because every geometry pass in the frame reads the same
+    /// rows, and no one of them is the owner. See `instances`.
+    instances: InstanceStore,
     hdr: HdrPass,
     /// Owns the histogram and exposure buffers the graph imports, and records
     /// the two dispatches that fill them.
@@ -364,6 +371,7 @@ impl VulkanRenderer {
         );
 
         Self {
+            instances: InstanceStore::new(&ctx),
             ctx,
             swapchain,
             forward,
@@ -1035,19 +1043,45 @@ impl VulkanRenderer {
         let prepass_material_set = self.prepass_material_set.clone().unwrap();
         let prepass_texture_set = self.prepass_texture_set.clone().unwrap();
 
-        // One upload feeding every geometry pass in the frame — the geometry
-        // prepass, the forward pass, and each cascade — because the per-object
-        // inverse-transpose is too expensive to compute more than once. The
-        // camera-visible items come first, so the two screen-space passes still
-        // index from zero and the cascades index from `objects.cascade_bases`.
+        // Every list a frame draws is an ordering over one shared `RenderItem`
+        // array, so any non-empty list carries the whole of it. Taking the
+        // longest rather than the camera's is what keeps a frame that culled
+        // everything on screen — but still casts shadows — from syncing nothing.
         let no_casters: [DrawList<'_>; 0] = [];
-        let objects = self.forward.upload_objects(
+        let items = [draws, transparent, refractive]
+            .into_iter()
+            .chain(shadows.map_or(&no_casters[..], |s| s.casters).iter().copied())
+            .chain(
+                shadows
+                    .map_or(&no_casters[..], |s| s.punctual_casters)
+                    .iter()
+                    .copied(),
+            )
+            .map(|list| list.items)
+            .max_by_key(|items| items.len())
+            .unwrap_or(&[]);
+
+        // The matrices themselves, brought up to date in place: only the rows
+        // whose object actually moved are written, and the copy that carries
+        // them is recorded here — at the top of the frame's command buffer,
+        // ahead of every pass that reads them.
+        self.instances.sync(&self.ctx, &mut builder, items);
+
+        // The draw orders, as row numbers into those rows. Still per frame,
+        // because the orders are: what the camera can see and what casts into
+        // each cascade is a different answer every frame even when nothing
+        // moved. Four bytes an entry rather than the 192 the matrices took.
+        // The camera-visible items come first, so the two screen-space passes
+        // still index from zero and the cascades index from
+        // `objects.cascade_bases`.
+        let objects = self.instances.upload_lists(
             draws,
             transparent,
             refractive,
             shadows.map_or(&no_casters, |s| s.casters),
             shadows.map_or(&no_casters, |s| s.punctual_casters),
         );
+        let object_rows = self.instances.rows().clone();
 
         // One set per pipeline layout per frame, rather than one per pass. The
         // buffer is a fresh subbuffer each frame so none of these can be cached
@@ -1056,12 +1090,16 @@ impl VulkanRenderer {
         // cascade, which is where the duplication actually was. They are kept
         // separate rather than shared because set compatibility is a property of
         // the layout each pipeline declares, not of the buffer written into it.
-        let forward_object_set = self.forward.build_object_set(&self.ctx, &objects.buffer);
+        let forward_object_set =
+            self.forward
+                .build_object_set(&self.ctx, &object_rows, &objects.indices);
         // One block for the whole frame, bound by the forward pass's set 0 and
         // the prepass's alike. See `ForwardPass::upload_decals`.
         let decal_block = self.forward.upload_decals(decals);
         let caster_sets = shadows.is_some().then(|| shadow::CasterSets {
-            objects: self.shadow.build_object_set(&self.ctx, &objects.buffer),
+            objects: self
+                .shadow
+                .build_object_set(&self.ctx, &object_rows, &objects.indices),
             materials: self.shadow_material_set.clone().unwrap(),
             textures: self.shadow_texture_set.clone().unwrap(),
         });
@@ -1069,7 +1107,10 @@ impl VulkanRenderer {
             .frame
             .ids
             .prepass
-            .map(|_| self.prepass.build_object_set(&self.ctx, &objects.buffer));
+            .map(|_| {
+                self.prepass
+                    .build_object_set(&self.ctx, &object_rows, &objects.indices)
+            });
 
         // Uploaded once even though the prepass and the SSAO resolve both read
         // it — which is what the shared `object_transforms` declaration in

@@ -40,6 +40,7 @@ use crate::gfx::{DrawList, Vertex};
 
 use super::VulkanRenderer;
 use super::context::VkContext;
+use super::instances::GpuObject;
 use super::swapchain::DEPTH_FORMAT;
 
 /// Where `shadow.frag` declares the material texture array, in the masked
@@ -166,12 +167,16 @@ impl ShadowPass {
     pub(super) fn build_object_set(
         &self,
         ctx: &VkContext,
-        objects: &Subbuffer<[super::forward::GpuObject]>,
+        rows: &Subbuffer<[GpuObject]>,
+        indices: &Subbuffer<[u32]>,
     ) -> Arc<DescriptorSet> {
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
             self.pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::buffer(0, objects.clone())],
+            [
+                WriteDescriptorSet::buffer(0, rows.clone()),
+                WriteDescriptorSet::buffer(1, indices.clone()),
+            ],
             [],
         )
         .unwrap()

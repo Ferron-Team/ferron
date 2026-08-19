@@ -5,6 +5,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -28,6 +29,7 @@
   ! msaa_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
   ! hdr_color Undefined->TransferDstOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      msaa_hdr ColorAttachment
      msaa_depth DepthAttachment
@@ -130,6 +132,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -155,6 +158,7 @@
   ! msaa_subsurface Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! subsurface_diffusible Undefined->TransferDstOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      msaa_hdr ColorAttachment
      msaa_depth DepthAttachment
@@ -278,6 +282,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -300,6 +305,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
@@ -399,18 +405,22 @@
 00 pass shadow_cascade_0 [Inline]
   ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 01 pass shadow_cascade_1 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 02 pass shadow_cascade_2 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 03 pass shadow_cascade_3 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 04 pass geometry_prepass [Inline]
   ! prepass_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -418,6 +428,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -441,6 +452,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      shadow_cascades Sampled
      hdr_color ColorAttachment
@@ -534,6 +546,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -542,6 +555,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth DepthStencilAttachmentOptimal->DepthStencilReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
 02 pass luminance_histogram [Compute]
@@ -571,6 +585,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -579,6 +594,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth DepthStencilAttachmentOptimal->DepthStencilReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
 02 pass taa_resolve [Compute]
@@ -680,6 +696,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -702,6 +719,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
@@ -786,6 +804,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -808,6 +827,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
@@ -842,18 +862,22 @@
 00 pass shadow_cascade_0 [Inline]
   ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 01 pass shadow_cascade_1 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 02 pass shadow_cascade_2 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 03 pass shadow_cascade_3 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 04 pass geometry_prepass [Inline]
   ! prepass_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -861,6 +885,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -894,6 +919,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      shadow_cascades Sampled
      fog_volume Sampled
@@ -903,6 +929,7 @@
   ! oit_accum Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! oit_reveal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      shadow_cascades Sampled
      fog_volume Sampled
@@ -1017,6 +1044,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -1039,6 +1067,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
@@ -1188,6 +1217,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -1196,6 +1226,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth DepthStencilAttachmentOptimal->DepthStencilReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
 02 pass dof_prefilter [Compute]
@@ -1336,6 +1367,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -1358,6 +1390,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
@@ -1489,6 +1522,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -1497,6 +1531,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth DepthStencilAttachmentOptimal->DepthStencilReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
 02 pass ssr_hiz [Compute]
@@ -1616,18 +1651,22 @@
 00 pass shadow_cascade_0 [Inline]
   ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 01 pass shadow_cascade_1 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 02 pass shadow_cascade_2 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 03 pass shadow_cascade_3 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 04 pass geometry_prepass [Inline]
   ! prepass_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -1635,6 +1674,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -1664,6 +1704,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      contact_shadow_mask Sampled
      shadow_cascades Sampled
@@ -1768,6 +1809,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -1784,6 +1826,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      contact_shadow_mask Sampled
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
@@ -1803,22 +1846,27 @@
 00 pass shadow_cascade_0 [Inline]
   ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 01 pass shadow_cascade_1 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 02 pass shadow_cascade_2 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 03 pass shadow_cascade_3 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 04 pass punctual_shadows [Inline]
   ! shadow_atlas Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_atlas DepthAttachment
 05 pass geometry_prepass [Inline]
   ! prepass_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -1826,6 +1874,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -1856,6 +1905,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      contact_shadow_mask Sampled
      shadow_cascades Sampled
@@ -1958,6 +2008,7 @@
 00 pass punctual_shadows [Inline]
   ! shadow_atlas Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_atlas DepthAttachment
 01 pass geometry_prepass [Inline]
   ! prepass_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -1965,6 +2016,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -1974,6 +2026,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth DepthStencilAttachmentOptimal->DepthStencilReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_atlas Sampled
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
@@ -2063,18 +2116,22 @@
 00 pass shadow_cascade_0 [Inline]
   ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 01 pass shadow_cascade_1 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 02 pass shadow_cascade_2 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 03 pass shadow_cascade_3 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 04 pass geometry_prepass [Inline]
   ! prepass_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -2082,6 +2139,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -2111,6 +2169,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      contact_shadow_mask Sampled
      shadow_cascades Sampled
@@ -2151,6 +2210,7 @@
   ! oit_reveal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      contact_shadow_mask Sampled
      shadow_cascades Sampled
@@ -2293,6 +2353,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -2301,12 +2362,14 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth DepthStencilAttachmentOptimal->DepthStencilReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
 02 pass oit_accumulate [Inline]
   ! oit_accum Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! oit_reveal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      oit_accum ColorAttachment
      oit_reveal ColorAttachment
      prepass_depth DepthAttachmentRead
@@ -2335,18 +2398,22 @@
 00 pass shadow_cascade_0 [Inline]
   ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 01 pass shadow_cascade_1 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 02 pass shadow_cascade_2 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 03 pass shadow_cascade_3 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 04 pass geometry_prepass [Inline]
   ! prepass_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -2354,6 +2421,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -2383,6 +2451,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      contact_shadow_mask Sampled
      shadow_cascades Sampled
@@ -2423,6 +2492,7 @@
   ! oit_reveal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      contact_shadow_mask Sampled
      shadow_cascades Sampled
@@ -2447,6 +2517,7 @@
   ! refraction_scene General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! refraction_accum Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      refraction_scene Sampled
      oit_color Sampled
      ssao_ao Sampled
@@ -2587,6 +2658,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -2595,6 +2667,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth DepthStencilAttachmentOptimal->DepthStencilReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
 02 pass refraction_scene [Compute]
@@ -2606,6 +2679,7 @@
   ! refraction_scene General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! refraction_accum Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      refraction_scene Sampled
      hdr_color Sampled
      refraction_accum ColorAttachment
@@ -2632,18 +2706,22 @@
 00 pass shadow_cascade_0 [Inline]
   ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 01 pass shadow_cascade_1 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 02 pass shadow_cascade_2 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 03 pass shadow_cascade_3 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 04 pass geometry_prepass [Inline]
   ! prepass_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -2651,6 +2729,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -2681,6 +2760,7 @@
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
   ! subsurface_diffusible Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      contact_shadow_mask Sampled
      shadow_cascades Sampled
@@ -2834,6 +2914,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -2843,6 +2924,7 @@
   ! prepass_depth DepthStencilAttachmentOptimal->DepthStencilReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
   ! subsurface_diffusible Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      hdr_color ColorAttachment
      prepass_depth DepthAttachmentRead
      subsurface_diffusible ColorAttachment
@@ -2882,10 +2964,12 @@
 00 pass shadow_cascade_0 [Inline]
   ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 01 pass shadow_cascade_1 [Inline]
   ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      shadow_cascades DepthAttachment
 02 pass geometry_prepass [Inline]
   ! prepass_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -2893,6 +2977,7 @@
   ! prepass_material Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
+     instance_index StorageRead
      prepass_normal ColorAttachment
      prepass_velocity ColorAttachment
      prepass_material ColorAttachment
@@ -2916,6 +3001,7 @@
   ! hdr_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
+     instance_index StorageRead
      ssao_ao Sampled
      shadow_cascades Sampled
      hdr_color ColorAttachment

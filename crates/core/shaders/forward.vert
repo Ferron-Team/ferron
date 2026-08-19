@@ -18,7 +18,8 @@ layout(location = 5) out vec3 v_color;
 layout(push_constant) uniform Push {
     mat4 view_proj;
     uint material_index;
-    // First object row of this instanced run; gl_InstanceIndex counts from it.
+    // Where this instanced run starts in `instances`; gl_InstanceIndex counts
+    // from it, and the entry found there is the object's row.
     uint object_base;
 } push;
 
@@ -33,6 +34,15 @@ layout(set = 4, binding = 0, std430) readonly buffer Objects {
     Object objects[];
 };
 
+// This pass's slice of the frame's draw order, as row numbers into `objects`.
+// The indirection is what lets a row be shared: an object the camera sees and
+// four cascades also draw occupies one row named five times, rather than five
+// copies of the same three matrices. `push.object_base` is where this run's
+// slice starts. See `vulkan::instances`.
+layout(set = 4, binding = 1, std430) readonly buffer Instances {
+    uint instances[];
+};
+
 // The other half of the depth-invariance guarantee `prepass.vert` documents:
 // with MSAA off this pass attaches the prepass depth read-only and tests
 // `EQUAL` against it, so `push.view_proj * world` here and `frame.view_proj *
@@ -40,7 +50,7 @@ layout(set = 4, binding = 0, std430) readonly buffer Objects {
 invariant gl_Position;
 
 void main() {
-    uint object = push.object_base + uint(gl_InstanceIndex);
+    uint object = instances[push.object_base + uint(gl_InstanceIndex)];
     mat4 model = objects[object].model;
     mat4 normal_matrix = objects[object].normal_matrix;
 

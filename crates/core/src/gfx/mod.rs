@@ -59,6 +59,13 @@ pub struct RenderItem {
     pub bounds: Aabb,
     pub mesh: MeshHandle,
     pub material: MaterialHandle,
+    /// Which row of the persistent instance buffer holds this object's
+    /// matrices: the entity's slot, which is stable for as long as the entity
+    /// lives. Every list that draws this object names the same row, so an
+    /// object in the camera's list and in four cascades occupies one row rather
+    /// than five, and a row survives the frames in which nothing about it
+    /// changed. See `vulkan::instances::InstanceStore`.
+    pub instance: u32,
 }
 
 /// One pass's draw order over a shared item array.
@@ -703,6 +710,7 @@ mod draw_list_tests {
             },
             mesh: MeshHandle(mesh),
             material: MaterialHandle(material),
+            instance: 0,
         }
     }
 

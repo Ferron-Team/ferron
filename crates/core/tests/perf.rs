@@ -173,6 +173,8 @@ fn frame_cost() {
     profile::set_gpu_passes_enabled(gpu_passes);
 
     let mut entities = 0usize;
+    let mut draws = 0usize;
+    let mut entries = 0usize;
     for frame in 0..frames + WARMUP {
         // The engine throws its numbers away for the first few frames; so does
         // this, by restarting the profiler once the transient is over.
@@ -214,6 +216,31 @@ fn frame_cost() {
                 systems::extract_geometry(&world, aspect, &cascade_set, &atlas, &mut geometry);
             }
             entities = geometry.visible().len();
+            // What the CPU actually records: one `draw_indexed` per maximal
+            // (mesh, material) run, per list. The entity count says how much
+            // there is to draw; this says how many commands saying so the
+            // recording costs, which is the number the per-draw work scales
+            // with.
+            // Every entry of every list, which is what the frame used to
+            // upload a 192-byte object row for and now uploads four bytes of
+            // row number for. Larger than the entity count because an object
+            // the camera sees and four cascades also draw appears in five.
+            entries = geometry.visible().len()
+                + geometry.transparent().len()
+                + geometry.refractive().len()
+                + (0..MAX_CASCADES).map(|i| geometry.cascade(i).len()).sum::<usize>()
+                + (0..MAX_SHADOW_LIGHTS)
+                    .map(|i| geometry.punctual(i).len())
+                    .sum::<usize>();
+            draws = geometry.visible().runs().count()
+                + geometry.transparent().runs().count()
+                + geometry.refractive().runs().count()
+                + (0..MAX_CASCADES)
+                    .map(|i| geometry.cascade(i).runs().count())
+                    .sum::<usize>()
+                + (0..MAX_SHADOW_LIGHTS)
+                    .map(|i| geometry.punctual(i).runs().count())
+                    .sum::<usize>();
         }
 
         let camera = *world.resource::<Camera>();
@@ -262,7 +289,8 @@ fn frame_cost() {
     }
 
     println!(
-        "\nscene {scene:?} at {}x{}, {frames} frames, {entities} visible items",
+        "\nscene {scene:?} at {}x{}, {frames} frames, {entities} visible items, \
+         {draws} recorded draws, {entries} list entries",
         extent[0], extent[1]
     );
     for lane in [Lane::Cpu, Lane::Gpu] {

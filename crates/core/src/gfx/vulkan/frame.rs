@@ -241,6 +241,7 @@ pub enum PassBody {
 #[derive(Clone, Copy, Debug)]
 pub struct FrameIds {
     pub object_transforms: ResourceId,
+    pub instance_index: ResourceId,
     pub swapchain_color: ResourceId,
     pub hdr_color: ResourceId,
     /// What the tonemap, metering and bloom passes read: whichever image the
@@ -527,10 +528,16 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         bodies.push(body);
     };
 
-    // Host-written each frame and read by both geometry passes; the per-object
-    // inverse-transpose is too expensive to compute twice, so the two passes
-    // share one upload and the graph records that they do.
+    // Read by every geometry pass. The rows persist between frames and are
+    // brought up to date by a copy recorded ahead of the schedule — the
+    // per-object inverse-transpose is too expensive to compute twice, so the
+    // passes share one buffer and the graph records that they do.
     let object_transforms = builder.import_buffer("object_transforms");
+    // The draw orders over those rows, which unlike the rows themselves are
+    // written afresh every frame. A second resource rather than a share of the
+    // first because they have different lifetimes, and the graph's whole claim
+    // is to know each resource's exact one. See `vulkan::instances`.
+    let instance_index = builder.import_buffer("instance_index");
 
     let swapchain_color = builder.import_image(
         "swapchain_color",
@@ -586,6 +593,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             let id = builder
                 .pass(CASCADE_PASS_NAMES[cascade as usize], PassKind::Inline)
                 .access(object_transforms, Access::StorageRead)
+                .access(instance_index, Access::StorageRead)
                 .access(shadows, Access::DepthAttachment)
                 .build();
             record(id, PassBody::ShadowCascade(cascade), &mut bodies);
@@ -606,6 +614,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let id = builder
             .pass("punctual_shadows", PassKind::Inline)
             .access(object_transforms, Access::StorageRead)
+            .access(instance_index, Access::StorageRead)
             .access(atlas, Access::DepthAttachment)
             .build();
         record(id, PassBody::PunctualShadows, &mut bodies);
@@ -688,6 +697,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let id = builder
             .pass("geometry_prepass", PassKind::Inline)
             .access(object_transforms, Access::StorageRead)
+            .access(instance_index, Access::StorageRead)
             .access(prepass.normal, Access::ColorAttachment)
             .access(prepass.velocity, Access::ColorAttachment)
             .access(prepass.material, Access::ColorAttachment)
@@ -802,7 +812,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
     let mut forward = builder
         .pass("forward", PassKind::Inline)
-        .access(object_transforms, Access::StorageRead);
+        .access(object_transforms, Access::StorageRead)
+        .access(instance_index, Access::StorageRead);
     if let Some(ssao) = ssao {
         forward = forward.access(ssao.ao, Access::Sampled);
     }
@@ -1029,7 +1040,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // the same set.
         let mut accumulate = builder
             .pass("oit_accumulate", PassKind::Inline)
-            .access(object_transforms, Access::StorageRead);
+            .access(object_transforms, Access::StorageRead)
+            .access(instance_index, Access::StorageRead);
         if let Some(ssao) = ssao {
             accumulate = accumulate.access(ssao.ao, Access::Sampled);
         }
@@ -1123,6 +1135,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let mut draw = builder
             .pass("refraction_draw", PassKind::Inline)
             .access(object_transforms, Access::StorageRead)
+            .access(instance_index, Access::StorageRead)
             .access(scene, Access::Sampled)
             .access(source, Access::Sampled);
         if let Some(ssao) = ssao {
@@ -1503,6 +1516,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         graph: compile(builder)?,
         ids: FrameIds {
             object_transforms,
+            instance_index,
             swapchain_color,
             hdr_color,
             scene_color,

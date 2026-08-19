@@ -9,8 +9,9 @@ layout(location = 3) in vec2 uv;
 layout(location = 0) out vec2 v_uv;
 #endif
 
-// The cascade's light view-projection, pushed per pass, plus the first object
-// row of this instanced run; gl_InstanceIndex counts from it.
+// The cascade's light view-projection, pushed per pass, plus where this
+// instanced run starts in `instances`; gl_InstanceIndex counts from it, and the
+// entry found there is the object's row.
 layout(push_constant) uniform Push {
     mat4 light_view_proj;
     uint object_base;
@@ -34,8 +35,17 @@ layout(set = 0, binding = 0, std430) readonly buffer Objects {
     Object objects[];
 };
 
+// This pass's slice of the frame's draw order, as row numbers into `objects`.
+// The indirection is what lets a row be shared: an object the camera sees and
+// four cascades also draw occupies one row named five times, rather than five
+// copies of the same three matrices. `push.object_base` is where this run's
+// slice starts. See `vulkan::instances`.
+layout(set = 0, binding = 1, std430) readonly buffer Instances {
+    uint instances[];
+};
+
 void main() {
-    uint object = push.object_base + uint(gl_InstanceIndex);
+    uint object = instances[push.object_base + uint(gl_InstanceIndex)];
     gl_Position = push.light_view_proj * objects[object].model * vec4(position, 1.0);
 #ifdef ORRIN_MASKED
     v_uv = uv;
