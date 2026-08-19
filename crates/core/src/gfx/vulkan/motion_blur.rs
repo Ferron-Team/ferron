@@ -19,7 +19,6 @@ use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInf
 use vulkano::buffer::{BufferContents, BufferUsage};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::MemoryTypeFilter;
@@ -85,21 +84,21 @@ impl MotionBlurPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
         let tile_max_pipeline = build_pipeline(
-            device,
+            ctx,
             tile_max_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap(),
         );
         let neighbour_max_pipeline = build_pipeline(
-            device,
+            ctx,
             neighbour_max_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap(),
         );
         let gather_pipeline = build_pipeline(
-            device,
+            ctx,
             gather_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
@@ -296,9 +295,10 @@ fn dispatch_over(
 }
 
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     entry_point: vulkano::shader::EntryPoint,
 ) -> Arc<ComputePipeline> {
+    let device = &ctx.device;
     let stage = PipelineShaderStageCreateInfo::new(entry_point);
     let layout = PipelineLayout::new(
         device.clone(),
@@ -309,7 +309,7 @@ fn build_pipeline(
     .unwrap();
     ComputePipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .unwrap()

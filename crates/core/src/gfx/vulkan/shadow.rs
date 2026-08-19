@@ -6,6 +6,7 @@ use vulkano::command_buffer::{
     AutoCommandBufferBuilder, ClearDepthStencilImageInfo, CommandBufferUsage,
     PrimaryAutoCommandBuffer,
 };
+use vulkano::command_buffer::{ClearAttachment, ClearRect};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
 use vulkano::format::ClearDepthStencilValue;
@@ -14,6 +15,7 @@ use vulkano::image::sampler::{
 };
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
+use vulkano::image::{ImageLayout, SampleCount};
 use vulkano::memory::allocator::AllocationCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
@@ -27,8 +29,6 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::command_buffer::{ClearAttachment, ClearRect};
-use vulkano::image::{ImageLayout, SampleCount};
 use vulkano::render_pass::{
     AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass,
     RenderPassCreateInfo, Subpass, SubpassDescription,
@@ -571,7 +571,7 @@ fn build_pipeline(
 
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),

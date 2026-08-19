@@ -28,7 +28,6 @@ use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInf
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -160,7 +159,7 @@ impl FogPass {
         let device = &ctx.device;
         let shadow_sampler = super::shadow::comparison_sampler(device);
         let scatter_pipeline = build_pipeline(
-            device,
+            ctx,
             scatter_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
@@ -168,7 +167,7 @@ impl FogPass {
             Some(&shadow_sampler),
         );
         let integrate_pipeline = build_pipeline(
-            device,
+            ctx,
             integrate_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
@@ -545,7 +544,7 @@ fn allocate_fallback(ctx: &VkContext) -> Arc<ImageView> {
 }
 
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     entry_point: vulkano::shader::EntryPoint,
     // `Some` for the scatter pass, which reads the cascades. The comparison
     // sampler has to be *immutable* — part of the layout rather than something
@@ -555,6 +554,7 @@ fn build_pipeline(
     // from a compute pipeline.
     shadow_sampler: Option<&Arc<Sampler>>,
 ) -> Arc<ComputePipeline> {
+    let device = &ctx.device;
     let stage = PipelineShaderStageCreateInfo::new(entry_point);
     let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage]);
     if let Some(sampler) = shadow_sampler {
@@ -573,7 +573,7 @@ fn build_pipeline(
     .unwrap();
     ComputePipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .unwrap()

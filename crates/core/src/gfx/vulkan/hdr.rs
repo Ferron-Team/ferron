@@ -88,7 +88,7 @@ impl HdrPass {
     pub fn new(ctx: &VkContext, swapchain_format: Format) -> Self {
         let device = &ctx.device;
         let tonemap_rp = tonemap_render_pass(device, swapchain_format);
-        let tonemap_pipeline = build_tonemap_pipeline(device, &tonemap_rp);
+        let tonemap_pipeline = build_tonemap_pipeline(ctx, &tonemap_rp);
 
         let sampler = Sampler::new(
             device.clone(),
@@ -179,10 +179,8 @@ fn tonemap_render_pass(device: &Arc<Device>, format: Format) -> Arc<RenderPass> 
     .unwrap()
 }
 
-fn build_tonemap_pipeline(
-    device: &Arc<Device>,
-    render_pass: &Arc<RenderPass>,
-) -> Arc<GraphicsPipeline> {
+fn build_tonemap_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = fullscreen_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -205,7 +203,7 @@ fn build_tonemap_pipeline(
     let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),

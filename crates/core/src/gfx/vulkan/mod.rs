@@ -12,6 +12,7 @@ mod instances;
 mod line;
 mod motion_blur;
 mod oit;
+mod pipeline_cache;
 mod prepass;
 mod refraction;
 mod resources;
@@ -23,6 +24,7 @@ mod swapchain;
 mod taa;
 mod texture;
 mod timestamps;
+mod vendor;
 
 use std::sync::Arc;
 
@@ -296,21 +298,19 @@ impl VulkanRenderer {
         let motion_blur = MotionBlurPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx);
         let line = LinePass::new(
-            &ctx.device,
-            &ctx.memory_allocator,
+            &ctx,
             &forward.render_pass,
             &forward.subsurface_render_pass,
             &forward.single_render_pass,
             &forward.single_subsurface_render_pass,
         );
-        let environment =
-            EnvironmentPass::new(
-                &ctx,
-                &forward.render_pass,
-                &forward.subsurface_render_pass,
-                &forward.single_render_pass,
-                &forward.single_subsurface_render_pass,
-            );
+        let environment = EnvironmentPass::new(
+            &ctx,
+            &forward.render_pass,
+            &forward.subsurface_render_pass,
+            &forward.single_render_pass,
+            &forward.single_subsurface_render_pass,
+        );
         let swapchain = make_target(&ctx, &hdr.tonemap_rp, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
 
@@ -534,7 +534,7 @@ impl VulkanRenderer {
 
 impl RenderBackend for VulkanRenderer {
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle {
-        let gpu = forward::upload_mesh(&self.ctx.memory_allocator, &mesh.vertices, &mesh.indices);
+        let gpu = forward::upload_mesh(&self.ctx, &mesh.vertices, &mesh.indices);
         let handle = MeshHandle(self.meshes.len() as u32);
         self.meshes.push(gpu);
         handle
@@ -1050,7 +1050,12 @@ impl VulkanRenderer {
         let no_casters: [DrawList<'_>; 0] = [];
         let items = [draws, transparent, refractive]
             .into_iter()
-            .chain(shadows.map_or(&no_casters[..], |s| s.casters).iter().copied())
+            .chain(
+                shadows
+                    .map_or(&no_casters[..], |s| s.casters)
+                    .iter()
+                    .copied(),
+            )
             .chain(
                 shadows
                     .map_or(&no_casters[..], |s| s.punctual_casters)
@@ -1103,14 +1108,10 @@ impl VulkanRenderer {
             materials: self.shadow_material_set.clone().unwrap(),
             textures: self.shadow_texture_set.clone().unwrap(),
         });
-        let prepass_object_set = self
-            .frame
-            .ids
-            .prepass
-            .map(|_| {
-                self.prepass
-                    .build_object_set(&self.ctx, &object_rows, &objects.indices)
-            });
+        let prepass_object_set = self.frame.ids.prepass.map(|_| {
+            self.prepass
+                .build_object_set(&self.ctx, &object_rows, &objects.indices)
+        });
 
         // Uploaded once even though the prepass and the SSAO resolve both read
         // it — which is what the shared `object_transforms` declaration in
@@ -1643,7 +1644,7 @@ impl VulkanRenderer {
                 .unwrap_or_else(|| self.swapchain.framebuffers[image_index as usize].clone());
             builder
                 .begin_render_pass(
-                    begin_info(framebuffer, body),
+                    begin_info(framebuffer, body, environment.background),
                     SubpassBeginInfo {
                         contents: SubpassContents::Inline,
                         ..Default::default()

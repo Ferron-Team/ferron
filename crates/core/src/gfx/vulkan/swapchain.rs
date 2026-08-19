@@ -16,6 +16,7 @@ pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
 fn present_mode(vsync: VsyncMode) -> PresentMode {
     match vsync {
         VsyncMode::Fifo => PresentMode::Fifo,
+        VsyncMode::FifoRelaxed => PresentMode::FifoRelaxed,
         VsyncMode::Mailbox => PresentMode::Mailbox,
         VsyncMode::Immediate => PresentMode::Immediate,
     }

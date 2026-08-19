@@ -127,7 +127,7 @@ impl RefractionPass {
     pub fn new(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Self {
         let device = &ctx.device;
         let render_pass = build_render_pass(device);
-        let pipeline = build_pipeline(device, &render_pass, forward_layout);
+        let pipeline = build_pipeline(ctx, &render_pass, forward_layout);
 
         let clamp = |info: SamplerCreateInfo| {
             Sampler::new(
@@ -143,8 +143,8 @@ impl RefractionPass {
         Self {
             render_pass,
             pipeline,
-            pyramid_pipeline: build_compute(device, pyramid_cs::load(device.clone()).unwrap()),
-            composite_pipeline: build_compute(device, composite_cs::load(device.clone()).unwrap()),
+            pyramid_pipeline: build_compute(ctx, pyramid_cs::load(device.clone()).unwrap()),
+            composite_pipeline: build_compute(ctx, composite_cs::load(device.clone()).unwrap()),
             linear_clamp: clamp(SamplerCreateInfo::simple_repeat_linear_no_mipmap()),
             linear_mip: clamp(SamplerCreateInfo {
                 mipmap_mode: SamplerMipmapMode::Linear,
@@ -395,10 +395,11 @@ fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
 }
 
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     render_pass: &Arc<RenderPass>,
     forward_layout: &Arc<PipelineLayout>,
 ) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     // The forward pass's vertex shader, unchanged: a refractive surface is the
     // same geometry read from the same per-object rows, and `shading.glsl` reads
     // the same varyings from it.
@@ -443,7 +444,7 @@ fn build_pipeline(
 
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),
@@ -499,9 +500,10 @@ fn build_pipeline(
 }
 
 fn build_compute(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     module: Arc<vulkano::shader::ShaderModule>,
 ) -> Arc<ComputePipeline> {
+    let device = &ctx.device;
     let stage = PipelineShaderStageCreateInfo::new(module.entry_point("main").unwrap());
     let layout = PipelineLayout::new(
         device.clone(),
@@ -512,7 +514,7 @@ fn build_compute(
     .unwrap();
     ComputePipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .unwrap()

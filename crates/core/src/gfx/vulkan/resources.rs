@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use glam::Vec3;
 use vulkano::command_buffer::RenderPassBeginInfo;
 use vulkano::format::ClearValue;
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
@@ -384,10 +385,10 @@ impl PassFramebuffers {
                                 forward.subsurface_render_pass.clone(),
                                 vec![
                                     images.view(msaa.hdr),
-                                    images.view(
-                                        sss.msaa_diffusible
-                                            .expect("a multisampled frame resolves its diffusible"),
-                                    ),
+                                    images
+                                        .view(sss.msaa_diffusible.expect(
+                                            "a multisampled frame resolves its diffusible",
+                                        )),
                                     images.view(msaa.depth),
                                     images.view(ids.hdr_color),
                                     images.view(sss.diffusible),
@@ -530,7 +531,11 @@ impl PassFramebuffers {
 /// How each pass's attachments start the frame. `None` means "leave it": for the
 /// resolve target and the swapchain image, every pixel is written anyway, so
 /// clearing first is bandwidth spent on values nothing reads.
-pub(super) fn clear_values(body: PassBody, framebuffer: &Framebuffer) -> Vec<Option<ClearValue>> {
+pub(super) fn clear_values(
+    body: PassBody,
+    framebuffer: &Framebuffer,
+    background: Vec3,
+) -> Vec<Option<ClearValue>> {
     let attachments = framebuffer.attachments().len();
     match body {
         // Flat +Z in the normal buffer, no motion in the velocity buffer, far in
@@ -569,7 +574,7 @@ pub(super) fn clear_values(body: PassBody, framebuffer: &Framebuffer) -> Vec<Opt
         PassBody::Forward => {
             let multisampled = framebuffer.attachments()[0].image().samples()
                 != vulkano::image::SampleCount::Sample1;
-            let color = Some([0.02, 0.02, 0.03, 1.0].into());
+            let color = Some([background.x, background.y, background.z, 1.0].into());
             let diffusible = Some([0.0, 0.0, 0.0, 0.0].into());
             match (multisampled, attachments) {
                 (true, 5) => vec![color, diffusible, Some(1.0.into()), None, None],
@@ -636,9 +641,13 @@ pub(super) fn clear_values(body: PassBody, framebuffer: &Framebuffer) -> Vec<Opt
     }
 }
 
-pub(super) fn begin_info(framebuffer: Arc<Framebuffer>, body: PassBody) -> RenderPassBeginInfo {
+pub(super) fn begin_info(
+    framebuffer: Arc<Framebuffer>,
+    body: PassBody,
+    background: Vec3,
+) -> RenderPassBeginInfo {
     RenderPassBeginInfo {
-        clear_values: clear_values(body, &framebuffer),
+        clear_values: clear_values(body, &framebuffer, background),
         ..RenderPassBeginInfo::framebuffer(framebuffer)
     }
 }

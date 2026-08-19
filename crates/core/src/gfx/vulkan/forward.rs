@@ -2,16 +2,19 @@ use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::AutoCommandBufferBuilder;
+use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
 use vulkano::format::Format;
+use vulkano::image::ImageLayout;
+use vulkano::image::SampleCount;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
+use vulkano::pipeline::graphics::depth_stencil::CompareOp;
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
@@ -23,13 +26,11 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::image::SampleCount;
-use vulkano::pipeline::graphics::depth_stencil::CompareOp;
 use vulkano::render_pass::{
     AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass,
     RenderPassCreateInfo, Subpass, SubpassDescription,
 };
-use vulkano::image::ImageLayout;
+use vulkano::sync::{self, GpuFuture};
 
 use crate::geom::Aabb;
 use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
@@ -873,7 +874,11 @@ impl ForwardPass {
 
     /// The quartet a frame draws with, given whether it rasterises multisampled.
     fn pipelines(&self, msaa: bool) -> &ForwardPipelines {
-        if msaa { &self.multisampled } else { &self.single }
+        if msaa {
+            &self.multisampled
+        } else {
+            &self.single
+        }
     }
 
     /// The layout the transparency pass builds its own pipeline with. Shared
@@ -1271,47 +1276,158 @@ pub(super) fn material_buffer(
     .expect("failed to allocate material buffer")
 }
 
-pub fn upload_mesh(
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    vertices: &[Vertex],
-    indices: &[u32],
-) -> GpuMesh {
-    let vertex_buffer = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        vertices.iter().copied(),
-    )
-    .expect("failed to allocate vertex buffer");
+/// Put a mesh where the GPU can read it many times per frame.
+///
+/// Static geometry is the one resource in the renderer that is written once and
+/// then *re-read* by every pass in the frame — the prepass, the forward pass,
+/// each shadow cascade, the atlas — which is what makes where it lives worth a
+/// branch. The two vendor guides say the same thing about it from opposite
+/// directions: AMD's, that device-local host-visible memory is for data "each
+/// byte of which is accessed once by the GPU", and NVIDIA's, to look explicitly
+/// for `DEVICE_LOCAL` when picking a memory type. Vertices are neither
+/// write-once nor incidentally device-local.
+///
+/// The reason a branch beats picking one path is that both are right on some
+/// machine:
+///
+/// - **Wide BAR** (Resizable BAR on, or a unified-memory part). The CPU writes
+///   straight into video memory. The buffer is device-local *and* the upload is
+///   one `memcpy` with no staging copy, no command buffer and no fence. Staging
+///   here would be strictly worse: same destination, extra work.
+/// - **Narrow BAR.** `PREFER_DEVICE | HOST_SEQUENTIAL_WRITE` reads as *required*
+///   host-visible and only *preferred* device-local, so it resolves to the
+///   legacy 256 MiB aperture — and when that fills, vulkano falls back to the
+///   next type satisfying the requirement, which is ordinary system RAM. The
+///   failure is silent and it is the bad one: every cascade then re-reads the
+///   scene's geometry across PCIe, every frame, for as long as the scene is
+///   open. Staging costs one copy at load and buys VRAM residency.
+///
+/// This is the change in this file that a machine with Resizable BAR *cannot*
+/// show you. On such a machine the first branch is taken and nothing here has
+/// changed at all; the second exists for the configuration that is still common
+/// on NVIDIA desktops and on anything with the option switched off in firmware.
+pub fn upload_mesh(ctx: &VkContext, vertices: &[Vertex], indices: &[u32]) -> GpuMesh {
+    let bounds = Aabb::from_points(vertices.iter().map(|v| Vec3::from(v.position)));
 
-    let index_buffer = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::INDEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        indices.iter().copied(),
-    )
-    .expect("failed to allocate index buffer");
+    let (vertex_buffer, index_buffer) = if ctx.profile.wide_bar() {
+        (
+            write_directly(&ctx.memory_allocator, BufferUsage::VERTEX_BUFFER, vertices),
+            write_directly(&ctx.memory_allocator, BufferUsage::INDEX_BUFFER, indices),
+        )
+    } else {
+        stage(ctx, vertices, indices)
+    };
 
     GpuMesh {
         vertex_buffer,
         index_buffer,
         index_count: indices.len() as u32,
-        bounds: Aabb::from_points(vertices.iter().map(|v| Vec3::from(v.position))),
+        bounds,
     }
+}
+
+/// One `memcpy` into memory the GPU owns and the CPU can see — the wide-BAR path.
+fn write_directly<T: BufferContents + Copy>(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    usage: BufferUsage,
+    data: &[T],
+) -> Subbuffer<[T]> {
+    Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        data.iter().copied(),
+    )
+    .expect("failed to allocate mesh buffer")
+}
+
+/// Both buffers through host memory into device-local memory the CPU cannot
+/// reach — the narrow-BAR path.
+///
+/// One command buffer and one fence for the pair, because the cost worth
+/// avoiding here is the round trip, not the copy. Blocking at all matches how
+/// [`texture`](super::texture) uploads: `load_mesh` is called while building a
+/// scene, not while drawing one, and the buffers have to exist before the handle
+/// it returns can be drawn with.
+fn stage(
+    ctx: &VkContext,
+    vertices: &[Vertex],
+    indices: &[u32],
+) -> (Subbuffer<[Vertex]>, Subbuffer<[u32]>) {
+    let vertex = staged_pair(ctx, BufferUsage::VERTEX_BUFFER, vertices);
+    let index = staged_pair(ctx, BufferUsage::INDEX_BUFFER, indices);
+
+    let mut builder = AutoCommandBufferBuilder::primary(
+        ctx.command_buffer_allocator.clone(),
+        ctx.queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .unwrap();
+    builder
+        .copy_buffer(CopyBufferInfo::buffers(vertex.0, vertex.1.clone()))
+        .unwrap()
+        .copy_buffer(CopyBufferInfo::buffers(index.0, index.1.clone()))
+        .unwrap();
+
+    sync::now(ctx.device.clone())
+        .then_execute(ctx.queue.clone(), builder.build().unwrap())
+        .unwrap()
+        .then_signal_fence_and_flush()
+        .unwrap()
+        .wait(None)
+        .unwrap();
+
+    (vertex.1, index.1)
+}
+
+/// A host-visible buffer holding `data`, and the empty device-local one it is
+/// about to be copied into.
+fn staged_pair<T: BufferContents + Copy>(
+    ctx: &VkContext,
+    usage: BufferUsage,
+    data: &[T],
+) -> (Subbuffer<[T]>, Subbuffer<[T]>) {
+    let staging = Buffer::from_iter(
+        ctx.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        data.iter().copied(),
+    )
+    .expect("failed to allocate mesh staging buffer");
+
+    // No host-access filter, which is the entire point: it leaves the plain
+    // `DEVICE_LOCAL` type — the one the aperture does not cover — as the best
+    // match, and Vulkan orders memory types so that the type with only that flag
+    // comes before the one that adds `HOST_VISIBLE`.
+    let device_local = Buffer::new_slice::<T>(
+        ctx.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: usage | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        data.len() as u64,
+    )
+    .expect("failed to allocate mesh buffer");
+
+    (staging, device_local)
 }
 
 pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
@@ -1598,7 +1714,7 @@ fn build_pipeline(
 
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),

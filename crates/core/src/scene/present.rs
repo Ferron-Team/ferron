@@ -7,9 +7,21 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VsyncMode {
     /// Capped to the display's refresh, no tearing. The only mode a driver has
-    /// to support, so it is also what the other two fall back to.
+    /// to support, so it is also what the other three fall back to.
     #[default]
     Fifo,
+    /// [`Fifo`](Self::Fifo), except that a frame which arrives *late* is
+    /// presented immediately rather than held for the next refresh.
+    ///
+    /// The mode AMD's RDNA guide names first for V-Sync on, and it is worth
+    /// having as a named choice because of what it does to the failure mode
+    /// rather than to the average: under plain `Fifo` a frame that misses its
+    /// vblank by a millisecond waits a whole refresh, so one slow frame costs
+    /// two frames' worth of latency and the rate halves until the renderer gets
+    /// far enough ahead again. Relaxed tears on exactly those frames and keeps
+    /// the rate. On a renderer comfortably inside its budget the two are the
+    /// same mode, since neither ever misses.
+    FifoRelaxed,
     /// Uncapped and tear-free: the presentation engine keeps the newest queued
     /// frame and discards the rest.
     Mailbox,

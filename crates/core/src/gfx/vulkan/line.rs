@@ -13,12 +13,12 @@ use std::sync::Arc;
 
 use crate::scene::DebugLine;
 
+use super::context::VkContext;
 use super::taa::FrameView;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
-use vulkano::device::Device;
-use vulkano::memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::memory::allocator::MemoryTypeFilter;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
@@ -54,15 +54,14 @@ pub struct LinePass {
 impl LinePass {
     /// Build the line pipelines against subpass 0 of each forward render pass.
     pub fn new(
-        device: &Arc<Device>,
-        memory_allocator: &Arc<StandardMemoryAllocator>,
+        ctx: &VkContext,
         render_pass: &Arc<RenderPass>,
         subsurface_render_pass: &Arc<RenderPass>,
         single_render_pass: &Arc<RenderPass>,
         single_subsurface_render_pass: &Arc<RenderPass>,
     ) -> Self {
         let subbuffer_allocator = SubbufferAllocator::new(
-            memory_allocator.clone(),
+            ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::VERTEX_BUFFER,
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
@@ -74,12 +73,12 @@ impl LinePass {
         Self {
             pipelines: [
                 [
-                    build_pipeline(device, single_render_pass),
-                    build_pipeline(device, single_subsurface_render_pass),
+                    build_pipeline(ctx, single_render_pass),
+                    build_pipeline(ctx, single_subsurface_render_pass),
                 ],
                 [
-                    build_pipeline(device, render_pass),
-                    build_pipeline(device, subsurface_render_pass),
+                    build_pipeline(ctx, render_pass),
+                    build_pipeline(ctx, subsurface_render_pass),
                 ],
             ],
             subbuffer_allocator,
@@ -156,7 +155,8 @@ impl LinePass {
     }
 }
 
-fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+fn build_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -185,7 +185,7 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
 
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),

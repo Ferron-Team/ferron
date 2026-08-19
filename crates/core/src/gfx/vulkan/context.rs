@@ -13,9 +13,13 @@ use vulkano::device::{
 use vulkano::instance::Instance;
 use vulkano::memory::MemoryHeapFlags;
 use vulkano::memory::allocator::StandardMemoryAllocator;
+use vulkano::pipeline::cache::PipelineCache;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::swapchain::Surface;
 use vulkano::{Version, VulkanObject};
+
+use super::pipeline_cache::ShaderCache;
+use super::vendor::GpuProfile;
 
 pub struct VkContext {
     pub device: Arc<Device>,
@@ -23,6 +27,18 @@ pub struct VkContext {
     pub memory_allocator: Arc<StandardMemoryAllocator>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+    /// What the device is and how its memory is shaped. Read by
+    /// [`upload_mesh`](super::forward::upload_mesh) to decide whether static
+    /// geometry can be written straight into video memory; reported at startup
+    /// so a frame-time number has the hardware beside it.
+    pub profile: GpuProfile,
+    /// The driver's compiled-shader cache, reloaded from disk and written back
+    /// when this context is dropped. Passed to every pipeline constructor
+    /// through [`pipeline_cache`](Self::pipeline_cache).
+    ///
+    /// Private because the only thing anything outside wants is the handle, and
+    /// the write-back is the destructor's business.
+    pipelines: ShaderCache,
     /// Whether a descriptor array may be left partly unwritten.
     ///
     /// The material texture array is [`MAX_TEXTURES`] slots wide and a scene
@@ -98,11 +114,15 @@ impl VkContext {
         let (physical_device, queue_family_index) =
             select_physical_device(instance, surface, &device_extensions);
 
+        let profile = GpuProfile::detect(&physical_device);
         println!(
             "Using device: {} ({:?})",
             physical_device.properties().device_name,
             physical_device.properties().device_type,
         );
+        // On the same line of the log as the device it describes, because these
+        // are the facts a recorded frame time is only reproducible against.
+        println!("  {}", profile.describe());
 
         // On portability-subset devices (MoltenVK on macOS) the extension must be
         // enabled if present, and egui's font/texture image views use a
@@ -180,14 +200,25 @@ impl VkContext {
             Default::default(),
         ));
 
+        let pipelines = ShaderCache::load(&device);
+
         Self {
             device,
             queue,
             memory_allocator,
             command_buffer_allocator,
             descriptor_set_allocator,
+            profile,
+            pipelines,
             partially_bound,
         }
+    }
+
+    /// The driver's compiled-shader cache, as every pipeline constructor wants
+    /// it. `None` on a device that would not give us one, which is also what
+    /// those constructors took before this existed.
+    pub fn pipeline_cache(&self) -> Option<Arc<PipelineCache>> {
+        self.pipelines.handle()
     }
 
     /// Live device-local VRAM as `(used, total)` bytes. `used` is `None` when
@@ -272,7 +303,6 @@ fn select_physical_device(
         })
         .expect("no suitable physical device found")
 }
-
 
 /// Fail at startup if the frame's packed colour format cannot back a storage
 /// image on this device.

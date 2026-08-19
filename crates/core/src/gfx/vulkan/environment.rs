@@ -164,16 +164,16 @@ impl EnvironmentPass {
     ) -> Self {
         let device = &ctx.device;
         let bake_rp = bake_render_pass(device);
-        let bake_pipeline = build_bake_pipeline(device, &bake_rp);
-        let prefilter_pipeline = build_prefilter_pipeline(device, &bake_rp);
+        let bake_pipeline = build_bake_pipeline(ctx, &bake_rp);
+        let prefilter_pipeline = build_prefilter_pipeline(ctx, &bake_rp);
         let skybox_pipelines = [
             [
-                build_skybox_pipeline(device, forward_single_rp),
-                build_skybox_pipeline(device, forward_single_subsurface_rp),
+                build_skybox_pipeline(ctx, forward_single_rp),
+                build_skybox_pipeline(ctx, forward_single_subsurface_rp),
             ],
             [
-                build_skybox_pipeline(device, forward_rp),
-                build_skybox_pipeline(device, forward_subsurface_rp),
+                build_skybox_pipeline(ctx, forward_rp),
+                build_skybox_pipeline(ctx, forward_subsurface_rp),
             ],
         ];
 
@@ -792,10 +792,8 @@ fn bake_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
     .unwrap()
 }
 
-fn build_bake_pipeline(
-    device: &Arc<Device>,
-    render_pass: &Arc<RenderPass>,
-) -> Arc<GraphicsPipeline> {
+fn build_bake_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = fullscreen_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -819,7 +817,7 @@ fn build_bake_pipeline(
 
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),
@@ -841,9 +839,10 @@ fn build_bake_pipeline(
 }
 
 fn build_prefilter_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     render_pass: &Arc<RenderPass>,
 ) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = fullscreen_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -867,7 +866,7 @@ fn build_prefilter_pipeline(
 
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),
@@ -888,10 +887,8 @@ fn build_prefilter_pipeline(
     .unwrap()
 }
 
-fn build_skybox_pipeline(
-    device: &Arc<Device>,
-    render_pass: &Arc<RenderPass>,
-) -> Arc<GraphicsPipeline> {
+fn build_skybox_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = skybox_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -915,7 +912,7 @@ fn build_skybox_pipeline(
 
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),

@@ -408,7 +408,7 @@ fn build_pipeline(
     let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),

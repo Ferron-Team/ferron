@@ -102,11 +102,12 @@ fn ao_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
 }
 
 fn build_fullscreen_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     render_pass: &Arc<RenderPass>,
     vs: EntryPoint,
     fs: EntryPoint,
 ) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let stages = [
         PipelineShaderStageCreateInfo::new(vs),
         PipelineShaderStageCreateInfo::new(fs),
@@ -121,7 +122,7 @@ fn build_fullscreen_pipeline(
     let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),
@@ -190,8 +191,8 @@ impl SsaoPass {
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let ssao_pipeline = build_fullscreen_pipeline(device, &ssao_rp, full_vs.clone(), ssao_fs);
-        let blur_pipeline = build_fullscreen_pipeline(device, &blur_rp, full_vs, blur_fs);
+        let ssao_pipeline = build_fullscreen_pipeline(ctx, &ssao_rp, full_vs.clone(), ssao_fs);
+        let blur_pipeline = build_fullscreen_pipeline(ctx, &blur_rp, full_vs, blur_fs);
 
         let uniform_allocator = SubbufferAllocator::new(
             ctx.memory_allocator.clone(),
@@ -341,19 +342,11 @@ impl SsaoPass {
             renderer.ctx.descriptor_set_allocator.clone(),
             self.blur_pipeline.layout().set_layouts()[0].clone(),
             [
-                WriteDescriptorSet::image_view_sampler(
-                    0,
-                    raw_ao_view,
-                    self.nearest_clamp.clone(),
-                ),
+                WriteDescriptorSet::image_view_sampler(0, raw_ao_view, self.nearest_clamp.clone()),
                 // Nearest, like every other read of this depth: interpolating
                 // across a silhouette invents a surface, which is precisely what
                 // the weighting below exists to stop.
-                WriteDescriptorSet::image_view_sampler(
-                    1,
-                    depth_view,
-                    self.nearest_clamp.clone(),
-                ),
+                WriteDescriptorSet::image_view_sampler(1, depth_view, self.nearest_clamp.clone()),
             ],
             [],
         )

@@ -101,8 +101,8 @@ impl OitPass {
     pub fn new(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Self {
         let device = &ctx.device;
         let render_pass = build_render_pass(device);
-        let pipeline = build_pipeline(device, &render_pass, forward_layout);
-        let composite_pipeline = build_composite_pipeline(device);
+        let pipeline = build_pipeline(ctx, &render_pass, forward_layout);
+        let composite_pipeline = build_composite_pipeline(ctx);
         let nearest_clamp = Sampler::new(
             device.clone(),
             SamplerCreateInfo {
@@ -294,10 +294,11 @@ fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
 }
 
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     render_pass: &Arc<RenderPass>,
     layout: &Arc<PipelineLayout>,
 ) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     // The forward pass's vertex shader, unchanged: a blended surface is the same
     // geometry with the same per-object rows, and `shading.glsl` reads the same
     // varyings from it.
@@ -316,7 +317,7 @@ fn build_pipeline(
 
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),
@@ -382,7 +383,8 @@ fn build_pipeline(
     .unwrap()
 }
 
-fn build_composite_pipeline(device: &Arc<Device>) -> Arc<ComputePipeline> {
+fn build_composite_pipeline(ctx: &VkContext) -> Arc<ComputePipeline> {
+    let device = &ctx.device;
     let stage = PipelineShaderStageCreateInfo::new(
         composite_cs::load(device.clone())
             .unwrap()
@@ -398,7 +400,7 @@ fn build_composite_pipeline(device: &Arc<Device>) -> Arc<ComputePipeline> {
     .unwrap();
     ComputePipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .unwrap()

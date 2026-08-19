@@ -107,7 +107,7 @@ impl ContactShadowPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
         let render_pass = build_render_pass(device);
-        let pipeline = build_pipeline(device, &render_pass);
+        let pipeline = build_pipeline(ctx, &render_pass);
 
         let uniform_allocator = SubbufferAllocator::new(
             ctx.memory_allocator.clone(),
@@ -272,7 +272,8 @@ fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
     .unwrap()
 }
 
-fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+fn build_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = fullscreen_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -295,7 +296,7 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
     let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),

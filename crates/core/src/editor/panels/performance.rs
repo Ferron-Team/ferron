@@ -108,13 +108,19 @@ fn measurement(ui: &mut egui::Ui, world: &World) {
             if let Some(mut present) = world.get_resource_mut::<PresentSettings>() {
                 let label = |mode: VsyncMode| match mode {
                     VsyncMode::Fifo => "Fifo (vsync)",
+                    VsyncMode::FifoRelaxed => "Fifo relaxed (vsync, tears when late)",
                     VsyncMode::Mailbox => "Mailbox (uncapped)",
                     VsyncMode::Immediate => "Immediate (uncapped, tears)",
                 };
                 egui::ComboBox::from_label("Present mode")
                     .selected_text(label(present.vsync))
                     .show_ui(ui, |ui| {
-                        for mode in [VsyncMode::Fifo, VsyncMode::Mailbox, VsyncMode::Immediate] {
+                        for mode in [
+                            VsyncMode::Fifo,
+                            VsyncMode::FifoRelaxed,
+                            VsyncMode::Mailbox,
+                            VsyncMode::Immediate,
+                        ] {
                             ui.selectable_value(&mut present.vsync, mode, label(mode));
                         }
                     })

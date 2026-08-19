@@ -14,7 +14,6 @@ use std::sync::Arc;
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -94,21 +93,21 @@ impl BloomPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
         let prefilter_pipeline = build_pipeline(
-            device,
+            ctx,
             prefilter_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap(),
         );
         let downsample_pipeline = build_pipeline(
-            device,
+            ctx,
             downsample_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap(),
         );
         let upsample_pipeline = build_pipeline(
-            device,
+            ctx,
             upsample_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
@@ -303,9 +302,10 @@ fn dispatch_over(
 }
 
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     entry_point: vulkano::shader::EntryPoint,
 ) -> Arc<ComputePipeline> {
+    let device = &ctx.device;
     let stage = PipelineShaderStageCreateInfo::new(entry_point);
     let layout = PipelineLayout::new(
         device.clone(),
@@ -316,7 +316,7 @@ fn build_pipeline(
     .unwrap();
     ComputePipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .unwrap()
