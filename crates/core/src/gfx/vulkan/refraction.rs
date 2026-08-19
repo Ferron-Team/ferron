@@ -65,7 +65,7 @@ use vulkano::render_pass::{
     RenderPassCreateInfo, Subpass, SubpassDescription,
 };
 
-use crate::gfx::{DrawList, Vertex};
+use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
 use super::VulkanRenderer;
 use super::context::VkContext;
@@ -287,7 +287,10 @@ impl RefractionPass {
             builder
                 .push_constants(self.pipeline.layout().clone(), 0, push)
                 .unwrap()
-                .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
+                .bind_vertex_buffers(
+                    0,
+                    (mesh.position_buffer.clone(), mesh.surface_buffer.clone()),
+                )
                 .unwrap()
                 .bind_index_buffer(mesh.index_buffer.clone())
                 .unwrap();
@@ -409,7 +412,9 @@ fn build_pipeline(
         .entry_point("main")
         .unwrap();
 
-    let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
+    let vertex_input_state = [PositionVertex::per_vertex(), SurfaceVertex::per_vertex()]
+        .definition(&vs)
+        .unwrap();
     let stages = [
         PipelineShaderStageCreateInfo::new(vs),
         PipelineShaderStageCreateInfo::new(fs),

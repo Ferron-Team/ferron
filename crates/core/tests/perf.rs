@@ -228,7 +228,9 @@ fn frame_cost() {
             entries = geometry.visible().len()
                 + geometry.transparent().len()
                 + geometry.refractive().len()
-                + (0..MAX_CASCADES).map(|i| geometry.cascade(i).len()).sum::<usize>()
+                + (0..MAX_CASCADES)
+                    .map(|i| geometry.cascade(i).len())
+                    .sum::<usize>()
                 + (0..MAX_SHADOW_LIGHTS)
                     .map(|i| geometry.punctual(i).len())
                     .sum::<usize>();

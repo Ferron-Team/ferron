@@ -17,21 +17,90 @@ use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
 
-#[derive(BufferContents, VertexTrait, Clone, Copy, Debug)]
+/// A vertex as meshes are *authored*: one struct with everything in it, which is
+/// what mesh generation, model import and the collision builders all write.
+///
+/// Deliberately not what the GPU is given. Upload de-interleaves it into
+/// [`PositionVertex`] and [`SurfaceVertex`], for the reason those two document —
+/// but nothing on the CPU side has to know that, which is why this type still
+/// exists and still has every field.
+#[derive(BufferContents, Clone, Copy, Debug)]
 #[repr(C)]
 pub struct Vertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub color: [f32; 3],
+    pub uv: [f32; 2],
+    /// Object-space tangent (+U texture direction) in `xyz`; `w` is the
+    /// bitangent handedness (±1) used to rebuild the TBN basis for normal maps.
+    pub tangent: [f32; 4],
+}
+
+/// The half of a vertex a *depth-only* pass reads: where it is, and — for a
+/// cutout material — where to sample the alpha from.
+///
+/// Split out of [`Vertex`] because the shadow passes are the frame's only
+/// consumers that need this and nothing else, and a stride is paid whether or
+/// not the attributes in it are fetched. AMD's RDNA guide asks for exactly this
+/// ("allocate position data in a separate vertex stream to improve depth-only
+/// passes"): with one interleaved 60-byte vertex, every cascade and every atlas
+/// tile pulls 60 bytes per vertex to use 12 of them, four to five times over per
+/// frame.
+///
+/// 20 bytes rather than 12 because the cutout shadow variant alpha-tests and so
+/// needs the texture coordinate, and one stream that serves both shadow
+/// pipelines beats a third buffer that serves one. The plain variant declares no
+/// `uv` and therefore fetches none — only the stride is shared.
+///
+/// This costs no memory: the two halves partition [`Vertex`] rather than
+/// duplicating any of it, so a mesh occupies exactly what it did before, in two
+/// buffers instead of one.
+#[derive(BufferContents, VertexTrait, Clone, Copy, Debug)]
+#[repr(C)]
+pub struct PositionVertex {
     #[format(R32G32B32_SFLOAT)]
     pub position: [f32; 3],
+    #[format(R32G32_SFLOAT)]
+    pub uv: [f32; 2],
+}
+
+/// The other half: what a pass that actually *shades* needs on top of
+/// [`PositionVertex`].
+///
+/// Bound alongside it by the four passes that rasterise a surface rather than
+/// just its depth — the geometry prepass, the forward pass, and the two
+/// non-opaque queues. Between them the two streams still add up to the same 60
+/// bytes the single interleaved vertex was.
+#[derive(BufferContents, VertexTrait, Clone, Copy, Debug)]
+#[repr(C)]
+pub struct SurfaceVertex {
     #[format(R32G32B32_SFLOAT)]
     pub normal: [f32; 3],
     #[format(R32G32B32_SFLOAT)]
     pub color: [f32; 3],
-    #[format(R32G32_SFLOAT)]
-    pub uv: [f32; 2],
-    /// Object-space tangent (+U texture direction) in `xyz`; `w` is the
-    /// bitangent handedness (±1) used to rebuild the TBN basis for normal maps.
     #[format(R32G32B32A32_SFLOAT)]
     pub tangent: [f32; 4],
+}
+
+impl Vertex {
+    /// The two halves this vertex is uploaded as.
+    ///
+    /// One function so the split is stated once: a field that moved between the
+    /// two streams without its shader declaration moving with it would be a
+    /// silently wrong mesh, not a compile error.
+    pub fn split(&self) -> (PositionVertex, SurfaceVertex) {
+        (
+            PositionVertex {
+                position: self.position,
+                uv: self.uv,
+            },
+            SurfaceVertex {
+                normal: self.normal,
+                color: self.color,
+                tangent: self.tangent,
+            },
+        )
+    }
 }
 
 /// One renderable instance, as extraction hands it to the passes. Everything a

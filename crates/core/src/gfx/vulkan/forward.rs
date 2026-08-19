@@ -38,7 +38,7 @@ use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
 use crate::gfx::{
     BlendMode, DecalInstance, DrawList, MAX_DECALS, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, Material,
-    SceneLighting, Vertex,
+    PositionVertex, SceneLighting, SurfaceVertex, Vertex,
 };
 use crate::scene::{Camera, EnvironmentSettings};
 
@@ -51,7 +51,12 @@ use super::taa::FrameView;
 use super::{MSAA_SAMPLES, ShadowFrame, VulkanRenderer};
 
 pub struct GpuMesh {
-    pub vertex_buffer: Subbuffer<[Vertex]>,
+    /// Position and texture coordinate, bound at binding 0 by every pass that
+    /// draws this mesh — including the shadow passes, which bind nothing else.
+    pub position_buffer: Subbuffer<[PositionVertex]>,
+    /// Everything a shading pass needs on top of the above, bound at binding 1
+    /// by the four passes that rasterise the surface rather than its depth.
+    pub surface_buffer: Subbuffer<[SurfaceVertex]>,
     pub index_buffer: Subbuffer<[u32]>,
     pub index_count: u32,
     /// Object-space bounds, derived here because upload is the last place the
@@ -1238,7 +1243,10 @@ impl ForwardPass {
             builder
                 .push_constants(pipeline.layout().clone(), 0, push)
                 .unwrap()
-                .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
+                .bind_vertex_buffers(
+                    0,
+                    (mesh.position_buffer.clone(), mesh.surface_buffer.clone()),
+                )
                 .unwrap()
                 .bind_index_buffer(mesh.index_buffer.clone())
                 .unwrap();
@@ -1309,17 +1317,25 @@ pub(super) fn material_buffer(
 pub fn upload_mesh(ctx: &VkContext, vertices: &[Vertex], indices: &[u32]) -> GpuMesh {
     let bounds = Aabb::from_points(vertices.iter().map(|v| Vec3::from(v.position)));
 
-    let (vertex_buffer, index_buffer) = if ctx.profile.wide_bar() {
+    // De-interleaved here because upload is the last place a vertex exists as
+    // the one authored struct, and the only place that has to know the two GPU
+    // streams are halves of it.
+    let (positions, surfaces): (Vec<_>, Vec<_>) = vertices.iter().map(Vertex::split).unzip();
+
+    let (position_buffer, surface_buffer, index_buffer) = if ctx.profile.wide_bar() {
+        let vertices = BufferUsage::VERTEX_BUFFER;
         (
-            write_directly(&ctx.memory_allocator, BufferUsage::VERTEX_BUFFER, vertices),
+            write_directly(&ctx.memory_allocator, vertices, &positions),
+            write_directly(&ctx.memory_allocator, vertices, &surfaces),
             write_directly(&ctx.memory_allocator, BufferUsage::INDEX_BUFFER, indices),
         )
     } else {
-        stage(ctx, vertices, indices)
+        stage(ctx, &positions, &surfaces, indices)
     };
 
     GpuMesh {
-        vertex_buffer,
+        position_buffer,
+        surface_buffer,
         index_buffer,
         index_count: indices.len() as u32,
         bounds,
@@ -1348,20 +1364,26 @@ fn write_directly<T: BufferContents + Copy>(
     .expect("failed to allocate mesh buffer")
 }
 
-/// Both buffers through host memory into device-local memory the CPU cannot
+/// All three buffers through host memory into device-local memory the CPU cannot
 /// reach — the narrow-BAR path.
 ///
-/// One command buffer and one fence for the pair, because the cost worth
-/// avoiding here is the round trip, not the copy. Blocking at all matches how
+/// One command buffer and one fence for the set, because the cost worth avoiding
+/// here is the round trip, not the copy. Blocking at all matches how
 /// [`texture`](super::texture) uploads: `load_mesh` is called while building a
 /// scene, not while drawing one, and the buffers have to exist before the handle
 /// it returns can be drawn with.
 fn stage(
     ctx: &VkContext,
-    vertices: &[Vertex],
+    positions: &[PositionVertex],
+    surfaces: &[SurfaceVertex],
     indices: &[u32],
-) -> (Subbuffer<[Vertex]>, Subbuffer<[u32]>) {
-    let vertex = staged_pair(ctx, BufferUsage::VERTEX_BUFFER, vertices);
+) -> (
+    Subbuffer<[PositionVertex]>,
+    Subbuffer<[SurfaceVertex]>,
+    Subbuffer<[u32]>,
+) {
+    let position = staged_pair(ctx, BufferUsage::VERTEX_BUFFER, positions);
+    let surface = staged_pair(ctx, BufferUsage::VERTEX_BUFFER, surfaces);
     let index = staged_pair(ctx, BufferUsage::INDEX_BUFFER, indices);
 
     let mut builder = AutoCommandBufferBuilder::primary(
@@ -1371,7 +1393,9 @@ fn stage(
     )
     .unwrap();
     builder
-        .copy_buffer(CopyBufferInfo::buffers(vertex.0, vertex.1.clone()))
+        .copy_buffer(CopyBufferInfo::buffers(position.0, position.1.clone()))
+        .unwrap()
+        .copy_buffer(CopyBufferInfo::buffers(surface.0, surface.1.clone()))
         .unwrap()
         .copy_buffer(CopyBufferInfo::buffers(index.0, index.1.clone()))
         .unwrap();
@@ -1384,7 +1408,7 @@ fn stage(
         .wait(None)
         .unwrap();
 
-    (vertex.1, index.1)
+    (position.1, surface.1, index.1)
 }
 
 /// A host-visible buffer holding `data`, and the empty device-local one it is
@@ -1679,7 +1703,9 @@ fn build_pipeline(
     let vs = vertex_shader(device);
     let fs = fragment.entry_point("main").unwrap();
 
-    let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
+    let vertex_input_state = [PositionVertex::per_vertex(), SurfaceVertex::per_vertex()]
+        .definition(&vs)
+        .unwrap();
 
     let stages = [
         PipelineShaderStageCreateInfo::new(vs),

@@ -840,14 +840,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // makes it legal for the passes after this one to keep sampling it —
         // the image never leaves `DepthStencilReadOnlyOptimal`, which is the
         // same contract `oit_accumulate` and `refraction_draw` already sign.
-        None => forward
-            .access(hdr_color, Access::ColorAttachment)
-            .access(
-                prepass
-                    .expect("a one-sample forward pass depth-tests against the prepass")
-                    .depth,
-                Access::DepthAttachmentRead,
-            ),
+        None => forward.access(hdr_color, Access::ColorAttachment).access(
+            prepass
+                .expect("a one-sample forward pass depth-tests against the prepass")
+                .depth,
+            Access::DepthAttachmentRead,
+        ),
     };
     // Between the first colour attachment and its resolve in the render pass's
     // own declaration order, but the graph does not care about order — only that
