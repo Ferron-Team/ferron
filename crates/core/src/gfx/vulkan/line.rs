@@ -44,13 +44,10 @@ pub struct LineVertex {
 }
 
 pub struct LinePass {
-    pipeline: Arc<GraphicsPipeline>,
-    /// The same pipeline against the forward pass's subsurface render pass, which
-    /// has a colour attachment more. A pipeline is tied to the render pass it was
-    /// built for, so sharing one across both is not available — see
-    /// [`ForwardPass::subsurface_render_pass`](super::forward::ForwardPass) for why
-    /// both exist for the whole session rather than being rebuilt on the toggle.
-    subsurface_pipeline: Arc<GraphicsPipeline>,
+    /// Indexed `[msaa][subsurface]`. A pipeline is tied to the render pass it
+    /// was built against, and the forward pass now has four of them: two sample
+    /// counts, each with and without the diffusible colour target.
+    pipelines: [[Arc<GraphicsPipeline>; 2]; 2],
     subbuffer_allocator: SubbufferAllocator,
 }
 
@@ -61,6 +58,8 @@ impl LinePass {
         memory_allocator: &Arc<StandardMemoryAllocator>,
         render_pass: &Arc<RenderPass>,
         subsurface_render_pass: &Arc<RenderPass>,
+        single_render_pass: &Arc<RenderPass>,
+        single_subsurface_render_pass: &Arc<RenderPass>,
     ) -> Self {
         let subbuffer_allocator = SubbufferAllocator::new(
             memory_allocator.clone(),
@@ -73,8 +72,16 @@ impl LinePass {
         );
 
         Self {
-            pipeline: build_pipeline(device, render_pass),
-            subsurface_pipeline: build_pipeline(device, subsurface_render_pass),
+            pipelines: [
+                [
+                    build_pipeline(device, single_render_pass),
+                    build_pipeline(device, single_subsurface_render_pass),
+                ],
+                [
+                    build_pipeline(device, render_pass),
+                    build_pipeline(device, subsurface_render_pass),
+                ],
+            ],
             subbuffer_allocator,
         }
     }
@@ -88,17 +95,14 @@ impl LinePass {
         view: &FrameView,
         extent: [u32; 2],
         subsurface: bool,
+        msaa: bool,
     ) {
         if lines.is_empty() {
             return;
         }
 
         // Whichever render pass the executor opened around this call.
-        let pipeline = if subsurface {
-            &self.subsurface_pipeline
-        } else {
-            &self.pipeline
-        };
+        let pipeline = &self.pipelines[msaa as usize][subsurface as usize];
 
         // Flatten each segment into its two endpoints for `LineList` topology.
         let mut vertices: Vec<LineVertex> = Vec::with_capacity(lines.len() * 2);
@@ -191,8 +195,13 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
             }),
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState::default()),
+            // Taken from the render pass this pipeline is being built against
+            // rather than named here, so the two cannot disagree — a pipeline
+            // whose sample count differs from its subpass's fails to create.
             multisample_state: Some(MultisampleState {
-                rasterization_samples: vulkano::image::SampleCount::Sample4,
+                rasterization_samples: subpass
+                    .num_samples()
+                    .unwrap_or(vulkano::image::SampleCount::Sample1),
                 ..Default::default()
             }),
             depth_stencil_state: Some(DepthStencilState {

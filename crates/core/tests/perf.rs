@@ -22,6 +22,18 @@
 //!   scenes have too few entities for extraction to show up at all.
 //! - `ORRIN_PERF_FRAMES` is how many frames to average over (default 200).
 //! - `ORRIN_PERF_EXTENT` is `WIDTHxHEIGHT` (default 1920x1080).
+//! - `ORRIN_PERF_GPU_PASSES=0` drops the per-pass GPU rows, leaving a
+//!   whole-frame time the timestamps are not themselves lengthening.
+//! - `ORRIN_PERF_EMPTY=1` despawns everything with a mesh after the scene is
+//!   built, leaving the camera, the lights and the environment: what the frame
+//!   costs with nothing in it.
+//! - `ORRIN_PERF_SSAO_HALF=0` resolves the occlusion at the full extent, which
+//!   is the pair of numbers the `SsaoSettings::half_resolution` default is
+//!   judged against.
+//! - `ORRIN_PERF_MSAA=1` rasterises the forward pass at four samples. The other
+//!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
+//!   pass writes and resolves its own targets and cannot depth-test `EQUAL`
+//!   against the prepass, so it rasterises every triangle a second time.
 //!
 //! Per-pass GPU timing serialises adjacent nodes that would otherwise overlap
 //! (see `profile::gpu_passes_enabled`), so the GPU rows are a breakdown, not a
@@ -40,8 +52,8 @@ use orrin_core::profile::{self, Lane, Profiler};
 use orrin_core::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
 use orrin_core::scene::{
     BloomSettings, Camera, ContactShadowSettings, Culling, DecalSettings, DofSettings,
-    EnvironmentSettings, FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings,
-    ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
+    EnvironmentSettings, FogSettings, HdrSettings, MeshHandle, MotionBlurSettings,
+    RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
     TransparencySettings,
 };
 use orrin_core::systems::{self, FrameGeometry};
@@ -107,15 +119,35 @@ fn frame_cost() {
     if let Some(spec) = StressSpec::from_env() {
         spawn_stress_scene(&mut world, &spec);
     }
+    // The floor: every pass still runs, with nothing to draw into them. Built
+    // from a real scene and then emptied rather than from an empty world,
+    // because the camera, the sun and the environment are what the screen-space
+    // passes cost anything at all against — a world with no sun is a frame with
+    // no shadow passes, which is a different graph rather than a lighter one.
+    if env_usize("ORRIN_PERF_EMPTY", 0) != 0 {
+        let drawn: Vec<_> = world
+            .entities()
+            .filter(|&entity| world.has::<MeshHandle>(entity))
+            .collect();
+        for entity in drawn {
+            world.despawn(entity);
+        }
+    }
 
-    world.insert_resource(SsaoSettings::default());
+    world.insert_resource(SsaoSettings {
+        half_resolution: env_usize("ORRIN_PERF_SSAO_HALF", 1) != 0,
+        ..SsaoSettings::default()
+    });
     world.insert_resource(ContactShadowSettings::default());
     world.insert_resource(SsrSettings::default());
     world.insert_resource(SubsurfaceSettings::default());
     world.insert_resource(DecalSettings::default());
     world.insert_resource(TransparencySettings::default());
     world.insert_resource(RefractionSettings::default());
-    world.insert_resource(TaaSettings::default());
+    world.insert_resource(TaaSettings {
+        msaa: env_usize("ORRIN_PERF_MSAA", 0) != 0,
+        ..TaaSettings::default()
+    });
     world.insert_resource(Culling::default());
     world.insert_resource(ShadowSettings {
         enabled: env_usize("ORRIN_PERF_SHADOWS", 1) != 0,
@@ -133,7 +165,12 @@ fn frame_cost() {
     // frame it belongs to; the aggregate below reads the whole ring.
     let mut profiler = Profiler::new((frames + WARMUP) as usize + 8);
     profile::set_enabled(true);
-    profile::set_gpu_passes_enabled(true);
+    // The per-pass breakdown costs the overlap it measures: a timestamp around
+    // every node drains passes the GPU would otherwise run together. Off, the
+    // whole-frame row is what the hardware actually does, and the gap between
+    // the two runs is the overlap the schedule is getting.
+    let gpu_passes = env_usize("ORRIN_PERF_GPU_PASSES", 1) != 0;
+    profile::set_gpu_passes_enabled(gpu_passes);
 
     let mut entities = 0usize;
     for frame in 0..frames + WARMUP {

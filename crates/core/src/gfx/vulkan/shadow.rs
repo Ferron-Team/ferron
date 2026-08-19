@@ -27,7 +27,12 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{RenderPass, Subpass};
+use vulkano::command_buffer::{ClearAttachment, ClearRect};
+use vulkano::image::{ImageLayout, SampleCount};
+use vulkano::render_pass::{
+    AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass,
+    RenderPassCreateInfo, Subpass, SubpassDescription,
+};
 use vulkano::sync::GpuFuture;
 
 use crate::gfx::punctual::ShadowAtlas;
@@ -66,6 +71,28 @@ struct MaskedPushConstants {
 
 pub struct ShadowPass {
     pub(super) render_pass: Arc<RenderPass>,
+    /// The same pass for the punctual atlas, differing in one operation: the
+    /// depth attachment is `DontCare` rather than `Clear`.
+    ///
+    /// A cascade is a full layer that is entirely re-rendered, so clearing it
+    /// whole is exactly right. The atlas is not: it is one 4096² image holding
+    /// up to 64 tiles, of which a typical scene lights a fraction — the demo
+    /// uses 19 — and clearing the whole thing writes 67 MB a frame to blank 45
+    /// tiles nobody will read. [`record_atlas`](ShadowPass::record_atlas) clears
+    /// the tiles actually in use instead.
+    ///
+    /// Safe only because `atlas_shadow` in `shading.glsl` clamps every one of
+    /// its nine taps to half a texel inside the tile it belongs to. Nothing can
+    /// read a texel outside an assigned tile, so whatever is left there is
+    /// unobservable. The cascades cannot make that promise — they deliberately
+    /// let a tap fall past the edge onto the sampler's white border — which is
+    /// the other reason these are two render passes and not one.
+    ///
+    /// Compatible with the same pipelines, and that is a Vulkan guarantee rather
+    /// than a coincidence: render-pass compatibility is defined on attachment
+    /// formats and sample counts, and explicitly excludes load and store
+    /// operations.
+    pub(super) atlas_render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
     /// The caster pipeline for a `Masked` material: two-sided, and running the
     /// fragment shader's alpha test.
@@ -102,12 +129,14 @@ pub struct ShadowPass {
 impl ShadowPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
-        let render_pass = depth_only_render_pass(device);
+        let render_pass = depth_only_render_pass(device, AttachmentLoadOp::Clear);
+        let atlas_render_pass = depth_only_render_pass(device, AttachmentLoadOp::DontCare);
         let pipeline = build_pipeline(ctx, &render_pass, false);
         let masked_pipeline = build_pipeline(ctx, &render_pass, true);
 
         Self {
             render_pass,
+            atlas_render_pass,
             pipeline,
             masked_pipeline,
             lit_view: build_lit_view(ctx),
@@ -238,6 +267,37 @@ impl ShadowPass {
         bases: &[u32],
         sets: &CasterSets,
     ) {
+        // Every tile this frame assigned, cleared before anything draws — and
+        // *only* those, which is the point: the attachment's load operation is
+        // `DontCare`, so the 45-odd tiles a typical scene leaves unassigned cost
+        // nothing rather than 67 MB of blanking. See `atlas_render_pass`.
+        //
+        // Over every assigned face rather than only the ones with something to
+        // draw: a light whose caster list came back empty still has its tile
+        // sampled, and it has to read as far, or the light would be shadowed by
+        // whatever the last frame left in that tile.
+        let tiles: Vec<ClearRect> = atlas
+            .casters
+            .iter()
+            .flat_map(|caster| {
+                &atlas.faces[caster.first_face..caster.first_face + caster.face_count]
+            })
+            .map(|face| ClearRect {
+                offset: face.tile.offset,
+                extent: [face.tile.size; 2],
+                array_layers: 0..1,
+            })
+            .collect();
+        if tiles.is_empty() {
+            return;
+        }
+        builder
+            .clear_attachments(
+                [ClearAttachment::Depth(1.0)].into_iter().collect(),
+                tiles.into_iter().collect(),
+            )
+            .unwrap();
+
         builder
             .set_depth_bias(self.punctual_constant_bias, 0.0, self.punctual_slope_bias)
             .unwrap();
@@ -441,20 +501,28 @@ pub(super) fn comparison_sampler(device: &Arc<Device>) -> Arc<Sampler> {
     .unwrap()
 }
 
-fn depth_only_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
-    vulkano::single_pass_renderpass!(
-        device.clone(),
-        attachments: {
-            depth: {
-                format: DEPTH_FORMAT,
-                samples: 1,
-                load_op: Clear,
-                store_op: Store,
-            },
-        },
-        pass: { color: [], depth_stencil: {depth} },
-    )
-    .unwrap()
+fn depth_only_render_pass(device: &Arc<Device>, load_op: AttachmentLoadOp) -> Arc<RenderPass> {
+    let create_info = RenderPassCreateInfo {
+        attachments: vec![AttachmentDescription {
+            format: DEPTH_FORMAT,
+            samples: SampleCount::Sample1,
+            load_op,
+            store_op: AttachmentStoreOp::Store,
+            initial_layout: ImageLayout::DepthStencilAttachmentOptimal,
+            final_layout: ImageLayout::DepthStencilAttachmentOptimal,
+            ..Default::default()
+        }],
+        subpasses: vec![SubpassDescription {
+            depth_stencil_attachment: Some(AttachmentReference {
+                attachment: 0,
+                layout: ImageLayout::DepthStencilAttachmentOptimal,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    RenderPass::new(device.clone(), create_info).unwrap()
 }
 
 fn build_pipeline(

@@ -272,7 +272,7 @@ impl VulkanRenderer {
         present: PresentSettings,
         make_target: impl FnOnce(&VkContext, &Arc<RenderPass>, Format, [u32; 2]) -> SwapchainState,
     ) -> Self {
-        let forward = ForwardPass::new(&ctx, hdr::HDR_FORMAT);
+        let forward = ForwardPass::new(&ctx, hdr::HDR_FORMAT, hdr::HDR_WIDE_FORMAT);
         let hdr = HdrPass::new(&ctx, format);
         let exposure = ExposurePass::new(&ctx);
         let bloom = BloomPass::new(&ctx);
@@ -293,9 +293,17 @@ impl VulkanRenderer {
             &ctx.memory_allocator,
             &forward.render_pass,
             &forward.subsurface_render_pass,
+            &forward.single_render_pass,
+            &forward.single_subsurface_render_pass,
         );
         let environment =
-            EnvironmentPass::new(&ctx, &forward.render_pass, &forward.subsurface_render_pass);
+            EnvironmentPass::new(
+                &ctx,
+                &forward.render_pass,
+                &forward.subsurface_render_pass,
+                &forward.single_render_pass,
+                &forward.single_subsurface_render_pass,
+            );
         let swapchain = make_target(&ctx, &hdr.tonemap_rp, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
 
@@ -322,7 +330,9 @@ impl VulkanRenderer {
         // path uses; anything else recompiles on its first render.
         let config = FrameConfig {
             color_format: format,
+            msaa: false,
             ssao: true,
+            ssao_half_res: true,
             contact_shadows: true,
             ssr: false,
             subsurface: false,
@@ -492,7 +502,10 @@ impl VulkanRenderer {
     }
 
     fn reallocate(&mut self) {
-        self.images = GraphImages::allocate(
+        // Rebuilt rather than replaced, so the image cache survives: a
+        // structural toggle re-points `views` at allocations that already exist
+        // instead of recreating every image in the frame. See `GraphImages`.
+        self.images.rebuild(
             &self.ctx.memory_allocator,
             &self.frame.graph,
             self.swapchain.extent,
@@ -812,12 +825,26 @@ impl VulkanRenderer {
         // exposure — flows through the same compiled schedule.
         self.ensure_graph(FrameConfig {
             color_format: self.swapchain.format,
+            msaa: taa.msaa,
             ssao: ssao.enabled,
+            ssao_half_res: ssao.half_resolution,
             contact_shadows: contact_shadows.enabled,
             ssr: ssr.enabled,
             subsurface: subsurface.enabled,
-            transparency: transparency.enabled,
-            refraction: refraction.enabled,
+            // Emptiness is part of the frame's structure, not a flag read at
+            // record time. With nothing blended and nothing refractive on
+            // screen these two chains still cost two full-resolution attachment
+            // clears, a seven-level half-res pyramid build, and two full-res
+            // composites that are provably identity operations — around 290 MB
+            // a frame, roughly a quarter of the whole budget, spent on doing
+            // nothing.
+            //
+            // Safe to vary per frame only because `GraphImages` caches its
+            // allocations: an object drifting on and off screen recompiles the
+            // graph, and without that cache each crossing would drop and
+            // recreate every image in the frame.
+            transparency: transparency.enabled && !transparent.is_empty(),
+            refraction: refraction.enabled && !refractive.is_empty(),
             taa: taa.enabled,
             auto_exposure: hdr.auto_exposure,
             motion_blur: motion_blur.enabled,
@@ -1052,9 +1079,12 @@ impl VulkanRenderer {
             .ids
             .prepass
             .map(|_| self.prepass.begin_frame(&view));
-        let ssao_uniforms = self.frame.ids.ssao.map(|_| {
+        // The AO extent rather than the frame's: the noise tiles per AO texel,
+        // so a half-res target that scaled the pattern by the window would
+        // stretch the rotation across two pixels and band the result.
+        let ssao_uniforms = self.frame.ids.ssao.map(|ids| {
             self.ssao.begin_frame(
-                self.swapchain.extent,
+                self.images.extent(ids.raw_ao),
                 frame_uniforms
                     .clone()
                     .expect("SSAO reads the geometry prepass"),
@@ -1621,21 +1651,35 @@ impl VulkanRenderer {
                     prepass_material_set.clone(),
                     prepass_texture_set.clone(),
                 ),
+                // Both AO passes take their viewport from the target they draw
+                // into rather than from the frame, because that target is the
+                // one thing here that is not always the frame's size. They still
+                // sample the prepass at full res: the resolve reads depth and
+                // normals by UV, and picking one of four texels is what makes
+                // the half-res version cheaper.
                 PassBody::SsaoResolve => {
-                    let ids = self.frame.ids.prepass.unwrap();
+                    let prepass = self.frame.ids.prepass.unwrap();
+                    let ids = self.frame.ids.ssao.unwrap();
                     self.ssao.record_ao(
                         &mut builder,
                         self,
-                        extent,
+                        self.images.extent(ids.raw_ao),
                         ssao_uniforms.as_ref().unwrap(),
-                        self.images.view(ids.depth),
-                        self.images.view(ids.normal),
+                        self.images.view(prepass.depth),
+                        self.images.view(prepass.normal),
                     );
                 }
                 PassBody::SsaoBlur => {
                     let ids = self.frame.ids.ssao.unwrap();
-                    self.ssao
-                        .record_blur(&mut builder, self, extent, self.images.view(ids.raw_ao));
+                    let prepass = self.frame.ids.prepass.unwrap();
+                    self.ssao.record_blur(
+                        &mut builder,
+                        self,
+                        self.images.extent(ids.ao),
+                        self.images.view(ids.raw_ao),
+                        self.images.view(prepass.depth),
+                        ssao_uniforms.as_ref().unwrap(),
+                    );
                 }
                 PassBody::ContactShadows => {
                     let ids = self
@@ -1659,6 +1703,7 @@ impl VulkanRenderer {
                     // pass this frame opens, so the pipeline every draw inside it
                     // binds follows from the same answer.
                     let subsurface = self.frame.ids.subsurface.is_some();
+                    let msaa = self.frame.ids.msaa.is_some();
                     self.forward.draw(
                         &mut builder,
                         self,
@@ -1667,6 +1712,7 @@ impl VulkanRenderer {
                         extent,
                         &forward_sets,
                         subsurface,
+                        msaa,
                     );
                     // Between the geometry and the lines, and it has to be:
                     // after the geometry so the depth test rejects the sky
@@ -1680,6 +1726,7 @@ impl VulkanRenderer {
                         extent,
                         environment,
                         subsurface,
+                        msaa,
                         self.fog.uniforms(),
                         self.fog.volume_or_fallback(
                             self.frame.ids.fog.map(|ids| self.images.view(ids.volume)),
@@ -1689,7 +1736,7 @@ impl VulkanRenderer {
                     // Debug lines share the forward subpass: depth-tested against
                     // the scene, drawn on top of it, before the pass ends.
                     self.line
-                        .record(&mut builder, debug_lines, &view, extent, subsurface);
+                        .record(&mut builder, debug_lines, &view, extent, subsurface, msaa);
                 }
                 PassBody::OitAccumulate => self.oit.record(
                     &mut builder,

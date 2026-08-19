@@ -169,6 +169,7 @@ impl VkContext {
         .expect("failed to create device");
 
         let queue = queues.next().unwrap();
+        assert_packed_color_is_storable(&device);
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
@@ -270,4 +271,42 @@ fn select_physical_device(
             _ => 4,
         })
         .expect("no suitable physical device found")
+}
+
+
+/// Fail at startup if the frame's packed colour format cannot back a storage
+/// image on this device.
+///
+/// [`HDR_FORMAT`](super::hdr::HDR_FORMAT) is what most of the optical chain
+/// reads and writes, and roughly half of those passes are compute passes writing
+/// it as a storage image. Vulkan's mandatory-format table guarantees
+/// `B10G11R11_UFLOAT_PACK32` as a sampled image and a colour attachment but *not*
+/// as a storage image — in practice every desktop driver supports it, and the
+/// halved bandwidth is worth more than any other single change in the frame.
+///
+/// Checked here, once, rather than left to surface as a descriptor-write failure
+/// deep inside the first frame that runs bloom. If this ever fires on real
+/// hardware the fix is to make the format a device-chosen field of `FrameConfig`
+/// and compile a second set of compute shaders for the wide format — which is
+/// why the assertion says so.
+fn assert_packed_color_is_storable(device: &Arc<Device>) {
+    let supported = device
+        .physical_device()
+        .format_properties(super::hdr::HDR_FORMAT)
+        .map(|properties| {
+            properties
+                .optimal_tiling_features
+                .contains(vulkano::format::FormatFeatures::STORAGE_IMAGE)
+        })
+        .unwrap_or(false);
+
+    assert!(
+        supported,
+        "this device cannot use {:?} as a storage image, which the frame's \
+         colour chain requires. Vulkan does not mandate it, though every \
+         desktop driver provides it; supporting such a device means making the \
+         colour format a device-chosen `FrameConfig` field and building the \
+         compute passes against both formats.",
+        super::hdr::HDR_FORMAT,
+    );
 }

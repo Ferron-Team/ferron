@@ -70,7 +70,7 @@ use crate::gfx::{DrawList, Vertex};
 use super::VulkanRenderer;
 use super::context::VkContext;
 use super::forward::ForwardSets;
-use super::hdr::HDR_FORMAT;
+use super::hdr::HDR_WIDE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -354,7 +354,7 @@ fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
     let create_info = RenderPassCreateInfo {
         attachments: vec![
             AttachmentDescription {
-                format: HDR_FORMAT,
+                format: HDR_WIDE_FORMAT,
                 samples: SampleCount::Sample1,
                 load_op: AttachmentLoadOp::Clear,
                 store_op: AttachmentStoreOp::Store,
@@ -520,8 +520,11 @@ fn build_compute(
 
 /// The format the accumulation target is created with. Float and wide because
 /// what it holds is premultiplied HDR radiance, exactly as the frame it will be
-/// composited over holds.
-pub(super) const ACCUM_FORMAT: Format = HDR_FORMAT;
+/// composited over holds — and premultiplied means the coverage it was
+/// multiplied by has to survive in alpha for `refraction_composite` to put the
+/// scene back underneath it. That is what keeps this off the packed colour
+/// format the rest of the chain moved to.
+pub(super) const ACCUM_FORMAT: Format = HDR_WIDE_FORMAT;
 
 mod fs {
     vulkano_shaders::shader! {

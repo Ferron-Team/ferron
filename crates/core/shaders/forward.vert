@@ -33,6 +33,12 @@ layout(set = 4, binding = 0, std430) readonly buffer Objects {
     Object objects[];
 };
 
+// The other half of the depth-invariance guarantee `prepass.vert` documents:
+// with MSAA off this pass attaches the prepass depth read-only and tests
+// `EQUAL` against it, so `push.view_proj * world` here and `frame.view_proj *
+// world_pos` there have to round identically.
+invariant gl_Position;
+
 void main() {
     uint object = push.object_base + uint(gl_InstanceIndex);
     mat4 model = objects[object].model;

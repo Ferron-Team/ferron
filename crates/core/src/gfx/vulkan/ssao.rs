@@ -324,21 +324,44 @@ impl SsaoPass {
         unsafe { builder.draw(3, 1, 0, 0).unwrap() };
     }
 
+    /// The blur is also the upsample when the occlusion was resolved at half the
+    /// frame's extent, which is why it takes the prepass depth: it weights each
+    /// tap by how close that tap's surface is to the centre's, so the term stops
+    /// bleeding across silhouettes. See `ssao_blur.frag`.
     pub(super) fn record_blur(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         renderer: &VulkanRenderer,
         extent: [u32; 2],
         raw_ao_view: Arc<ImageView>,
+        depth_view: Arc<ImageView>,
+        uniforms: &SsaoUniforms,
     ) {
         let input = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.blur_pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::image_view_sampler(
-                0,
-                raw_ao_view,
-                self.nearest_clamp.clone(),
-            )],
+            [
+                WriteDescriptorSet::image_view_sampler(
+                    0,
+                    raw_ao_view,
+                    self.nearest_clamp.clone(),
+                ),
+                // Nearest, like every other read of this depth: interpolating
+                // across a silhouette invents a surface, which is precisely what
+                // the weighting below exists to stop.
+                WriteDescriptorSet::image_view_sampler(
+                    1,
+                    depth_view,
+                    self.nearest_clamp.clone(),
+                ),
+            ],
+            [],
+        )
+        .unwrap();
+        let frame_set = DescriptorSet::new(
+            renderer.ctx.descriptor_set_allocator.clone(),
+            self.blur_pipeline.layout().set_layouts()[1].clone(),
+            [WriteDescriptorSet::buffer(0, uniforms.frame.clone())],
             [],
         )
         .unwrap();
@@ -351,7 +374,7 @@ impl SsaoPass {
                 PipelineBindPoint::Graphics,
                 self.blur_pipeline.layout().clone(),
                 0,
-                vec![input],
+                vec![input, frame_set],
             )
             .unwrap();
         unsafe { builder.draw(3, 1, 0, 0).unwrap() };

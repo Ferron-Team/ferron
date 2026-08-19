@@ -50,7 +50,18 @@ layout(set = 0, binding = 0) uniform Frame {
     mat4 prev_view_proj;
     // xy = the NDC offset baked into `proj`.
     vec4 jitter;
+    // `proj * view`, premultiplied CPU-side. See the FrameUbo doc comment.
+    mat4 view_proj;
 } frame;
+
+// The forward pass tests `EQUAL` against the depth this pass writes, so the two
+// shaders have to agree on `gl_Position` to the last bit. `invariant` is the
+// guarantee that they do: it holds for the same expression over the same
+// inputs, which is why the line below multiplies by the premultiplied
+// `view_proj` rather than by `proj` and `view` in turn -- `forward.vert` has
+// only the product, and `proj * (view * world)` is not `(proj * view) * world`
+// in floating point.
+invariant gl_Position;
 
 // The same per-object buffer the forward pass reads, uploaded once per frame.
 // Mirrors GpuObject in forward.rs.
@@ -86,8 +97,12 @@ void main() {
     v_world_pos = world_pos.xyz;
     vec4 view_pos = frame.view * world_pos;
     v_view_pos = view_pos.xyz;
+    gl_Position = frame.view_proj * world_pos;
+
+    // Still by way of view space, unlike the position above: this feeds the
+    // jitter removal below rather than the rasteriser, so it is not the value
+    // the depth test compares and nothing downstream needs it bit-exact.
     vec4 clip = frame.proj * view_pos;
-    gl_Position = clip;
 
     // `proj` carries the jitter as a translation of clip.xy by jitter * w, so
     // subtracting exactly that recovers the unjittered position.

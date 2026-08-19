@@ -24,7 +24,7 @@ use super::bloom::MAX_BLOOM_MIPS;
 use super::contact_shadows::MASK_FORMAT;
 use super::dof::COC_TILE_SHIFT;
 use super::fog::{FOG_FORMAT, FROXEL_SHIFT, FROXEL_SLICES};
-use super::hdr::HDR_FORMAT;
+use super::hdr::{HDR_FORMAT, HDR_WIDE_FORMAT};
 use super::motion_blur::TILE_SHIFT;
 use super::oit::{ACCUM_FORMAT, REVEAL_FORMAT};
 use super::prepass::{MATERIAL_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT};
@@ -40,7 +40,34 @@ use super::swapchain::DEPTH_FORMAT;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FrameConfig {
     pub color_format: Format,
+    /// Whether the forward pass rasterises at [`MSAA_SAMPLES`] rather than one.
+    ///
+    /// Off by default, and the default is the point: this frame also runs TAA,
+    /// which already resolves geometric edges, so multisampling on top of it
+    /// buys the absence of one frame of temporal lag on silhouettes for roughly
+    /// a quarter of the frame time. `resources.rs` asks for `LAZILY_ALLOCATED`
+    /// memory so that the multisampled targets cost no DRAM at all, which is
+    /// true on MoltenVK's tile memory and false on every desktop driver —
+    /// AMD and NVIDIA expose no lazily-allocated memory type, so there the pair
+    /// is ordinary VRAM paying full write-and-resolve traffic.
+    ///
+    /// Kept as a field rather than deleted because the evidence is worth being
+    /// able to reproduce, and because the MoltenVK path really is nearly free.
+    /// It costs a second set of pipelines at startup, which the masked and
+    /// subsurface variants already establish as the shape of this pass.
+    ///
+    /// Structural, and more deeply than most: it decides which forward *render
+    /// pass* the frame opens, whether the multisampled targets are declared at
+    /// all, and — off — makes the geometry prepass mandatory, because the
+    /// forward pass then depth-tests against the depth that pass wrote instead
+    /// of rasterising its own.
+    pub msaa: bool,
     pub ssao: bool,
+    /// Whether the occlusion is resolved at half the frame's extent. Structural
+    /// because it is a size rather than a uniform: the two AO images change
+    /// extent, so the graph has to reallocate them and the passes that draw into
+    /// them have to be told the new viewport.
+    pub ssao_half_res: bool,
     /// Whether the frame marches the depth buffer for the shadow band the
     /// cascades cannot resolve. Structural like the rest, and one more consumer
     /// that keeps the geometry prepass alive on its own — it reads the depth and
@@ -223,8 +250,10 @@ pub struct FrameIds {
     /// frame it is in, which is what makes inserting a stage a change to one
     /// binding rather than to every consumer.
     pub scene_color: ResourceId,
-    pub msaa_hdr: ResourceId,
-    pub msaa_depth: ResourceId,
+    /// The multisampled pair, in a frame that rasterises at more than one
+    /// sample. `None` on the default path, where the forward pass shades
+    /// straight into `hdr_color` and borrows the prepass depth.
+    pub msaa: Option<MsaaIds>,
     /// Written by the metering passes and read by the tonemap pass. Always
     /// declared, because the tonemap pass binds it whether or not anything wrote
     /// it this frame — an import may be read without a writer, which is exactly
@@ -355,6 +384,19 @@ pub struct SsrIds {
     pub output: ResourceId,
 }
 
+/// The forward pass's multisampled targets, declared only when `FrameConfig::msaa`
+/// is on.
+///
+/// Both are `DontCare`/`DontCare` within the render pass: the colour is resolved
+/// into `hdr_color` and the depth is never read again, which is what lets both
+/// ask for lazily-allocated memory on a tiler. On a desktop driver that request
+/// is silently ignored and they are the most expensive images in the frame.
+#[derive(Clone, Copy, Debug)]
+pub struct MsaaIds {
+    pub hdr: ResourceId,
+    pub depth: ResourceId,
+}
+
 /// Subsurface scattering's targets: the one the forward pass resolves into, the
 /// two the separable blur ping-pongs through, and what the composite was handed.
 ///
@@ -365,7 +407,10 @@ pub struct SsrIds {
 #[derive(Clone, Copy, Debug)]
 pub struct SubsurfaceIds {
     pub source: ResourceId,
-    pub msaa_diffusible: ResourceId,
+    /// The multisampled half of the pair, and `None` for the same reason
+    /// [`FrameIds::msaa`] is: at one sample the forward pass writes `diffusible`
+    /// directly and there is nothing to resolve from.
+    pub msaa_diffusible: Option<ResourceId>,
     /// `rgb` = the radiance that left the surface elsewhere, `a` = the widest
     /// channel's mean free path in metres. The alpha is the only mask the passes
     /// need, so nothing else carries one.
@@ -580,7 +625,14 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // material target — and transparency and refraction both attach the depth
     // read-only, the two readers that want it as an attachment rather than as a
     // texture.
-    let prepass = (config.ssao
+    //
+    // And one more, which is why `!config.msaa` is in the list: at one sample
+    // the forward pass does not rasterise a depth buffer of its own at all. It
+    // attaches this one read-only and tests `EQUAL` against it, which is what
+    // turns the prepass from a cost the forward pass ignores into perfect
+    // early-Z with no shading overdraw.
+    let prepass = (!config.msaa
+        || config.ssao
         || config.contact_shadows
         || config.subsurface
         || config.taa
@@ -596,18 +648,41 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             depth: builder.create_image("prepass_depth", ImageDesc::new(DEPTH_FORMAT)),
         });
 
+    // Both AO images at one extent, whichever it is: the blur samples the
+    // resolve's output texel for texel, and the forward pass reads the result by
+    // screen UV through a linear sampler, so the only pass that has to know
+    // which extent this is is the one setting the viewport.
+    let ao_extent = if config.ssao_half_res {
+        Extent::FrameDiv(1)
+    } else {
+        Extent::Frame
+    };
     let ssao = config.ssao.then(|| SsaoIds {
-        raw_ao: builder.create_image("ssao_raw_ao", ImageDesc::new(AO_FORMAT)),
-        ao: builder.create_image("ssao_ao", ImageDesc::new(AO_FORMAT)),
+        raw_ao: builder.create_image("ssao_raw_ao", ImageDesc::new(AO_FORMAT).extent(ao_extent)),
+        ao: builder.create_image("ssao_ao", ImageDesc::new(AO_FORMAT).extent(ao_extent)),
     });
 
-    let msaa_hdr =
-        builder.create_image("msaa_hdr", ImageDesc::new(HDR_FORMAT).samples(MSAA_SAMPLES));
-    let msaa_depth = builder.create_image(
-        "msaa_depth",
-        ImageDesc::new(DEPTH_FORMAT).samples(MSAA_SAMPLES),
-    );
-    let hdr_color = builder.create_image("hdr_color", ImageDesc::new(HDR_FORMAT));
+    let msaa = config.msaa.then(|| MsaaIds {
+        hdr: builder.create_image(
+            "msaa_hdr",
+            ImageDesc::new(HDR_WIDE_FORMAT).samples(MSAA_SAMPLES),
+        ),
+        depth: builder.create_image(
+            "msaa_depth",
+            ImageDesc::new(DEPTH_FORMAT).samples(MSAA_SAMPLES),
+        ),
+    });
+    // The packed format, except in a multisampled frame. Two constraints force
+    // that exception and either alone would be enough: a render-pass resolve
+    // requires the source and destination formats to match, and alpha to
+    // coverage reads the first attachment's alpha — which an attachment with no
+    // alpha component supplies as 1.0, quietly un-cutting every cutout.
+    let color_format = if config.msaa {
+        HDR_WIDE_FORMAT
+    } else {
+        HDR_FORMAT
+    };
+    let hdr_color = builder.create_image("hdr_color", ImageDesc::new(color_format));
 
     if let Some(prepass) = prepass {
         let id = builder
@@ -631,9 +706,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .build();
         record(id, PassBody::SsaoResolve, &mut bodies);
 
+        // The depth as well as the raw term: the blur is bilateral, and at half
+        // resolution it is also the upsample. See `ssao_blur.frag`.
         let id = builder
             .pass("ssao_blur", PassKind::Inline)
             .access(ssao.raw_ao, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
             .access(ssao.ao, Access::ColorAttachment)
             .build();
         record(id, PassBody::SsaoBlur, &mut bodies);
@@ -712,10 +790,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // same shape as the frame's first pair, and only in a frame that diffuses.
     let subsurface_targets = config.subsurface.then(|| {
         (
-            builder.create_image(
-                "msaa_subsurface",
-                ImageDesc::new(SUBSURFACE_FORMAT).samples(MSAA_SAMPLES),
-            ),
+            msaa.map(|_| {
+                builder.create_image(
+                    "msaa_subsurface",
+                    ImageDesc::new(SUBSURFACE_FORMAT).samples(MSAA_SAMPLES),
+                )
+            }),
             builder.create_image("subsurface_diffusible", ImageDesc::new(SUBSURFACE_FORMAT)),
         )
     });
@@ -738,18 +818,37 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     if let Some(fog) = fog {
         forward = forward.access(fog.volume, Access::Sampled);
     }
-    forward = forward
-        .access(msaa_hdr, Access::ColorAttachment)
-        .access(msaa_depth, Access::DepthAttachment)
-        .access(hdr_color, Access::ResolveAttachment);
+    forward = match msaa {
+        Some(msaa) => forward
+            .access(msaa.hdr, Access::ColorAttachment)
+            .access(msaa.depth, Access::DepthAttachment)
+            .access(hdr_color, Access::ResolveAttachment),
+        // One sample, so there is nothing to resolve from: shade straight into
+        // the image the resolve used to land in, and attach the depth the
+        // prepass wrote read-only. `DepthAttachmentRead` is the declaration that
+        // makes it legal for the passes after this one to keep sampling it —
+        // the image never leaves `DepthStencilReadOnlyOptimal`, which is the
+        // same contract `oit_accumulate` and `refraction_draw` already sign.
+        None => forward
+            .access(hdr_color, Access::ColorAttachment)
+            .access(
+                prepass
+                    .expect("a one-sample forward pass depth-tests against the prepass")
+                    .depth,
+                Access::DepthAttachmentRead,
+            ),
+    };
     // Between the first colour attachment and its resolve in the render pass's
     // own declaration order, but the graph does not care about order — only that
     // an attachment declared here is one the framebuffer binds. `PassFramebuffers`
     // is what keeps the two lists in step.
     if let Some((msaa_diffusible, diffusible)) = subsurface_targets {
-        forward = forward
-            .access(msaa_diffusible, Access::ColorAttachment)
-            .access(diffusible, Access::ResolveAttachment);
+        forward = match msaa_diffusible {
+            Some(msaa_diffusible) => forward
+                .access(msaa_diffusible, Access::ColorAttachment)
+                .access(diffusible, Access::ResolveAttachment),
+            None => forward.access(diffusible, Access::ColorAttachment),
+        };
     }
     let id = forward.build();
     record(id, PassBody::Forward, &mut bodies);
@@ -1131,25 +1230,31 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // composite's bilinear upsample puts back more detail than the extra
         // resolution would have carried, because the field it is upsampling is
         // by definition out of focus.
+        // The wide format through the whole chain bar its output, and every
+        // stage needs it for a different reason. The prefilter packs a *signed*
+        // circle of confusion into alpha; the gather writes premultiplied
+        // radiance whose coverage weight the composite divides by; and the tile
+        // image carries two channels of signed maxima. None of the three
+        // survives a format with no alpha and no negatives.
         let prefiltered = builder.create_image(
             "dof_prefiltered",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
         );
         let near = builder.create_image(
             "dof_near",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
         );
         let far = builder.create_image(
             "dof_far",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
         );
-        // Two channels of maxima in an `HDR_FORMAT` image, for the reason the
-        // motion blur tiles are: `R16G16_SFLOAT` is only a guaranteed storage
-        // format behind an optional device feature, and at one texel per 4096
-        // the unused half is not worth a feature flag.
+        // Two channels of maxima, for the reason the motion blur tiles are:
+        // `R16G16_SFLOAT` is only a guaranteed storage format behind an optional
+        // device feature, and at one texel per 4096 the unused half is not worth
+        // a feature flag.
         let tile = builder.create_image(
             "dof_tile",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(COC_TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(COC_TILE_SHIFT)),
         );
         let output = builder.create_image("dof_color", ImageDesc::new(HDR_FORMAT));
 
@@ -1219,18 +1324,20 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // from its own pixel coordinate, and a level sized any other way is a
         // texel off from the one it means to read at odd extents.
         //
-        // Both carry a two-component vector in an `HDR_FORMAT` image. A storage
+        // Both carry a two-component *signed* vector, which is the other reason
+        // they stay on the wide format: a velocity points in both directions and
+        // the packed one is unsigned. A storage
         // image is only guaranteed to support `R16G16_SFLOAT` behind an optional
         // device feature, while `R16G16B16A16_SFLOAT` is always available — and
         // at one texel per 256 the two unused channels are not worth a feature
         // flag on the device.
         let tile = builder.create_image(
             "motion_blur_tile",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
         );
         let neighbour = builder.create_image(
             "motion_blur_neighbour",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
         );
         let output = builder.create_image("motion_blur_color", ImageDesc::new(HDR_FORMAT));
 
@@ -1399,8 +1506,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             swapchain_color,
             hdr_color,
             scene_color,
-            msaa_hdr,
-            msaa_depth,
+            msaa,
             exposure,
             histogram,
             bloom,

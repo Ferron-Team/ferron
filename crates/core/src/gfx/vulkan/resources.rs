@@ -7,6 +7,7 @@
 //! missing a capability something needs, and cannot quietly carry one nothing
 //! asked for.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use vulkano::command_buffer::RenderPassBeginInfo;
@@ -28,9 +29,47 @@ use super::refraction::RefractionPass;
 use super::shadow::ShadowPass;
 use super::ssao::SsaoPass;
 
+/// Everything that distinguishes one allocation from another.
+///
+/// The name is in the key and has to be: two resources can be identical in every
+/// other field and still have to be separate images. `subsurface_blur_x` and
+/// `subsurface_blur_y` are exactly that pair — same format, same extent, and two
+/// allocations precisely because a graph resource is unversioned, so a pass that
+/// read and wrote one image would make "readers after writers" point both ways.
+/// Keying without the name would silently alias them into one.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ImageKey {
+    name: String,
+    format: vulkano::format::Format,
+    extent: [u32; 3],
+    usage: ImageUsage,
+    samples: vulkano::image::SampleCount,
+    array_layers: u32,
+    mip_levels: u32,
+    memoryless: bool,
+}
+
 /// Graph-owned images, indexed by [`ResourceId`].
 pub(super) struct GraphImages {
     views: Vec<Option<Arc<ImageView>>>,
+    /// Every image allocated at the current extent, for any graph, keyed by what
+    /// makes it that image.
+    ///
+    /// A structural toggle — SSAO off, transparency on, the MSAA switch — makes
+    /// `ensure_graph` recompile and call straight back here, and without a cache
+    /// that means dropping and recreating every image and every framebuffer in
+    /// the frame. `declare` and `compile` are device-free and take microseconds;
+    /// the allocation is the entire cost, and it is a visible hitch.
+    ///
+    /// That matters beyond the editor's checkboxes: folding "is this queue
+    /// empty?" into the frame's structure means the graph is recompiled whenever
+    /// an object drifts on or off screen, which without this would hitch every
+    /// few frames.
+    ///
+    /// Cleared on resize rather than allowed to accumulate: `Extent::Frame`
+    /// resolves differently then, so every entry keyed at the old size is dead
+    /// weight no lookup will ever hit again.
+    cache: HashMap<ImageKey, Arc<ImageView>>,
     /// What [`Extent::Frame`](crate::gfx::graph::Extent::Frame) resolved to when
     /// these were allocated, so a resize is a comparison rather than a flag
     /// somebody has to remember to set.
@@ -43,10 +82,36 @@ impl GraphImages {
         graph: &FrameGraph,
         extent: [u32; 2],
     ) -> Self {
+        let mut images = Self {
+            views: Vec::new(),
+            cache: HashMap::new(),
+            extent,
+        };
+        images.rebuild(memory, graph, extent);
+        images
+    }
+
+    /// Point `views` at the images this graph declares, allocating only the ones
+    /// the cache does not already hold.
+    pub fn rebuild(
+        &mut self,
+        memory: &Arc<StandardMemoryAllocator>,
+        graph: &FrameGraph,
+        extent: [u32; 2],
+    ) {
         // A target that is only ever an attachment never leaves the render pass
         // that wrote it, so ask for lazily-allocated memory: on MoltenVK it
-        // becomes tile-only and the 4x MSAA HDR and depth targets cost no DRAM
-        // at all. Backends with no lazy memory type fall back silently.
+        // becomes tile-only and the multisampled HDR and depth targets cost no
+        // DRAM at all.
+        //
+        // "Backends with no lazy memory type fall back silently" is the whole
+        // problem with reading this as a general win. *No* desktop driver
+        // exposes a lazily-allocated memory type — not AMD's, not NVIDIA's — so
+        // there the fallback is ordinary VRAM paying full write-and-resolve
+        // traffic, and `msaa_hdr` at 1440p is 118 MB of it. This request is a
+        // tiler optimisation that costs nothing to keep and buys nothing off a
+        // tiler, which is why `FrameConfig::msaa` now defaults off rather than
+        // why this filter changed.
         let lazy = AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter {
                 preferred_flags: MemoryPropertyFlags::DEVICE_LOCAL
@@ -56,7 +121,17 @@ impl GraphImages {
             ..Default::default()
         };
 
+        if self.extent != extent {
+            self.cache.clear();
+            self.extent = extent;
+        }
+
         let mut views = vec![None; graph.resource_count()];
+        // Within one graph a key must be claimed at most once, or two resources
+        // would be handed the same allocation — see [`ImageKey`] for why that is
+        // a correctness bug and not just a surprise. Names are unique per graph,
+        // so this only fires on a declaration mistake.
+        let mut claimed: std::collections::HashSet<ImageKey> = HashSet::new();
         for (id, image) in graph.transient_images() {
             let extent = image.desc.extent.resolve(extent);
             let mip_levels = image.desc.mip_levels.min(max_mip_levels(extent));
@@ -67,6 +142,26 @@ impl GraphImages {
                 "render graph: `{}` asked to be both a 3D image and a 2D array",
                 graph.resource_name(id),
             );
+            let key = ImageKey {
+                name: graph.resource_name(id).to_string(),
+                format: image.desc.format,
+                extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
+                usage: image.usage,
+                samples: image.desc.samples,
+                array_layers: image.desc.array_layers.unwrap_or(1),
+                mip_levels,
+                memoryless: image.memoryless,
+            };
+            assert!(
+                claimed.insert(key.clone()),
+                "render graph: two resources named `{}` describe the same image",
+                key.name,
+            );
+            if let Some(view) = self.cache.get(&key) {
+                views[id.index()] = Some(view.clone());
+                continue;
+            }
+
             let allocated = Image::new(
                 memory.clone(),
                 ImageCreateInfo {
@@ -122,9 +217,10 @@ impl GraphImages {
                 },
             )
             .unwrap();
+            self.cache.insert(key, view.clone());
             views[id.index()] = Some(view);
         }
-        Self { views, extent }
+        self.views = views;
     }
 
     pub fn is_stale(&self, extent: [u32; 2]) -> bool {
@@ -139,6 +235,15 @@ impl GraphImages {
         self.views[id.index()]
             .clone()
             .expect("render graph resource is not a graph-owned image")
+    }
+
+    /// The width and height a graph-owned image was allocated at, which is what
+    /// a pass drawing into one at less than the frame's extent has to set its
+    /// viewport to — the framebuffer's render area follows the attachment, but
+    /// the viewport is dynamic state nothing derives.
+    pub fn extent(&self, id: ResourceId) -> [u32; 2] {
+        let extent = self.view(id).image().extent();
+        [extent[0], extent[1]]
     }
 
     /// A single-layer 2D view of one layer of an array image.
@@ -258,26 +363,58 @@ impl PassFramebuffers {
                     // colour target, so it opens the render pass that has one.
                     // The attachment order is the order each render pass
                     // *declares*, not the order the graph accessed them in.
-                    PassBody::Forward => match ids.subsurface {
-                        Some(sss) => (
-                            forward.subsurface_render_pass.clone(),
-                            vec![
-                                images.view(ids.msaa_hdr),
-                                images.view(sss.msaa_diffusible),
-                                images.view(ids.msaa_depth),
-                                images.view(ids.hdr_color),
-                                images.view(sss.diffusible),
-                            ],
-                        ),
-                        None => (
-                            forward.render_pass.clone(),
-                            vec![
-                                images.view(ids.msaa_hdr),
-                                images.view(ids.msaa_depth),
-                                images.view(ids.hdr_color),
-                            ],
-                        ),
-                    },
+                    //
+                    // Four shapes rather than two, because the sample count
+                    // moves more than a number: at one sample there is no
+                    // resolve, so `hdr_color` is the colour attachment itself
+                    // and the depth is the geometry prepass's, attached
+                    // read-only — the third image in this frame two render
+                    // passes attach, alongside `oit_accumulate` and
+                    // `refraction_draw`, and for the same reason.
+                    PassBody::Forward => {
+                        let borrowed_depth = || {
+                            images.view(
+                                ids.prepass
+                                    .expect("a one-sample forward pass borrows the prepass depth")
+                                    .depth,
+                            )
+                        };
+                        match (ids.msaa, ids.subsurface) {
+                            (Some(msaa), Some(sss)) => (
+                                forward.subsurface_render_pass.clone(),
+                                vec![
+                                    images.view(msaa.hdr),
+                                    images.view(
+                                        sss.msaa_diffusible
+                                            .expect("a multisampled frame resolves its diffusible"),
+                                    ),
+                                    images.view(msaa.depth),
+                                    images.view(ids.hdr_color),
+                                    images.view(sss.diffusible),
+                                ],
+                            ),
+                            (Some(msaa), None) => (
+                                forward.render_pass.clone(),
+                                vec![
+                                    images.view(msaa.hdr),
+                                    images.view(msaa.depth),
+                                    images.view(ids.hdr_color),
+                                ],
+                            ),
+                            (None, Some(sss)) => (
+                                forward.single_subsurface_render_pass.clone(),
+                                vec![
+                                    images.view(ids.hdr_color),
+                                    images.view(sss.diffusible),
+                                    borrowed_depth(),
+                                ],
+                            ),
+                            (None, None) => (
+                                forward.single_render_pass.clone(),
+                                vec![images.view(ids.hdr_color), borrowed_depth()],
+                            ),
+                        }
+                    }
                     // The prepass depth as the third attachment, read-only —
                     // the one image in this frame two render passes attach.
                     PassBody::OitAccumulate => {
@@ -331,7 +468,7 @@ impl PassFramebuffers {
                     // second declaration of the identical thing would be a
                     // second place for the format to drift.
                     PassBody::PunctualShadows => (
-                        shadow.render_pass.clone(),
+                        shadow.atlas_render_pass.clone(),
                         vec![
                             images.view(
                                 ids.shadow_atlas
@@ -393,7 +530,8 @@ impl PassFramebuffers {
 /// How each pass's attachments start the frame. `None` means "leave it": for the
 /// resolve target and the swapchain image, every pixel is written anyway, so
 /// clearing first is bandwidth spent on values nothing reads.
-pub(super) fn clear_values(body: PassBody, attachments: usize) -> Vec<Option<ClearValue>> {
+pub(super) fn clear_values(body: PassBody, framebuffer: &Framebuffer) -> Vec<Option<ClearValue>> {
+    let attachments = framebuffer.attachments().len();
     match body {
         // Flat +Z in the normal buffer, no motion in the velocity buffer, far in
         // depth. Zero velocity is what the sky and any unrasterised pixel are
@@ -422,14 +560,29 @@ pub(super) fn clear_values(body: PassBody, attachments: usize) -> Vec<Option<Cle
         // mask: the skybox and the debug lines share this render pass and write
         // nothing to that attachment, so zero is what a pixel they covered holds —
         // and a zero radius is exactly "nothing scattered here".
-        PassBody::Forward if attachments == 5 => vec![
-            Some([0.02, 0.02, 0.03, 1.0].into()),
-            Some([0.0, 0.0, 0.0, 0.0].into()),
-            Some(1.0.into()),
-            None,
-            None,
-        ],
-        PassBody::Forward => vec![Some([0.02, 0.02, 0.03, 1.0].into()), Some(1.0.into()), None],
+        //
+        // Four shapes, and the attachment count alone no longer tells them
+        // apart: a multisampled frame without diffusion and a one-sample frame
+        // with it both have three. What separates them is the sample count,
+        // read off the first attachment — the same thing that decides which
+        // render pass `PassFramebuffers::build` opened.
+        PassBody::Forward => {
+            let multisampled = framebuffer.attachments()[0].image().samples()
+                != vulkano::image::SampleCount::Sample1;
+            let color = Some([0.02, 0.02, 0.03, 1.0].into());
+            let diffusible = Some([0.0, 0.0, 0.0, 0.0].into());
+            match (multisampled, attachments) {
+                (true, 5) => vec![color, diffusible, Some(1.0.into()), None, None],
+                (true, _) => vec![color, Some(1.0.into()), None],
+                // One sample: the colour target, the diffusible one if the frame
+                // has it, and the prepass depth last. That depth is *loaded* —
+                // it is the whole input to the `EQUAL` test — so it carries no
+                // clear, exactly as it carries none for the two transparency
+                // passes that borrow it.
+                (false, 3) => vec![color, diffusible, None],
+                (false, _) => vec![color, None],
+            }
+        }
         // Nothing accumulated, and everything revealed. The second is the one
         // that matters: revealage is a running *product* of `1 - alpha`, so a
         // clear of zero would hide the opaque frame everywhere rather than
@@ -472,16 +625,20 @@ pub(super) fn clear_values(body: PassBody, attachments: usize) -> Vec<Option<Cle
         | PassBody::BloomPrefilter
         | PassBody::BloomDownsample(_)
         | PassBody::BloomUpsample(_) => Vec::new(),
-        // One clear for the whole atlas, which is the other half of why every
-        // face is one pass: a tile nobody drew into reads as far, and therefore
-        // as lit.
-        PassBody::ShadowCascade(_) | PassBody::PunctualShadows => vec![Some(1.0.into())],
+        // A cascade is one layer, entirely re-rendered, so clearing it whole is
+        // exactly what it wants: a texel nobody drew into reads as far, and
+        // therefore as lit.
+        PassBody::ShadowCascade(_) => vec![Some(1.0.into())],
+        // The atlas is not. It holds up to 64 tiles of which a frame lights a
+        // fraction, so it loads `DontCare` and `record_atlas` clears the tiles
+        // actually assigned — see `ShadowPass::atlas_render_pass`.
+        PassBody::PunctualShadows => vec![None],
     }
 }
 
 pub(super) fn begin_info(framebuffer: Arc<Framebuffer>, body: PassBody) -> RenderPassBeginInfo {
     RenderPassBeginInfo {
-        clear_values: clear_values(body, framebuffer.attachments().len()),
+        clear_values: clear_values(body, &framebuffer),
         ..RenderPassBeginInfo::framebuffer(framebuffer)
     }
 }

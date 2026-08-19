@@ -57,7 +57,7 @@ use crate::gfx::{DrawList, Vertex};
 use super::VulkanRenderer;
 use super::context::VkContext;
 use super::forward::ForwardSets;
-use super::hdr::HDR_FORMAT;
+use super::hdr::HDR_WIDE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -67,7 +67,10 @@ const TILE: u32 = 8;
 /// `rgb` = the sum of weighted premultiplied radiance, `a` = the sum of weighted
 /// coverage. Float and wide because both sums are unbounded above: the weight in
 /// `oit.frag` is clamped per fragment, not per pixel.
-pub(super) const ACCUM_FORMAT: Format = HDR_FORMAT;
+// The wide format: this target carries *weighted* radiance, and the weight is
+// in alpha. The packed colour format has no alpha channel, so accumulating into
+// it would throw away the divisor the composite needs.
+pub(super) const ACCUM_FORMAT: Format = HDR_WIDE_FORMAT;
 
 /// Transmittance: the running product of `1 - alpha`, one channel and eight bits
 /// of it. The paper's own recommendation — the value is a fraction in `[0, 1]`

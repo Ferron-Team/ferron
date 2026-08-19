@@ -51,14 +51,17 @@ use crate::scene::EnvironmentSettings;
 
 use super::fog::GpuFog;
 
-use super::MSAA_SAMPLES;
 use super::context::VkContext;
-use super::hdr::HDR_FORMAT;
+use super::hdr::HDR_WIDE_FORMAT;
 use super::taa::FrameView;
 
 /// The environment carries the same radiance the scene does, so it uses the
 /// same format the forward target does.
-pub const CUBE_FORMAT: Format = HDR_FORMAT;
+// The wide format, not the packed one the frame's colour uses. This is baked
+// once when an environment is loaded rather than written every frame, so there
+// is no per-frame bandwidth to win here — and the prefilter accumulates weighted
+// taps through the alpha channel the packed format does not have.
+pub const CUBE_FORMAT: Format = HDR_WIDE_FORMAT;
 
 /// Edge length of one cube face. Enough for a background at ordinary fields of
 /// view; not enough for sharp mirror reflections, which is what would drive
@@ -126,12 +129,11 @@ pub struct EnvironmentPass {
     bake_pipeline: Arc<GraphicsPipeline>,
     prefilter_pipeline: Arc<GraphicsPipeline>,
     equirect_sampler: Arc<Sampler>,
-    skybox_pipeline: Arc<GraphicsPipeline>,
-    /// The skybox against the forward pass's subsurface render pass, which has a
-    /// colour attachment more. Both live for the session, for the reason
-    /// [`ForwardPass::subsurface_render_pass`](super::forward::ForwardPass)
+    /// The skybox against each of the forward pass's four render passes,
+    /// indexed `[msaa][subsurface]`. All four live for the session, for the
+    /// reason [`ForwardPass::subsurface_render_pass`](super::forward::ForwardPass)
     /// documents.
-    skybox_subsurface_pipeline: Arc<GraphicsPipeline>,
+    skybox_pipelines: [[Arc<GraphicsPipeline>; 2]; 2],
     cube_sampler: Arc<Sampler>,
     /// Bound in place of the prefiltered chain when nothing is loaded.
     fallback_cube: Arc<ImageView>,
@@ -157,13 +159,23 @@ impl EnvironmentPass {
         ctx: &VkContext,
         forward_rp: &Arc<RenderPass>,
         forward_subsurface_rp: &Arc<RenderPass>,
+        forward_single_rp: &Arc<RenderPass>,
+        forward_single_subsurface_rp: &Arc<RenderPass>,
     ) -> Self {
         let device = &ctx.device;
         let bake_rp = bake_render_pass(device);
         let bake_pipeline = build_bake_pipeline(device, &bake_rp);
         let prefilter_pipeline = build_prefilter_pipeline(device, &bake_rp);
-        let skybox_pipeline = build_skybox_pipeline(device, forward_rp);
-        let skybox_subsurface_pipeline = build_skybox_pipeline(device, forward_subsurface_rp);
+        let skybox_pipelines = [
+            [
+                build_skybox_pipeline(device, forward_single_rp),
+                build_skybox_pipeline(device, forward_single_subsurface_rp),
+            ],
+            [
+                build_skybox_pipeline(device, forward_rp),
+                build_skybox_pipeline(device, forward_subsurface_rp),
+            ],
+        ];
 
         // Repeat in u so the seam wraps, clamp in v so the poles do not fold
         // across to the opposite hemisphere.
@@ -196,8 +208,7 @@ impl EnvironmentPass {
             bake_pipeline,
             prefilter_pipeline,
             equirect_sampler,
-            skybox_pipeline,
-            skybox_subsurface_pipeline,
+            skybox_pipelines,
             fallback_cube: white_cube(ctx),
             cube_sampler,
             cube: None,
@@ -302,6 +313,7 @@ impl EnvironmentPass {
         extent: [u32; 2],
         settings: &EnvironmentSettings,
         subsurface: bool,
+        msaa: bool,
         fog: Subbuffer<GpuFog>,
         fog_volume: Arc<ImageView>,
         fog_sampler: Arc<Sampler>,
@@ -314,11 +326,7 @@ impl EnvironmentPass {
         }
 
         // Whichever render pass the executor opened around this call.
-        let pipeline = if subsurface {
-            &self.skybox_subsurface_pipeline
-        } else {
-            &self.skybox_pipeline
-        };
+        let pipeline = &self.skybox_pipelines[msaa as usize][subsurface as usize];
 
         let set = DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
@@ -915,7 +923,12 @@ fn build_skybox_pipeline(
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState::default()),
             multisample_state: Some(MultisampleState {
-                rasterization_samples: MSAA_SAMPLES,
+                // From the render pass being built against rather than named
+                // here: the forward pass has four, at two sample counts, and a
+                // pipeline that disagreed with its subpass would fail to create.
+                rasterization_samples: subpass
+                    .num_samples()
+                    .unwrap_or(vulkano::image::SampleCount::Sample1),
                 ..Default::default()
             }),
             // The triangle sits exactly on the far plane, so the test has to

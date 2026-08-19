@@ -81,6 +81,22 @@ pub(super) struct FrameUbo {
     inv_proj: [[f32; 4]; 4],
     prev_view_proj: [[f32; 4]; 4],
     jitter: [f32; 4],
+    /// `proj * view`, premultiplied on the CPU — the identical `Mat4` the
+    /// forward pass pushes as a push constant.
+    ///
+    /// Last in the block rather than beside `proj`, and that position is
+    /// load-bearing: `ssao.frag` and `contact_shadows.frag` declare only the
+    /// first three matrices of this block, which is legal exactly as long as
+    /// what they declare stays a prefix of what is uploaded. Appending keeps it
+    /// one; inserting would silently hand both of them the wrong matrix.
+    ///
+    /// It exists so `prepass.vert` can compute `gl_Position` from the same
+    /// expression `forward.vert` does. Multiplying `proj * (view * world)` and
+    /// `(proj * view) * world` are equal in exact arithmetic and not in floating
+    /// point, and the forward pass now depth-tests `EQUAL` against the depth
+    /// this pass wrote — so a difference in the last bit is a surface that
+    /// vanishes. See the `invariant gl_Position` in both shaders.
+    view_proj: [[f32; 4]; 4],
 }
 
 #[derive(BufferContents, Clone, Copy)]
@@ -171,6 +187,7 @@ impl GeometryPrepass {
             inv_proj: view.proj.inverse().to_cols_array_2d(),
             prev_view_proj: view.prev_view_proj.to_cols_array_2d(),
             jitter: [view.jitter.x, view.jitter.y, 0.0, 0.0],
+            view_proj: view.view_proj.to_cols_array_2d(),
         };
         frame
     }

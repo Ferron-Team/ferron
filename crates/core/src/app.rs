@@ -822,7 +822,7 @@ fn print_run_banner(world: &World, renderer: &VulkanRenderer, scene: SceneChoice
 
     println!(
         "Run config: {} build | debug assertions {} | validation {} | present {} | \
-         {}x{} | MSAA {:?} | overlay {} | GPU pass timings {} | scene {}",
+         {}x{} | MSAA {} | overlay {} | GPU pass timings {} | scene {}",
         if cfg!(debug_assertions) {
             "unoptimised"
         } else {
@@ -833,7 +833,14 @@ fn print_run_banner(world: &World, renderer: &VulkanRenderer, scene: SceneChoice
         present,
         extent[0],
         extent[1],
-        crate::gfx::vulkan::MSAA_SAMPLES,
+        // What the frame actually rasterises at, not the constant it *would*
+        // use: MSAA is off by default now, and a banner quoting `Sample4` on a
+        // one-sample run would misdescribe the number beside it.
+        if world.resource::<TaaSettings>().msaa {
+            format!("{:?}", crate::gfx::vulkan::MSAA_SAMPLES)
+        } else {
+            "off".to_string()
+        },
         on_off(world.resource::<Diagnostics>().overlay),
         on_off(crate::profile::gpu_passes_enabled()),
         scene.label(),

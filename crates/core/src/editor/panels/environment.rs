@@ -64,6 +64,13 @@ fn screen_space_column(ui: &mut egui::Ui, world: &World) {
         ui.add(egui::Slider::new(&mut s.radius, 0.0..=4.0).text("Radius"));
         ui.add(egui::Slider::new(&mut s.bias, 0.0..=0.1).text("Bias"));
         ui.add(egui::Slider::new(&mut s.power, 0.1..=4.0).text("Power"));
+        ui.checkbox(&mut s.half_resolution, "Half resolution")
+            .on_hover_text(
+                "Resolve the occlusion at half the frame's extent and let the \
+                 bilateral blur upsample it: a quarter of the pixels through the \
+                 frame's most expensive loop, for a term that is low-frequency \
+                 and blurred either way",
+            );
     }
     ui.add_space(6.0);
     ui.strong("Temporal AA")
@@ -77,6 +84,12 @@ fn screen_space_column(ui: &mut egui::Ui, world: &World) {
             .on_hover_text("How much of the reprojected history each frame keeps");
         ui.add(egui::Slider::new(&mut taa.jitter_scale, 0.0..=1.5).text("Jitter"))
             .on_hover_text("Fraction of a pixel the camera samples across");
+        ui.checkbox(&mut taa.msaa, "4x MSAA").on_hover_text(
+            "Rasterise the forward pass at four samples instead of one. The \
+             alternative to the temporal resolve above, not a companion to it: \
+             it costs roughly a quarter of the frame, and at one sample the \
+             forward pass borrows the prepass depth and shades each pixel once",
+        );
     }
     ui.add_space(6.0);
     ui.strong("Reflections").on_hover_text(

@@ -43,11 +43,74 @@ const BLOOM_MIPS: u8 = 6;
 
 fn configs() -> Vec<(&'static str, FrameConfig)> {
     vec![
+        // The multisampled path, which is no longer the default and so needs
+        // saying explicitly. It is the one shape where the forward pass writes
+        // depth: everything else in this file borrows the geometry prepass's
+        // read-only, which is what the `EQUAL` test is for. Both variants are
+        // here because the pair is exactly what a regression would collapse —
+        // an MSAA frame that stopped resolving, or a one-sample frame that
+        // started declaring a depth *write* and quietly took the prepass's
+        // single-writer guarantee with it.
+        (
+            "editor frame, MSAA on",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                msaa: true,
+                ssao: true,
+                ssao_half_res: false,
+                contact_shadows: false,
+                ssr: false,
+                subsurface: false,
+                transparency: false,
+                refraction: false,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
+                volumetric_fog: false,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
+        // MSAA with the diffusion on, which is the five-attachment forward pass:
+        // two multisampled colour targets and two resolves. The one-sample frame
+        // with diffusion has three attachments and so shares a count with the
+        // multisampled frame without it — see `clear_values`, which is why that
+        // function reads the sample count rather than counting.
+        (
+            "editor frame, MSAA and subsurface on",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                msaa: true,
+                ssao: true,
+                ssao_half_res: false,
+                contact_shadows: false,
+                ssr: false,
+                subsurface: true,
+                transparency: false,
+                refraction: false,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
+                volumetric_fog: false,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+            },
+        ),
         (
             "editor frame, TAA and SSAO on",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -75,7 +138,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, four cascades",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -102,7 +167,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, SSAO off",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: false,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -127,7 +194,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, TAA without SSAO",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: false,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -154,7 +223,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, auto exposure off",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -180,7 +251,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, one bloom level",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -210,7 +283,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, volumetric fog with cascades",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -237,7 +312,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, depth of field and motion blur",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -264,7 +341,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, depth of field and motion blur without TAA",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: false,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -291,7 +370,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, screen-space reflections",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: true,
                 subsurface: false,
@@ -316,7 +397,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, reflections without TAA",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: false,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: true,
                 subsurface: false,
@@ -343,7 +426,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, contact shadows",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: true,
                 ssr: false,
                 subsurface: false,
@@ -368,7 +453,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, contact shadows alone",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: false,
+                ssao_half_res: false,
                 contact_shadows: true,
                 ssr: false,
                 subsurface: false,
@@ -394,7 +481,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, punctual shadow atlas",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: true,
                 ssr: false,
                 subsurface: false,
@@ -420,7 +509,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, punctual shadows without cascades",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: false,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -448,7 +539,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, transparency",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: true,
                 ssr: true,
                 subsurface: false,
@@ -474,7 +567,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, transparency alone",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: false,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -501,7 +596,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, transparency and refraction",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: true,
                 ssr: true,
                 subsurface: false,
@@ -526,7 +623,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, refraction alone",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: false,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -556,7 +655,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, subsurface scattering",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: true,
                 ssr: true,
                 subsurface: true,
@@ -582,7 +683,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "editor frame, subsurface scattering alone",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: false,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: true,
@@ -604,7 +707,9 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             "headless frame, no overlay",
             FrameConfig {
                 color_format: COLOR_FORMAT,
+                msaa: false,
                 ssao: true,
+                ssao_half_res: false,
                 contact_shadows: false,
                 ssr: false,
                 subsurface: false,
@@ -707,7 +812,9 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
     for count in 1..=4u8 {
         let frame = declare(FrameConfig {
             color_format: COLOR_FORMAT,
+            msaa: false,
             ssao: true,
+            ssao_half_res: false,
             contact_shadows: false,
             ssr: false,
             subsurface: false,
@@ -753,7 +860,9 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
 fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
+        msaa: false,
         ssao: true,
+        ssao_half_res: false,
         contact_shadows: false,
         ssr: false,
         subsurface: false,
@@ -805,7 +914,9 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
 fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
+        msaa: false,
         ssao: true,
+        ssao_half_res: false,
         contact_shadows: false,
         ssr: false,
         subsurface: false,
@@ -853,7 +964,9 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
 fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
+        msaa: false,
         ssao: true,
+        ssao_half_res: false,
         contact_shadows: false,
         ssr: false,
         subsurface: false,
@@ -910,7 +1023,9 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
 fn transparency_composites_after_the_reflections_and_before_the_resolve() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
+        msaa: false,
         ssao: true,
+        ssao_half_res: false,
         contact_shadows: false,
         ssr: true,
         subsurface: false,
@@ -964,7 +1079,9 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
 fn transparency_attaches_the_prepass_depth_read_only() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
+        msaa: false,
         ssao: false,
+        ssao_half_res: false,
         contact_shadows: false,
         ssr: false,
         subsurface: false,
@@ -1020,7 +1137,9 @@ fn transparency_attaches_the_prepass_depth_read_only() {
 fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
     let base = FrameConfig {
         color_format: COLOR_FORMAT,
+        msaa: false,
         ssao: false,
+        ssao_half_res: false,
         contact_shadows: false,
         ssr: false,
         subsurface: true,
@@ -1039,10 +1158,28 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
     };
 
     let plan = format!("{}", declare(base).unwrap().graph);
+    // At one sample there is nothing to resolve from: the forward pass writes
+    // the diffusible target directly, and declaring it is the whole requirement.
     assert!(
-        plan.contains("msaa_subsurface ColorAttachment")
-            && plan.contains("subsurface_diffusible ResolveAttachment"),
-        "the forward pass must declare the second target and its resolve:\n{plan}",
+        plan.contains("subsurface_diffusible ColorAttachment"),
+        "the forward pass must declare the second target:\n{plan}",
+    );
+    assert!(
+        !plan.contains("msaa_subsurface"),
+        "a one-sample frame must not declare a multisampled second target:\n{plan}",
+    );
+    // Multisampled, the same target arrives by resolve instead, and both halves
+    // have to be declared or the framebuffer binds an image the plan is silent
+    // about.
+    let multisampled = format!(
+        "{}",
+        declare(FrameConfig { msaa: true, ..base }).unwrap().graph
+    );
+    assert!(
+        multisampled.contains("msaa_subsurface ColorAttachment")
+            && multisampled.contains("subsurface_diffusible ResolveAttachment"),
+        "a multisampled forward pass must declare the second target and its \
+         resolve:\n{multisampled}",
     );
     // The temporal resolve is the next thing in this frame to read the lit
     // colour, so it is where a broken hand-over would show. It must read the
@@ -1096,7 +1233,9 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
 fn refraction_composites_after_the_transparency_and_before_the_resolve() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
+        msaa: false,
         ssao: true,
+        ssao_half_res: false,
         contact_shadows: false,
         ssr: true,
         subsurface: false,
@@ -1143,15 +1282,19 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
 /// `refraction.rs` builds its render pass by hand precisely so the attachment
 /// reference says `DepthStencilReadOnlyOptimal`.
 ///
-/// With both queues on, the prepass depth is now attached read-only by *two*
-/// passes and sampled by others — which is the case the widened write-after-read
-/// barrier in `step` exists for. The single-writer assertion below is what says
-/// neither of them started writing it.
+/// With both queues on and MSAA off, the prepass depth is attached read-only by
+/// *three* passes — the forward pass joined them — and sampled by others, which
+/// is the case the widened write-after-read barrier in `step` exists for. The
+/// single-writer assertion below is what says none of the three started writing
+/// it: it is the guarantee the whole one-sample forward path rests on, because a
+/// forward pass that wrote depth would be racing the passes that sample it.
 #[test]
 fn refraction_attaches_the_prepass_depth_read_only() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
+        msaa: false,
         ssao: false,
+        ssao_half_res: false,
         contact_shadows: false,
         ssr: false,
         subsurface: false,
@@ -1173,8 +1316,9 @@ fn refraction_attaches_the_prepass_depth_read_only() {
     let plan = format!("{}", frame.graph);
     assert_eq!(
         plan.matches("prepass_depth DepthAttachmentRead").count(),
-        2,
-        "both non-opaque queues must attach the prepass depth read-only:\n{plan}",
+        3,
+        "the forward pass and both non-opaque queues must attach the prepass \
+         depth read-only:\n{plan}",
     );
     assert_eq!(
         plan.matches("prepass_depth DepthAttachment\n").count(),
@@ -1198,7 +1342,9 @@ fn refraction_attaches_the_prepass_depth_read_only() {
 fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
+        msaa: false,
         ssao: true,
+        ssao_half_res: false,
         contact_shadows: false,
         ssr: false,
         subsurface: false,
@@ -1265,7 +1411,12 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
 fn any_single_consumer_keeps_the_geometry_prepass() {
     let base = FrameConfig {
         color_format: COLOR_FORMAT,
+        // On, and it is the premise of the whole test: a one-sample forward pass
+        // is itself a consumer of the prepass, so the "nothing wants it" case
+        // below can only be reached with MSAA rasterising its own depth.
+        msaa: true,
         ssao: false,
+        ssao_half_res: false,
         contact_shadows: false,
         ssr: false,
         subsurface: false,
@@ -1283,7 +1434,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         shadow_atlas: 0,
     };
 
-    let consumers: [(&str, fn(&mut FrameConfig)); 9] = [
+    let consumers: [(&str, fn(&mut FrameConfig)); 10] = [
         ("ssao", |c| c.ssao = true),
         ("contact shadows", |c| c.contact_shadows = true),
         ("taa", |c| c.taa = true),
@@ -1293,6 +1444,9 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         ("transparency", |c| c.transparency = true),
         ("refraction", |c| c.refraction = true),
         ("subsurface diffusion", |c| c.subsurface = true),
+        // The forward pass itself, whenever it rasterises at one sample: it has
+        // no depth buffer of its own then and tests `EQUAL` against this one.
+        ("one-sample shading", |c| c.msaa = false),
     ];
     for (label, enable) in consumers {
         let mut config = base;
@@ -1305,7 +1459,9 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
     }
 
     // And nothing wants it when none of them do, so it is genuinely gated
-    // rather than always present.
+    // rather than always present. `base` has MSAA on for exactly this line:
+    // that is the one configuration whose forward pass rasterises its own depth
+    // and therefore needs nothing from this pass.
     assert!(declare(base).unwrap().ids.prepass.is_none());
 }
 
