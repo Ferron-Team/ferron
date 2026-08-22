@@ -13,5 +13,6 @@ pub mod scene;
 pub mod scripting;
 pub mod stats;
 pub mod systems;
+pub mod threads;
 
 pub use app::App;

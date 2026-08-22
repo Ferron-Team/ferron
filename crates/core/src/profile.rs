@@ -15,8 +15,16 @@
 //! Collection is per-thread and only the thread that calls `end_frame` is
 //! drained, which matches the engine's single-threaded frame loop. Threaded
 //! command recording would need each thread's buffer merged here.
+//!
+//! Since the engine grew a thread pool, that "only" is enforced rather than
+//! assumed: a scope opened on a pool worker would file spans into a buffer
+//! nothing ever drains — a slow leak, and timings describing no frame — so
+//! workers call [`suppress_on_this_thread`] as they start and [`scope`] is a
+//! no-op there. See [`crate::threads`]. Work that rayon runs on the *calling*
+//! thread is still collected, and nests inside whichever phase dispatched it,
+//! which is where it belongs.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -133,6 +141,25 @@ struct Collector {
 
 thread_local! {
     static COLLECTOR: RefCell<Collector> = RefCell::new(Collector::default());
+    /// Cleared on pool workers, so their scopes cost one thread-local load and
+    /// nothing else. Per-thread rather than a set of thread ids because the
+    /// check is on the hot path of every scope.
+    static COLLECTING: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Take the calling thread out of span collection, permanently.
+///
+/// The rule is that **workers are not profiled**: only the thread that calls
+/// [`Profiler::end_frame`] is drained, so any other thread's spans accumulate
+/// unread. [`crate::threads`] calls this from the pool's `start_handler`, which
+/// is the one place that knows a thread is a worker.
+pub fn suppress_on_this_thread() {
+    COLLECTING.with(|collecting| collecting.set(false));
+}
+
+/// Whether spans opened on this thread are kept. False on pool workers.
+pub fn is_collecting() -> bool {
+    COLLECTING.with(Cell::get)
 }
 
 /// Times its enclosing region and files a [`Span`] on drop. Create one with
@@ -143,9 +170,10 @@ pub struct Scope {
     start_ns: u64,
 }
 
-/// `None` while profiling is off, which makes the guard's drop a no-op.
+/// `None` while profiling is off — or on any thread that is not the one being
+/// drained — which makes the guard's drop a no-op.
 pub fn scope(name: &'static str) -> Option<Scope> {
-    if !is_enabled() {
+    if !is_enabled() || !is_collecting() {
         return None;
     }
     let depth = COLLECTOR.with(|cell| {
@@ -502,5 +530,22 @@ mod tests {
         assert_eq!(forward.max_ms, 2.0);
         // (1 ms + 2 ms) over the two retained frames.
         assert_eq!(forward.avg_ms, 1.5);
+    }
+
+    /// The worker rule, on a plain thread rather than a pool one so the test
+    /// needs no pool: a suppressed thread opens no scope, and says so, while
+    /// the thread being drained is untouched by its neighbour's setting.
+    #[test]
+    fn a_suppressed_thread_opens_no_scope() {
+        let suppressed = std::thread::spawn(|| {
+            suppress_on_this_thread();
+            assert!(!is_collecting());
+            (scope("worker").is_none(), COLLECTOR.with(|cell| cell.borrow().spans.len()))
+        })
+        .join()
+        .expect("the worker thread panicked");
+
+        assert_eq!(suppressed, (true, 0), "a suppressed thread filed a span");
+        assert!(is_collecting(), "suppression leaked onto the test thread");
     }
 }

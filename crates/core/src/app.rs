@@ -104,6 +104,10 @@ struct Scripts {
 
 impl App {
     pub fn run() {
+        // Before anything that might dispatch into it — the scene build decodes
+        // textures across it, and that happens on the first `resumed`.
+        crate::threads::init();
+
         let event_loop = EventLoop::new().unwrap();
         event_loop.set_control_flow(ControlFlow::Poll);
 

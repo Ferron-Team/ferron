@@ -407,37 +407,64 @@ fn load_buffers(
         .collect()
 }
 
+/// Where one image's encoded bytes come from, resolved but not yet read.
+///
+/// Named separately so the decode below has an indexable slice to split: a
+/// `gltf::Document`'s images are an iterator over a borrowed document, and
+/// neither is `Sync`.
+enum ImageSource<'a> {
+    /// A file beside the document — a `.gltf`'s textures.
+    Uri(String),
+    /// A range of a buffer already in memory — a `.glb`'s. Borrowed rather than
+    /// copied out: the copy would be of the whole encoded texture, for nothing.
+    View { bytes: &'a [u8], name: String },
+}
+
+/// Decode every image the document names, in document order.
+///
+/// The decode is the expensive half of importing a model — Sponza is ~70 JPEGs
+/// — and it is pure CPU with no shared state, so it goes across the pool. The
+/// *resolution* above it stays serial: it walks a borrowed `gltf::Document`,
+/// and it is bookkeeping either way.
+///
+/// One difference from a serial fold, and it is deliberate: a file that fails to
+/// decode no longer stops the ones after it, since they may already be in
+/// flight. The error reported is still the first in document order, so which
+/// failure a broken model names does not depend on how the work was split.
 fn load_images(
     document: &gltf::Document,
     base: &Path,
     buffers: &[Vec<u8>],
 ) -> Result<Vec<ModelImage>, ModelError> {
-    document
+    let sources = document
         .images()
-        .map(|image| {
-            let (bytes, uri) = match image.source() {
-                gltf::image::Source::Uri { uri, .. } => (read_uri(uri, base)?, uri.to_string()),
-                gltf::image::Source::View { view, .. } => {
-                    let buffer = &buffers[view.buffer().index()];
-                    let start = view.offset();
-                    let end = start + view.length();
-                    let name = format!("image {}", image.index());
-                    let slice = buffer
-                        .get(start..end)
-                        .ok_or_else(|| ModelError::Resource {
-                            uri: name.clone(),
-                            reason: format!(
-                                "its buffer view runs to {end} bytes, past the {} the buffer holds",
-                                buffer.len()
-                            ),
-                        })?
-                        .to_vec();
-                    (slice, name)
-                }
-            };
-            decode_image(&bytes, &uri)
+        .map(|image| match image.source() {
+            gltf::image::Source::Uri { uri, .. } => Ok(ImageSource::Uri(uri.to_string())),
+            gltf::image::Source::View { view, .. } => {
+                let buffer = &buffers[view.buffer().index()];
+                let start = view.offset();
+                let end = start + view.length();
+                let name = format!("image {}", image.index());
+                let bytes = buffer
+                    .get(start..end)
+                    .ok_or_else(|| ModelError::Resource {
+                        uri: name.clone(),
+                        reason: format!(
+                            "its buffer view runs to {end} bytes, past the {} the buffer holds",
+                            buffer.len()
+                        ),
+                    })?;
+                Ok(ImageSource::View { bytes, name })
+            }
         })
-        .collect()
+        .collect::<Result<Vec<_>, ModelError>>()?;
+
+    crate::threads::map(&sources, |source| match source {
+        ImageSource::Uri(uri) => decode_image(&read_uri(uri, base)?, uri),
+        ImageSource::View { bytes, name } => decode_image(bytes, name),
+    })
+    .into_iter()
+    .collect()
 }
 
 /// Resolve a glTF URI against the document's directory.

@@ -2781,6 +2781,7 @@ dependencies = [
  "orrin-project",
  "orrin-registry",
  "orrin-script",
+ "rayon",
  "ron",
  "serde",
  "sysinfo",
@@ -2796,6 +2797,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "proptest",
+ "rayon",
 ]
 
 [[package]]
