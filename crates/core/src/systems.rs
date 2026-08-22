@@ -1,4 +1,4 @@
-use glam::{Mat3, Mat4, Vec3};
+use glam::{Mat3, Mat4, Vec3, Vec3A};
 
 use orrin_ecs::{Entity, World};
 
@@ -385,8 +385,8 @@ fn order_runs_front_to_back(items: &[RenderItem], order: &mut Vec<u32>, eye: Vec
 /// which every cascade agrees on — that is
 /// [`CascadeSet::abs_light_rotation`](crate::gfx::shadows::CascadeSet::abs_light_rotation)
 /// times the box's half-extents, and the reason this is not `&Aabb`.
-fn casts_into(center: Vec3, ls_extents: Vec3, cascade: &Cascade) -> bool {
-    let c = cascade.light_view.transform_point3(center);
+fn casts_into(center: Vec3A, ls_extents: Vec3A, cascade: &Cascade) -> bool {
+    let c = cascade.light_view.transform_point3a(center);
     let half = cascade.half_extent;
     // `light_view` is a right-handed look-at, so what the pass renders lies at
     // negative z, between the eye at 0 and the far plane at -depth_range.
@@ -402,7 +402,7 @@ mod shadow_culling_tests {
     use super::*;
     use crate::gfx::shadows::{CascadeConfig, cascades};
     use crate::scene::Camera;
-    use glam::Vec3;
+    use glam::{Vec3, Vec3A};
 
     const ASPECT: f32 = 16.0 / 9.0;
 
@@ -423,9 +423,10 @@ mod shadow_culling_tests {
     }
 
     fn box_at(center: Vec3, half: f32) -> Aabb {
+        let center = Vec3A::from(center);
         Aabb {
-            min: center - Vec3::splat(half),
-            max: center + Vec3::splat(half),
+            min: center - Vec3A::splat(half),
+            max: center + Vec3A::splat(half),
         }
     }
 
@@ -719,7 +720,7 @@ mod tests {
         Camera, CpuMesh, Culling, Decal, DecalSettings, LocalTransform, MeshBounds, MeshHandle,
         Transform, WorldTransform,
     };
-    use glam::{Mat3, Mat4, Quat, Vec3};
+    use glam::{Mat3, Mat4, Quat, Vec3, Vec3A};
     use orrin_ecs::World;
 
     const ASPECT: f32 = 16.0 / 9.0;
@@ -1215,8 +1216,8 @@ mod tests {
     #[test]
     fn a_mesh_reports_the_bounds_of_its_vertices() {
         let bounds = CpuMesh::cube().bounds();
-        assert!((bounds.min - Vec3::splat(-0.5)).length() < 1e-6);
-        assert!((bounds.max - Vec3::splat(0.5)).length() < 1e-6);
+        assert!((bounds.min - Vec3A::splat(-0.5)).length() < 1e-6);
+        assert!((bounds.max - Vec3A::splat(0.5)).length() < 1e-6);
 
         let empty = CpuMesh::default().bounds();
         assert!(!empty.is_valid());
@@ -1358,7 +1359,7 @@ mod geometry_tests {
         Camera, CpuMesh, Culling, LocalTransform, MaterialHandle, MeshBounds, MeshHandle,
         Transform, WorldTransform,
     };
-    use glam::Vec3;
+    use glam::{Vec3, Vec3A};
     use orrin_ecs::World;
 
     const ASPECT: f32 = 16.0 / 9.0;

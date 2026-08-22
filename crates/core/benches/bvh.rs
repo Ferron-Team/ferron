@@ -7,7 +7,7 @@
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use glam::Vec3;
+use glam::{Vec3, Vec3A};
 use orrin_core::collision::{Aabb, Bvh};
 
 const COUNTS: [usize; 3] = [100, 1_000, 10_000];
@@ -32,12 +32,12 @@ fn bounds(count: usize, spread: f32) -> Vec<Aabb> {
     let mut rng = Rng(0x0DDB_A11_0_C0FF_EE00);
     (0..count)
         .map(|_| {
-            let center = Vec3::new(
+            let center = Vec3A::new(
                 (rng.unit() - 0.5) * spread,
                 (rng.unit() - 0.5) * spread,
                 (rng.unit() - 0.5) * spread,
             );
-            let half = Vec3::splat(0.5);
+            let half = Vec3A::splat(0.5);
             Aabb {
                 min: center - half,
                 max: center + half,

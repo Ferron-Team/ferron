@@ -766,7 +766,7 @@ pub trait RenderBackend {
 mod draw_list_tests {
     use super::{DrawList, MaterialHandle, MeshHandle, RenderItem};
     use crate::geom::Aabb;
-    use glam::{Mat3, Mat4, Vec3};
+    use glam::{Mat3, Mat4, Vec3, Vec3A};
 
     fn item(mesh: u32, material: u32) -> RenderItem {
         RenderItem {
@@ -774,8 +774,8 @@ mod draw_list_tests {
             prev_model: Mat4::IDENTITY,
             normal_matrix: Mat3::IDENTITY,
             bounds: Aabb {
-                min: Vec3::splat(-0.5),
-                max: Vec3::splat(0.5),
+                min: Vec3A::splat(-0.5),
+                max: Vec3A::splat(0.5),
             },
             mesh: MeshHandle(mesh),
             material: MaterialHandle(material),

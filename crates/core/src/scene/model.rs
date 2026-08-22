@@ -914,6 +914,7 @@ fn attach(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec3A;
 
     /// A single triangle in the `xy` plane with a clean UV layout, written as a
     /// `.gltf` beside its `.bin` — the shape a downloaded model actually has, so
@@ -1116,8 +1117,8 @@ mod tests {
         // And the measured box is the triangle at its node: a centimetre wide,
         // two centimetres along `x`.
         let bounds = model.bounds();
-        assert!((bounds.min - Vec3::new(0.02, 0.0, 0.0)).length() < 1e-6);
-        assert!((bounds.max - Vec3::new(0.03, 0.01, 0.0)).length() < 1e-6);
+        assert!((bounds.min - Vec3A::new(0.02, 0.0, 0.0)).length() < 1e-6);
+        assert!((bounds.max - Vec3A::new(0.03, 0.01, 0.0)).length() < 1e-6);
     }
 
     #[test]

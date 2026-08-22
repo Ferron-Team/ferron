@@ -8,7 +8,7 @@
 //! replace the internals later without touching `collision::run`.
 
 use super::Aabb;
-use glam::Vec3;
+use glam::Vec3A;
 
 type NodeIndex = u32;
 
@@ -86,8 +86,8 @@ impl Bvh {
 
         // Split on the axis where the centers spread widest; centers (not box
         // edges) keep the partition meaningful when bounds overlap heavily.
-        let mut min_c = Vec3::splat(f32::INFINITY);
-        let mut max_c = Vec3::splat(f32::NEG_INFINITY);
+        let mut min_c = Vec3A::splat(f32::INFINITY);
+        let mut max_c = Vec3A::splat(f32::NEG_INFINITY);
 
         for &i in indices.iter() {
             let center = bounds[i].center();
@@ -168,12 +168,12 @@ impl Bvh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::Vec3;
+    use glam::{Vec3, Vec3A};
 
     fn aabb(min: [f32; 3], max: [f32; 3]) -> Aabb {
         Aabb {
-            min: Vec3::from_array(min),
-            max: Vec3::from_array(max),
+            min: Vec3A::from_array(min),
+            max: Vec3A::from_array(max),
         }
     }
 
@@ -192,10 +192,10 @@ mod tests {
     fn rebuild_matches_a_fresh_build() {
         let crowded: Vec<Aabb> = (0..12)
             .map(|i| {
-                let min = Vec3::new(i as f32 * 0.5, 0.0, 0.0);
+                let min = Vec3A::new(i as f32 * 0.5, 0.0, 0.0);
                 Aabb {
                     min,
-                    max: min + Vec3::ONE,
+                    max: min + Vec3A::ONE,
                 }
             })
             .collect();
@@ -237,10 +237,10 @@ mod tests {
         let mut bounds = Vec::new();
         for x in 0..4 {
             for z in 0..4 {
-                let min = Vec3::new(x as f32 * 0.75, 0.0, z as f32 * 0.75);
+                let min = Vec3A::new(x as f32 * 0.75, 0.0, z as f32 * 0.75);
                 bounds.push(Aabb {
                     min,
-                    max: min + Vec3::ONE,
+                    max: min + Vec3A::ONE,
                 });
             }
         }
