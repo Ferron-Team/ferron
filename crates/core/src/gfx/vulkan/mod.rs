@@ -28,7 +28,6 @@ mod texture;
 mod timestamps;
 mod vendor;
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
@@ -76,13 +75,32 @@ use self::hdr::HdrPass;
 use self::line::LinePass;
 use self::motion_blur::MotionBlurPass;
 use self::prepass::GeometryPrepass;
-use self::record::{InFlight, Recorder};
+use self::record::{InFlight, Recorder, RunAhead};
 
 /// How far the CPU may record ahead of the GPU.
 ///
-/// Two, which is one frame of overlap and what the `GpuFuture` chain gave before
-/// the renderer recorded raw. More would need per-frame *resource* sets rather
-/// than only per-frame lifetimes — #64 item 7.
+/// Two, which is one frame of overlap. Nothing structural holds it there any
+/// more: the depth is a [`RunAhead`] bound and no *resource* is duplicated to
+/// raise it. Per-frame lifetimes come from `KeepAlive`, which raw recording made
+/// this crate's job; the host-visible data a frame writes comes from
+/// `SubbufferAllocator`s, which recycle an arena only once every subbuffer cut
+/// from it has been dropped; and the graph's images stay a single set because
+/// `frame_chain` keeps the GPU executing one frame at a time whatever the CPU
+/// is doing.
+///
+/// Three was measured, against two, interleaved, and is indistinguishable from
+/// it — so two is what stays. `frame_chain` is the reason there is nothing to
+/// win: with the GPU executing one frame at a time, a single frame of overlap
+/// already keeps the queue fed, and a third recording ahead cannot fill a gap
+/// the schedule does not have. A deeper queue is worth revisiting only alongside
+/// something that lets frames overlap on the device — an async compute queue, or
+/// graph images that are no longer one set.
+///
+/// The ceiling, should the schedule ever stop serialising, is the timestamp pool
+/// rather than memory: `timestamps.rs` rotates one query slot per frame in
+/// flight and resets a slot before recording into it, so a frame beyond `SLOTS`
+/// would reset a pool the GPU is still writing. `SLOTS` is defined from this
+/// constant so the two cannot drift apart.
 const FRAMES_IN_FLIGHT: usize = 2;
 use self::resources::GraphImages;
 use self::shadow::ShadowPass;
@@ -220,21 +238,22 @@ pub struct VulkanRenderer {
     /// objects, which is what keeps the three passes agreeing about a material.
     shadow_material_set: Option<Arc<DescriptorSet>>,
     shadow_texture_set: Option<Arc<DescriptorSet>>,
-    /// Frames the GPU has not finished with, oldest first.
-    ///
-    /// Retired when a fence *happens* to have signalled, so the CPU records
-    /// ahead rather than lock-stepping; [`FRAMES_IN_FLIGHT`] bounds the
-    /// run-ahead, and everything a frame named is held here until then.
+    /// Frames the GPU has not finished with, oldest first, bounded by
+    /// [`FRAMES_IN_FLIGHT`]. Everything a frame named is held here until its
+    /// fence signals.
     ///
     /// Their GPU work is still serialised through `frame_chain`: there is one
     /// set of graph images, so frame `n + 1` writes what frame `n` is reading.
-    /// Overlapping that is #64 item 7.
-    in_flight: VecDeque<InFlight>,
+    /// What runs ahead is the recording, not the execution.
+    in_flight: RunAhead<InFlight>,
     /// Signalled when the last submitted frame finishes, and waited by the next.
     frame_chain: Option<Arc<Semaphore>>,
-    /// The overlay's submission and present, when one ran. Held only so its
-    /// resources are released once it signals; nothing waits on it.
-    overlay_present: Option<FenceSignalFuture<Box<dyn GpuFuture>>>,
+    /// The overlay's submissions and presents, when one ran. Nothing waits on
+    /// them, but they are bounded like the frames are and for a sharper reason:
+    /// `FenceSignalFuture`'s destructor waits on its fence, so holding one slot
+    /// and overwriting it each frame is a CPU stall on the previous frame's
+    /// present — the run-ahead above, undone one line later.
+    overlay_present: RunAhead<FenceSignalFuture<Box<dyn GpuFuture>>>,
     recreate_swapchain: bool,
     pending_extent: [u32; 2],
     /// What the swapchain should be built with. Changing it takes the same route
@@ -392,9 +411,9 @@ impl VulkanRenderer {
             prepass_texture_set: None,
             shadow_material_set: None,
             shadow_texture_set: None,
-            in_flight: VecDeque::new(),
+            in_flight: RunAhead::new(FRAMES_IN_FLIGHT),
             frame_chain: None,
-            overlay_present: None,
+            overlay_present: RunAhead::new(FRAMES_IN_FLIGHT),
             recreate_swapchain: false,
             pending_extent: extent,
             present,
@@ -431,9 +450,10 @@ impl VulkanRenderer {
     pub fn capture(&mut self) -> Option<(Vec<u8>, [u32; 2])> {
         let image = self.swapchain.readback.first()?.clone();
 
-        while let Some(previous) = self.in_flight.pop_front() {
-            previous.wait();
-        }
+        self.in_flight.drain();
+        // The overlay is the last thing to write the target when there is one,
+        // so a readback that skipped it would copy the frame underneath it.
+        self.overlay_present.drain();
 
         let extent = self.swapchain.extent;
         let buffer = Buffer::new_slice::<u8>(
@@ -895,23 +915,11 @@ impl VulkanRenderer {
             }),
         });
 
-        if let Some(overlay) = self.overlay_present.as_mut() {
-            overlay.cleanup_finished();
-        }
-        // Retire whatever the GPU has already finished, without blocking on it.
-        while self.in_flight.front().is_some_and(InFlight::is_complete) {
-            self.in_flight.pop_front();
-        }
-        // Only block when the CPU is a whole frame ahead: recording raw means
-        // this crate owns those lifetimes, and the bound caps the list.
-        while self.in_flight.len() >= FRAMES_IN_FLIGHT {
-            profile_scope!("wait");
-            let oldest = self
-                .in_flight
-                .pop_front()
-                .expect("the queue is non-empty inside this loop");
-            oldest.wait();
-        }
+        // Release what the GPU has already finished and block only if the CPU
+        // is [`FRAMES_IN_FLIGHT`] frames ahead: recording raw means this crate
+        // owns those lifetimes, and the bound is what caps the list.
+        self.in_flight.wait_for_room();
+        self.overlay_present.wait_for_room();
 
         // Split out because under Fifo this blocks until the presentation engine
         // hands back an image — a vsync wait, not work. Folded into a single
@@ -927,9 +935,11 @@ impl VulkanRenderer {
                     Semaphore::from_pool(self.ctx.device.clone())
                         .expect("failed to create the acquire semaphore"),
                 );
-                // SAFETY: the semaphore is unsignalled and has no pending wait —
-                // it was made a line above — and the previous frame's fence has
-                // been waited on, so nothing else is using this swapchain.
+                // SAFETY: the semaphore is unsignalled and has no pending wait
+                // — it was made a line above, and the frame that ends up waiting
+                // on it holds it until its own fence signals. The previous frame
+                // may still be executing, which acquire allows: the presentation
+                // engine hands back only an image it has finished with.
                 let acquired = unsafe {
                     swapchain.acquire_next_image(&AcquireNextImageInfo {
                         semaphore: Some(semaphore.clone()),
@@ -1989,7 +1999,7 @@ impl VulkanRenderer {
         self.frame_chain = Some(chain);
 
         if overlay_pass {
-            self.in_flight.push_back(in_flight);
+            self.in_flight.push(in_flight);
             let ready = overlay_ready.expect("an overlay frame signals its own semaphore");
             let mut future = record::SemaphoreWait::new(
                 self.ctx.queue.clone(),
@@ -2032,13 +2042,13 @@ impl VulkanRenderer {
                 None => future.then_signal_fence_and_flush(),
             };
             match presented.map_err(Validated::unwrap) {
-                Ok(future) => self.overlay_present = Some(future),
+                Ok(future) => self.overlay_present.push(future),
                 Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
                 Err(e) => eprintln!("failed to flush the overlay: {e}"),
             }
         } else {
             debug_assert!(raw_passes.is_empty());
-            self.in_flight.push_back(in_flight);
+            self.in_flight.push(in_flight);
         }
 
         if let Some(swapchain) = self.swapchain.swapchain.clone().filter(|_| !overlay_pass) {

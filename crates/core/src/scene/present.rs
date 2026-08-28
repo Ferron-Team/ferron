@@ -58,6 +58,10 @@ impl Default for PresentSettings {
         // taken before this became a setting and one taken after are the same
         // measurement. Changing either default is a change to every number
         // anybody has already written down.
+        //
+        // Two suits the `Fifo` beside it and suits nothing else, which is why
+        // the floor an uncapped mode needs is applied where the mode is
+        // resolved rather than raised here — see `swapchain::image_count`.
         Self {
             vsync: VsyncMode::Fifo,
             images: 2,

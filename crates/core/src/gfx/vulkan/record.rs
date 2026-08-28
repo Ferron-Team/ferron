@@ -28,6 +28,7 @@
 //!   the feature for that reason.
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -47,7 +48,7 @@ use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, PipelineBindPoint, Pi
 use vulkano::query::QueryPool;
 use vulkano::sync::PipelineStage;
 use vulkano::sync::fence::{Fence, FenceCreateInfo};
-use vulkano::sync::future::{AccessCheckError, GpuFuture, SubmitAnyBuilder};
+use vulkano::sync::future::{AccessCheckError, FenceSignalFuture, GpuFuture, SubmitAnyBuilder};
 use vulkano::sync::semaphore::Semaphore;
 use vulkano::sync::{
     AccessFlags, DependencyInfo, ImageMemoryBarrier, MemoryBarrier, PipelineStages,
@@ -58,6 +59,7 @@ use vulkano::swapchain::Swapchain;
 use vulkano::{DeviceSize, Validated, VulkanError};
 
 use crate::gfx::graph::{Barrier, ResourceId};
+use crate::profile_scope;
 
 use super::context::VkContext;
 
@@ -636,20 +638,110 @@ pub(super) struct InFlight {
     semaphores: Vec<Arc<Semaphore>>,
 }
 
-impl InFlight {
-    /// Whether the GPU has finished with this frame, without blocking on it.
+/// Work the CPU has handed the queue and cannot yet prove is finished.
+///
+/// A frame submits either one of these or two: its own recording, and — with an
+/// editor overlay — the second submission vulkano makes for it. The two are
+/// different types and are retired identically, which is the whole reason this
+/// is a trait rather than a method on [`InFlight`].
+pub(super) trait Pending {
+    /// Whether the GPU has finished, asked rather than waited for.
     ///
-    /// What lets the CPU run ahead: a frame is retired when its fence happens to
-    /// have signalled, not by waiting for it.
-    pub(super) fn is_complete(&self) -> bool {
+    /// What lets the CPU run ahead: a submission is released when its fence
+    /// happens to have signalled, not by blocking until it does.
+    fn is_complete(&self) -> bool;
+
+    /// Block until it has, then release what it named.
+    fn retire(self);
+}
+
+impl Pending for InFlight {
+    fn is_complete(&self) -> bool {
         self.fence.is_signaled().unwrap_or(true)
     }
 
-    /// Block until this frame has executed, then release what it named.
-    pub(super) fn wait(self) {
+    fn retire(self) {
         self.fence
             .wait(None)
             .expect("failed to wait on the frame fence");
+    }
+}
+
+/// The overlay's submission, which vulkano owns because it is vulkano that made
+/// it — `Gui::draw_on_image` builds and flushes its own command buffer.
+///
+/// Held for the same reason [`InFlight`] is, and with one extra hazard:
+/// `FenceSignalFuture`'s destructor waits on the fence. Dropping one the GPU has
+/// not reached is therefore a silent CPU stall, so this must be polled through
+/// [`Pending::is_complete`] rather than replaced.
+impl Pending for FenceSignalFuture<Box<dyn GpuFuture>> {
+    fn is_complete(&self) -> bool {
+        self.is_signaled().unwrap_or(true)
+    }
+
+    fn retire(self) {
+        self.wait(None)
+            .expect("failed to wait on the overlay fence");
+    }
+}
+
+/// How far the CPU may record ahead of the GPU, and the submissions that make
+/// up the distance.
+///
+/// Oldest first, which is also the order they complete in: everything here went
+/// to one queue. Retiring is opportunistic — a submission is released when its
+/// fence happens to have signalled — and the block in
+/// [`wait_for_room`](Self::wait_for_room) is the only one there is. Without that
+/// block the list would grow until the driver's queue depth, rather than a
+/// number this engine chose, decided how far ahead a frame could get.
+pub(super) struct RunAhead<T> {
+    pending: VecDeque<T>,
+    depth: usize,
+}
+
+impl<T: Pending> RunAhead<T> {
+    pub(super) fn new(depth: usize) -> Self {
+        Self {
+            pending: VecDeque::with_capacity(depth),
+            depth,
+        }
+    }
+
+    /// Make room for one more submission.
+    ///
+    /// Releases everything the GPU has already finished, and blocks only if that
+    /// left none — which is the run-ahead bound being reached, not a frame going
+    /// wrong.
+    pub(super) fn wait_for_room(&mut self) {
+        while self.pending.front().is_some_and(T::is_complete) {
+            self.pending.pop_front();
+        }
+        while self.pending.len() >= self.depth {
+            profile_scope!("wait");
+            let oldest = self
+                .pending
+                .pop_front()
+                .expect("the queue is non-empty inside this loop");
+            oldest.retire();
+        }
+    }
+
+    pub(super) fn push(&mut self, pending: T) {
+        self.pending.push_back(pending);
+    }
+
+    /// Block until the GPU is idle with respect to everything here.
+    ///
+    /// What a readback needs, and the only place a wait is unconditional.
+    pub(super) fn drain(&mut self) {
+        while let Some(oldest) = self.pending.pop_front() {
+            oldest.retire();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending.len()
     }
 }
 
@@ -927,5 +1019,120 @@ unsafe impl GpuFuture for SemaphoreWait {
             }
             _ => Err(AccessCheckError::Unknown),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    /// A submission whose completion the test decides, logging the one thing
+    /// that matters: whether the ring *blocked* on it, as opposed to finding it
+    /// already finished.
+    struct Fake {
+        id: u32,
+        complete: Rc<Cell<bool>>,
+        waited: Rc<RefCell<Vec<u32>>>,
+    }
+
+    impl Pending for Fake {
+        fn is_complete(&self) -> bool {
+            self.complete.get()
+        }
+
+        fn retire(self) {
+            self.waited.borrow_mut().push(self.id);
+        }
+    }
+
+    struct Harness {
+        ring: RunAhead<Fake>,
+        waited: Rc<RefCell<Vec<u32>>>,
+        next: u32,
+    }
+
+    impl Harness {
+        fn new(depth: usize) -> Self {
+            Self {
+                ring: RunAhead::new(depth),
+                waited: Rc::new(RefCell::new(Vec::new())),
+                next: 0,
+            }
+        }
+
+        fn push(&mut self, complete: bool) {
+            let id = self.next;
+            self.next += 1;
+            self.ring.push(Fake {
+                id,
+                complete: Rc::new(Cell::new(complete)),
+                waited: self.waited.clone(),
+            });
+        }
+
+        fn waited(&self) -> Vec<u32> {
+            self.waited.borrow().clone()
+        }
+    }
+
+    /// The whole point of a depth greater than one: with room left, opening a
+    /// frame costs no wait however busy the GPU is.
+    #[test]
+    fn runs_ahead_without_blocking_below_the_depth() {
+        let mut harness = Harness::new(3);
+        harness.push(false);
+        harness.push(false);
+
+        harness.ring.wait_for_room();
+
+        assert_eq!(harness.waited(), Vec::<u32>::new());
+        assert_eq!(harness.ring.len(), 2);
+    }
+
+    /// And the bound that keeps it honest: at the depth the CPU blocks, on the
+    /// oldest submission and on that one only.
+    #[test]
+    fn blocks_on_the_oldest_at_the_depth() {
+        let mut harness = Harness::new(3);
+        harness.push(false);
+        harness.push(false);
+        harness.push(false);
+
+        harness.ring.wait_for_room();
+
+        assert_eq!(harness.waited(), vec![0]);
+        assert_eq!(harness.ring.len(), 2);
+    }
+
+    /// A submission the GPU happens to have finished is released without a wait,
+    /// which is what stops the depth from being a lock-step.
+    #[test]
+    fn releases_finished_submissions_without_waiting() {
+        let mut harness = Harness::new(3);
+        harness.push(true);
+        harness.push(true);
+        harness.push(false);
+
+        harness.ring.wait_for_room();
+
+        assert_eq!(harness.waited(), Vec::<u32>::new());
+        assert_eq!(harness.ring.len(), 1);
+    }
+
+    /// What a readback needs: after this the GPU is idle with respect to
+    /// everything the ring held, whatever its fences said on the way in.
+    #[test]
+    fn drain_waits_for_every_submission() {
+        let mut harness = Harness::new(3);
+        harness.push(true);
+        harness.push(false);
+        harness.push(false);
+
+        harness.ring.drain();
+
+        assert_eq!(harness.waited(), vec![0, 1, 2]);
+        assert_eq!(harness.ring.len(), 0);
     }
 }

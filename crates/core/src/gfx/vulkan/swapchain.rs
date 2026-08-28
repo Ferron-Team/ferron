@@ -47,15 +47,48 @@ fn resolve(
         })
         .unwrap_or(PresentMode::Fifo);
 
-    let mut images = want.images.max(1);
-    if let Ok(caps) = physical.surface_capabilities(surface, Default::default()) {
-        images = images.max(caps.min_image_count);
-        if let Some(max) = caps.max_image_count {
-            images = images.min(max);
-        }
-    }
+    let (min, max) = match physical.surface_capabilities(surface, Default::default()) {
+        Ok(caps) => (caps.min_image_count, caps.max_image_count),
+        Err(_) => (1, None),
+    };
 
-    (mode, images)
+    (mode, image_count(want.images, mode, min, max))
+}
+
+/// Images an uncapped present mode needs before it can do anything a capped one
+/// cannot: one on screen, one queued, one being drawn.
+const UNCAPPED_MINIMUM: u32 = 3;
+
+/// How many images to build the swapchain with, given what was asked for, the
+/// mode the surface honoured, and the range it advertises.
+///
+/// Split out from [`resolve`] because it is the half worth asserting and the
+/// half that needs no device.
+fn image_count(want: u32, mode: PresentMode, min: u32, max: Option<u32>) -> u32 {
+    // `Mailbox` and `Immediate` are the modes that let a frame finish ahead of
+    // the display, and with two images they cannot: one is on screen and one is
+    // queued, so the acquire blocks until the presentation engine hands one back
+    // and the uncapped mode measures as the capped one it was chosen over.
+    //
+    // A floor rather than a default, and applied here rather than in
+    // `PresentSettings`, because it belongs to the mode and not to the setting:
+    // somebody switching to `Mailbox` in the performance panel has asked for
+    // this, whatever the image count they did not touch still says. The default
+    // stays two, so a `Fifo` number taken before this and one taken after are
+    // the same measurement.
+    let floor = match mode {
+        PresentMode::Mailbox | PresentMode::Immediate => UNCAPPED_MINIMUM,
+        _ => 1,
+    };
+
+    let images = want.max(floor).max(min);
+    // Last, so a surface that advertises a smaller maximum than the floor gets a
+    // worse frame rather than a failed swapchain — the same fallback the mode
+    // itself takes above.
+    match max {
+        Some(max) => images.min(max),
+        None => images,
+    }
 }
 
 /// What the frame's last pass draws into: a real swapchain, or — offscreen — a
@@ -211,4 +244,41 @@ fn build_views(images: &[Arc<Image>]) -> Vec<Arc<ImageView>> {
         .iter()
         .map(|image| ImageView::new_default(image.clone()).unwrap())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A capped mode is handed exactly what was asked for: the floor below
+    /// exists for the acquire an uncapped mode blocks in, and `Fifo` is supposed
+    /// to block there.
+    #[test]
+    fn a_capped_mode_gets_the_count_it_asked_for() {
+        assert_eq!(image_count(2, PresentMode::Fifo, 1, None), 2);
+        assert_eq!(image_count(2, PresentMode::FifoRelaxed, 1, None), 2);
+    }
+
+    /// The defect this floor exists for: two images and `Mailbox` is `Fifo` with
+    /// extra steps, because the acquire waits for the presentation engine either
+    /// way.
+    #[test]
+    fn an_uncapped_mode_gets_a_third_image() {
+        assert_eq!(image_count(2, PresentMode::Mailbox, 1, None), 3);
+        assert_eq!(image_count(2, PresentMode::Immediate, 1, None), 3);
+    }
+
+    /// The floor raises a count, never lowers one.
+    #[test]
+    fn asking_for_more_than_the_floor_is_honoured() {
+        assert_eq!(image_count(5, PresentMode::Mailbox, 1, None), 5);
+    }
+
+    /// And the surface has the last word in both directions, because a count it
+    /// cannot honour has to be a worse frame rather than a dead window.
+    #[test]
+    fn the_surface_range_wins_over_both() {
+        assert_eq!(image_count(2, PresentMode::Mailbox, 1, Some(2)), 2);
+        assert_eq!(image_count(2, PresentMode::Fifo, 4, None), 4);
+    }
 }

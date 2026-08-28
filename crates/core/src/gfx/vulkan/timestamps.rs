@@ -51,10 +51,26 @@ use crate::profile::{Profiler, Span};
 /// passes at the end of the chain.
 const MAX_PASSES: usize = 64;
 
-/// Frame slots in rotation. Two would be correct only while `previous_frame_end`
-/// is a single fence that retires frame N-1 before N records; three removes that
-/// coupling, so growing frames-in-flight later can't silently corrupt timings.
-const SLOTS: usize = 3;
+/// Frame slots in rotation: one more than the frames the CPU may be ahead by.
+///
+/// Two constraints, and the second is the binding one.
+///
+/// A slot is reset before the frame that writes it records, so it must belong to
+/// a frame the GPU has finished. Slot `N % SLOTS` last belonged to `N - SLOTS`,
+/// which `RunAhead` has waited on whenever `SLOTS` is at least
+/// [`FRAMES_IN_FLIGHT`].
+///
+/// But a slot must also be *read* before it is reused, and `drain_completed`
+/// declines two: the slot being written, and any slot whose frame the profiler
+/// has not closed yet. Frame `N`'s slot is therefore first eligible on frame
+/// `N + 1`, when the write cursor sits at `N + 2` — the same slot when `SLOTS`
+/// is two, which is why two silently files no GPU spans at all rather than
+/// filing wrong ones. One spare slot is what buys the readback its window.
+///
+/// Derived from the run-ahead rather than written down beside it, because the
+/// two disagreeing costs timings rather than frames, and nothing about a frame
+/// looks wrong while it happens.
+const SLOTS: usize = super::FRAMES_IN_FLIGHT + 1;
 
 /// Name of the reserved pair covering the whole frame. Always query 0/1, which
 /// also makes query 0 a guaranteed-written origin for the anchor below.
@@ -177,7 +193,9 @@ impl GpuTimestamps {
     pub fn record_resets(&mut self, builder: &mut Recorder) {
         let pool = self.slots[self.write].pool.clone();
         // SAFETY: outside any render pass, and this slot is not in flight —
-        // `end_frame` only rotates onto a slot that `drain_completed` retired.
+        // there are more slots than frames the CPU may be ahead by, so the frame
+        // that last wrote this one has been waited on by
+        // `RunAhead::wait_for_room`.
         builder.reset_query_pool(pool, 0..(2 * MAX_PASSES as u32));
         // Reserved first, so it is always query 0/1 and query 0 is guaranteed
         // written — `drain_completed` uses it as the frame's tick origin. Its
@@ -381,6 +399,26 @@ mod tests {
         assert!(
             timed <= MAX_PASSES,
             "the busiest frame times {timed} passes but the pool holds {MAX_PASSES}",
+        );
+    }
+
+    /// The coupling [`SLOTS`] documents, asserted rather than trusted. Too few
+    /// slots resets a pool the GPU is still writing; exactly as many leaves the
+    /// readback no frame to happen on, which is how three slots behind two
+    /// frames in flight became two slots that filed no GPU span at all. Both
+    /// failures are silent — the frame renders, the profiler is just wrong.
+    #[test]
+    fn a_spare_timestamp_slot_beyond_the_frames_in_flight() {
+        assert!(
+            SLOTS > super::super::FRAMES_IN_FLIGHT,
+            "{SLOTS} query slots for {} frames in flight leaves no slot to read \
+             back from",
+            super::super::FRAMES_IN_FLIGHT,
+        );
+        assert!(
+            SLOTS >= 3,
+            "a slot is only eligible to drain a frame after the \
+             one it was written in, and never while the cursor sits on it"
         );
     }
 
