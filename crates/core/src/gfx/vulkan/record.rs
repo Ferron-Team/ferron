@@ -1,82 +1,31 @@
 //! Recording without vulkano's auto-synchronisation, and submitting without its
 //! future chain.
 //!
-//! This is the seam tier 3 item 1 asks for. Everywhere else in `gfx/vulkan/`,
-//! commands go into an [`AutoCommandBufferBuilder`], which tracks every
-//! resource's state per recorded command on the CPU and derives its own
-//! barriers — a second synchronisation compiler, running beside the one in
-//! `gfx/graph/` whose plan nothing submits. What lands here records into
-//! vulkano's raw [`RecordingCommandBuffer`] instead: no tracking, no derived
-//! barriers, and the caller says what the dependencies are.
+//! Everywhere else the engine would record into an `AutoCommandBufferBuilder`,
+//! which tracks every resource on the CPU and derives its own barriers — a
+//! second synchronisation compiler beside the one in `gfx/graph/`. [`Recorder`]
+//! records raw instead, and [`emit_plan`] submits the barriers the graph
+//! actually compiled.
 //!
-//! [`AutoCommandBufferBuilder`]: vulkano::command_buffer::AutoCommandBufferBuilder
+//! Four constraints shape what is here, none of them visible from the API:
 //!
-//! # Why submission is hand-rolled
-//!
-//! Not for control — because vulkano 0.35 leaves no alternative. A finished raw
-//! [`CommandBuffer`] does not implement `PrimaryCommandBufferAbstract`, and
-//! cannot be made to from outside the crate: that trait requires
-//! `fn resources_usage(&self) -> &CommandBufferResourcesUsage`, and every field
-//! of `CommandBufferResourcesUsage` is `pub(crate)` with no constructor and no
-//! `Default`. `GpuFuture::then_execute` takes that trait, and so does
-//! `QueueGuard::submit` by way of `CommandBufferSubmitInfo`. So a raw command
-//! buffer can only reach the queue through `ash`, which is already a direct
-//! dependency for the memory-budget query in `context.rs`.
-//!
-//! The practical consequence is that "record through the unchecked path" and
-//! "drop to `ash`" — options (b) and (c) of the item — are one change, not two.
-//!
-//! # What the caller owes
-//!
-//! [`RecordingCommandBuffer`] keeps nothing alive and checks nothing. Every
-//! buffer, image, view, descriptor set and pipeline a recorded command names
-//! must outlive the GPU's execution of it, and every dependency between two
-//! recorded commands must be a barrier the caller wrote. [`submit_one_shot`]
-//! discharges the lifetime half by waiting before it returns, which is why it is
-//! the shape the upload paths use; a frame that does not wait has to hold its
-//! own keep-alive list until the fence signals.
-//!
-//! # Raw and auto-synchronised buffers cannot share an image
-//!
-//! This is the constraint that decides how the rest of the migration is staged,
-//! and it is not visible from either API's surface.
-//!
-//! Vulkano tracks, per `Image`, whether any command buffer has ever declared a
-//! use of it (`Image::is_layout_initialized`). The first auto-synchronised
-//! command buffer to touch an image assumes it is in `Undefined` on entry and
-//! sets that flag; every later one assumes the image's canonical layout instead
-//! (`RawImage::default_layout` — `ShaderReadOnlyOptimal` for a sampled texture).
-//! A raw command buffer sets nothing, because it declares nothing.
-//!
-//! So an image uploaded here and then sampled by an auto-synchronised frame is
-//! still, as far as vulkano knows, untouched: the frame emits an
-//! `Undefined -> ShaderReadOnlyOptimal` barrier before its first sample
-//! (`auto/builder.rs`, the `state.initial_layout` barrier), and `Undefined` as a
-//! source layout is the spec's licence to **discard the contents**. The upload
-//! that just happened is what would be discarded.
-//!
-//! Measured, no driver here takes that licence: the twelve `offscreen` captures
-//! are byte-identical to the auto-synchronised path on both RADV GFX1201 and
-//! lavapipe. That is evidence it is benign today, not that it is correct — it is
-//! the one-vendor-scheduler failure mode the graph exists to remove, pointed the
-//! other way, and a driver is free to start discarding at any release.
-//!
-//! There is no public lever to set the flag: `Image::layout_initialized` is
-//! `pub(crate)`, and `VkImageCreateInfo::initialLayout` cannot be anything but
-//! `Undefined` for an optimal-tiled device-local image. The consequence is that
-//! the conversion cannot be staged per resource, only per *resource's whole
-//! lifetime*: an image recorded into raw must never be named by an auto
-//! builder. For textures that means the frame converts with them.
-//!
-//! # Barriers use pre-`synchronization2` flags
-//!
-//! `synchronization2` is not enabled on the device (`context.rs`), so
-//! `pipeline_barrier` takes vulkano's `VK_VERSION_1_0` path, which narrows the
-//! 64-bit `AccessFlags2` to 32 bits with an `as u32`. Any access bit at 32 or
-//! above — `SHADER_SAMPLED_READ`, `SHADER_STORAGE_READ` and the rest of the
-//! sync2-only set — truncates to zero there, which is a barrier that silently
-//! carries no access mask. Until the feature is enabled, stay on flags that
-//! existed in 1.0: `SHADER_READ` rather than `SHADER_SAMPLED_READ`.
+//! - **Submission must go through `ash`.** A raw `CommandBuffer` cannot
+//!   implement `PrimaryCommandBufferAbstract` from outside vulkano — that trait
+//!   needs `CommandBufferResourcesUsage`, whose fields are all `pub(crate)` with
+//!   no constructor. `GpuFuture::then_execute` and `QueueGuard::submit` both
+//!   take it, so neither will accept one.
+//! - **Nothing is kept alive.** Every object a recorded command names must
+//!   outlive its execution; that is [`KeepAlive`]'s job.
+//! - **A raw and an auto command buffer cannot share an image.** Vulkano tracks
+//!   per-`Image` whether any command buffer has declared a use of it. The first
+//!   auto one assumes `Undefined` and *discards*; later ones assume the image's
+//!   fixed layout requirement. A raw buffer declares nothing, so an image it
+//!   wrote must reach an auto buffer in the layout that buffer expects — for a
+//!   swapchain image, `PresentSrc`.
+//! - **Barriers need `synchronization2`.** Without it vulkano narrows
+//!   `AccessFlags2` to 32 bits, and every shader-read bit the plan uses sits at
+//!   32 or above: they truncate to an empty access mask. `context.rs` requires
+//!   the feature for that reason.
 
 use std::any::Any;
 use std::ops::Range;
@@ -283,22 +232,12 @@ pub(super) enum Target {
 
 /// Record one pass's worth of the compiled barrier plan.
 ///
-/// This is the call the whole of tier 3 item 1 exists to make. `gfx/graph/`
-/// derives these — precise stages, access masks and layout transitions, asserted
-/// against a golden file on a runner with no GPU — and until now nothing
-/// submitted them: vulkano's `AutoCommandBufferBuilder` tracked every resource
-/// on the CPU and inserted its own, necessarily wider, barriers instead. The
-/// engine paid for two synchronisation compilers and used neither result.
+/// All of a pass's barriers go into one `DependencyInfo`: barriers submitted
+/// together are one dependency the driver satisfies with a single stall, where a
+/// sequence of them is a sequence of stalls.
 ///
-/// All of a pass's barriers go into one `DependencyInfo` rather than one call
-/// each. That is not only fewer commands: barriers submitted together are one
-/// dependency the driver can satisfy with a single stall, where a sequence of
-/// them is a sequence of stalls.
-///
-/// `resolve` returning `None` drops the barrier, which is correct for exactly
-/// one case — a resource the frame declared but this configuration does not
-/// allocate. Anything else reaching here unresolved is a bug in the resolver,
-/// not something to synchronise around, and the caller is expected to panic.
+/// `resolve` returning `None` drops the barrier — correct only for a resource
+/// this configuration does not allocate.
 pub(super) fn emit_plan(
     recording: &mut RecordingCommandBuffer,
     barriers: &[Barrier],
@@ -364,16 +303,9 @@ pub(super) fn emit_plan(
 
 /// Everything a recorded command named, held until the GPU is done with it.
 ///
-/// [`RecordingCommandBuffer`] retains nothing — that is the cost of dropping the
-/// tracking, and the one obligation it hands back. An auto-synchronised builder
-/// cloned an `Arc` into its own list for every pipeline, descriptor set, buffer
-/// and image view a command mentioned; recording raw means the caller does it,
-/// and dropping this before the frame's fence signals is a use-after-free the
-/// validation layers will not catch.
-///
-/// Deliberately untyped. What has to be held is "the things this frame touched",
-/// which spans a dozen unrelated types, and the only operation ever performed on
-/// the list is dropping it.
+/// Dropping this before the frame's fence signals is a use-after-free the
+/// validation layers will not catch. Untyped because the only operation ever
+/// performed on the list is dropping it.
 #[derive(Default)]
 pub(super) struct KeepAlive(Vec<Box<dyn Any + Send + Sync>>);
 
@@ -384,31 +316,15 @@ impl KeepAlive {
     }
 }
 
-/// The engine's recording surface: a raw command buffer, the resources it named,
-/// and nothing else.
+/// The engine's recording surface: a raw command buffer plus what it named.
 ///
-/// Every pass in `gfx/vulkan/` records through this rather than through
-/// vulkano's [`AutoCommandBufferBuilder`]. The two differences that matter are
-/// both invisible at a call site, which is why they are argued here once instead
-/// of at each of the hundred-odd commands:
+/// Two things an auto builder did are argued here once rather than at each of
+/// the hundred-odd call sites. Ordering comes from [`Recorder::barriers`] — the
+/// plan the graph compiled — not from a tracker inferring it. Lifetimes come
+/// from each method holding what it binds in [`KeepAlive`].
 ///
-/// 1. **Nothing is synchronised for you.** An auto builder tracked every
-///    resource's state per recorded command and derived barriers from what it
-///    saw. Ordering now comes from [`Recorder::barriers`], which submits the plan
-///    `gfx/graph/` compiled from what the passes *declared* — earlier, once per
-///    frame, and checked against a golden file on a machine with no GPU. A
-///    command recorded here is ordered against the ones before it because the
-///    graph said so, not because a tracker inferred it.
-/// 2. **Nothing is kept alive for you.** An auto builder cloned an `Arc` into its
-///    own list for every object a command mentioned. Each method here does the
-///    same into [`KeepAlive`], so a pass author cannot forget; the frame drops
-///    that list only once its fence has signalled.
-///
-/// The methods mirror the auto builder's, minus the `Result` — a validation
-/// failure here is a bug in this crate, not a condition to handle, exactly as
-/// the `.unwrap()`s at the old call sites said.
-///
-/// [`AutoCommandBufferBuilder`]: vulkano::command_buffer::AutoCommandBufferBuilder
+/// The methods mirror the auto builder's minus the `Result`: a validation
+/// failure here is a bug in this crate, as the old `.unwrap()`s said.
 pub(super) struct Recorder {
     inner: RecordingCommandBuffer,
     keep: KeepAlive,
@@ -701,10 +617,8 @@ impl Recorder {
 
 /// One frame's submission, and everything that must outlive it.
 ///
-/// The frame's resources are released when this is dropped, which is why
 /// [`wait`](InFlight::wait) consumes it: the fence signalling is the only
-/// evidence the GPU is finished, and the keep-alive list must not be dropped
-/// before it.
+/// evidence the GPU is finished with what the frame named.
 // Every field but the fence exists to be *held*, not read: dropping any of them
 // while the queue is still executing this frame is a use-after-free the
 // validation layers do not catch. That is the whole obligation raw recording
@@ -741,16 +655,8 @@ impl InFlight {
 
 /// Submit one recorded frame.
 ///
-/// `waits` are the semaphores this frame's execution must not begin before, each
-/// with the stage that has to wait: the presentation engine's hand-back of the
-/// acquired image, and the previous frame's completion. `signals` are the ones
-/// signalled when it finishes — one per waiter, because a binary semaphore's
-/// signal may be waited exactly once.
-///
-/// Submitted through `ash` rather than vulkano, and not for control: a raw
-/// [`CommandBuffer`] does not implement `PrimaryCommandBufferAbstract` and
-/// cannot be made to from outside the crate, so neither `GpuFuture::then_execute`
-/// nor `QueueGuard::submit` will take one. See the module docs.
+/// `signals` needs one semaphore per waiter: a binary semaphore's signal may be
+/// waited exactly once. Through `ash` for the reason the module docs give.
 pub(super) fn submit_frame(
     ctx: &VkContext,
     command_buffer: CommandBuffer,
@@ -801,11 +707,9 @@ pub(super) fn submit_frame(
 /// Fill in a [`RenderingInfo`]'s render area and layer count from its
 /// attachments, as the two zero defaults ask for.
 ///
-/// Vulkano does this itself in `AutoCommandBufferBuilder::begin_rendering`, and
-/// only there: `RenderingInfo::set_auto_extent_layers` is `pub(crate)`, so the
-/// raw path leaves both fields at the zero that means "derive me" and then
-/// rejects them. The rule is the smallest of every attachment's extent and layer
-/// count, resolve targets included, less the render area's offset.
+/// The smallest of every attachment, resolve targets included, less the render
+/// area offset. Reimplemented because `set_auto_extent_layers` is `pub(crate)`:
+/// the raw path leaves both fields at zero and then rejects them.
 fn set_auto_extent_layers(info: &mut RenderingInfo) {
     let auto_extent = info.render_area_extent[0] == 0 || info.render_area_extent[1] == 0;
     let auto_layers = info.layer_count == 0;
@@ -918,27 +822,16 @@ pub(super) fn color_to_shader_read(
 
 /// A [`GpuFuture`] that is nothing but a wait on a semaphore this crate signalled.
 ///
-/// The bridge between the frame — submitted raw, through `ash` — and the editor
-/// overlay, which is `egui_winit_vulkano`'s to submit and takes a `GpuFuture` to
-/// chain onto. Vulkano ships no future that waits on a semaphore the caller
-/// owns, but it does not need to: [`SubmitAnyBuilder::SemaphoresWait`] is public
-/// and is exactly that, so the whole bridge is one `build_submission`.
+/// The bridge between the raw frame and the editor overlay, which
+/// `egui_winit_vulkano` submits itself from a `GpuFuture` it is handed. Vulkano
+/// ships no such future, but [`SubmitAnyBuilder::SemaphoresWait`] is public, so
+/// the whole bridge is one `build_submission` — and the overlay is ordered on
+/// the GPU rather than by blocking the CPU on the frame's fence.
 ///
-/// Without it the only way to order the overlay after the frame is to block the
-/// CPU on the frame's fence, which costs a full GPU frame of overlap every time
-/// the editor is open. With it the dependency stays on the GPU, where it was
-/// before the renderer recorded raw.
-///
-/// `queue_change_allowed` is false and `queue` names the one the semaphore is
-/// signalled on: a wait for a signal from another queue is a different
-/// synchronisation problem, and this type does not solve it.
-///
-/// `acquired` is the swapchain image the signalling submission rendered into,
-/// when there is one. Vulkano validates a present by walking the future chain
-/// for the acquire the image came from, and this future stands in for a
-/// submission it cannot see — one that waited on that acquire's semaphore
-/// itself. Naming the image here is how that fact reaches the check; without it
-/// a present behind this future is refused as unacquired.
+/// `acquired` names the swapchain image the signalling submission rendered into.
+/// Vulkano validates a present by walking the chain for the acquire it came
+/// from; this future stands in for a submission it cannot see, and without that
+/// field the present behind it is refused as unacquired.
 pub(super) struct SemaphoreWait {
     queue: Arc<Queue>,
     semaphore: Arc<Semaphore>,

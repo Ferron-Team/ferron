@@ -1,25 +1,16 @@
 //! What each pass renders into, without render pass objects or framebuffers.
 //!
-//! Every graphics pass in `gfx/vulkan/` opens a rendering instance with
-//! [`VK_KHR_dynamic_rendering`], promoted to core in Vulkan 1.3 and required by
-//! `context.rs`. That replaces three things this module now owns between them:
-//! the `RenderPass` each pass used to declare, the `Framebuffer` binding its
-//! attachments, and the positional `Vec<Option<ClearValue>>` that had to line up
-//! with the framebuffer's attachment order.
+//! Every graphics pass opens a rendering instance with dynamic rendering, which
+//! replaces three things this module now owns between them: each pass's
+//! `RenderPass`, its `Framebuffer`, and the positional clear list that had to
+//! match the framebuffer's attachment order.
 //!
-//! Two consequences are worth naming, because they are why the change is worth
-//! making beyond the deletion:
-//!
-//! - **Load and store ops become a record-time decision.** They were baked into
-//!   the render pass, which is why the shadow atlas needed a second render pass
-//!   differing from the cascades' only in `load_op`, and why `PassFramebuffers`
-//!   kept four forward render passes to spell out four attachment shapes.
-//! - **Attachment layouts are stated per attachment, at the point of use.** The
-//!   read-only prepass depth that `oit.rs`, `refraction.rs` and the one-sample
-//!   forward pass all borrow is simply an attachment in
-//!   [`ImageLayout::DepthStencilReadOnlyOptimal`]. That is exactly what
-//!   `single_pass_renderpass!` could not express and what those three modules
-//!   hand-built whole `RenderPassCreateInfo`s to say.
+//! Two consequences shape what is here. Load and store ops are decided at record
+//! time, so the shadow atlas no longer needs a second render pass differing from
+//! the cascades' only in `load_op`. And attachment layouts are stated per
+//! attachment, so the read-only prepass depth that `oit.rs`, `refraction.rs` and
+//! the one-sample forward pass borrow is one field rather than three hand-built
+//! `RenderPassCreateInfo`s.
 //!
 //! [`VK_KHR_dynamic_rendering`]: https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_dynamic_rendering.html
 
@@ -39,12 +30,9 @@ use super::resources::GraphImages;
 
 /// The formats a pipeline will be used with.
 ///
-/// This is what a `GraphicsPipelineCreateInfo::subpass` carries now, and it is
-/// the whole of what a pipeline needs to know about its target: the render pass
-/// object it used to point at said nothing else a pipeline read. Each pass
-/// module builds its own from the format constants it already declares, so a
-/// format still has exactly one definition — it is just no longer restated in a
-/// render pass beside the image that carries it.
+/// The whole of what a pipeline needs to know about its target. Each pass module
+/// builds its own from the format constants it already declares, so a format
+/// still has exactly one definition.
 pub(super) fn pipeline_info(
     color: &[Format],
     depth: Option<Format>,
@@ -122,16 +110,11 @@ fn depth_written(view: Arc<ImageView>) -> RenderingAttachmentInfo {
 /// The geometry prepass's depth, borrowed by a later pass that tests against it
 /// and never writes it.
 ///
-/// `DepthStencilReadOnlyOptimal` is the layout the barrier plan says this image
-/// is in — every pass from the prepass onwards samples it — and stating it here
-/// is what keeps this attachment from transitioning an image nobody wrote. Under
-/// render pass objects that took a hand-built `RenderPassCreateInfo` in each of
-/// the three modules that borrow it; here it is one field.
-///
-/// Stored rather than `DontCare` for the same reason it was before: nothing was
-/// written, so there is nothing to discard, and `DontCare` would license a
-/// driver to leave the depth undefined for the passes that read it after this
-/// one — which is most of them.
+/// `DepthStencilReadOnlyOptimal` is the layout the barrier plan says it is in,
+/// so stating it here keeps this attachment from transitioning an image nobody
+/// wrote. Stored rather than `DontCare`: nothing was written, and `DontCare`
+/// would license a driver to leave the depth undefined for the passes that read
+/// it afterwards — which is most of them.
 fn depth_borrowed(view: Arc<ImageView>) -> RenderingAttachmentInfo {
     RenderingAttachmentInfo {
         image_layout: vulkano::image::ImageLayout::DepthStencilReadOnlyOptimal,
@@ -141,15 +124,13 @@ fn depth_borrowed(view: Arc<ImageView>) -> RenderingAttachmentInfo {
     }
 }
 
-/// What one graphics pass renders into, or `None` for a pass that dispatches
-/// compute or is recorded outside the executor entirely.
+/// What one graphics pass renders into, or `None` for a compute pass or one
+/// recorded outside the executor.
 ///
-/// This is the whole of what `PassFramebuffers::build` and `clear_values` used
-/// to do between them, and it is a fraction of the size because the two halves
-/// are now one: an attachment carries its own clear, so there is no positional
-/// list to keep in step with a framebuffer's attachment order, and no need to
-/// tell four forward shapes apart by counting attachments and reading a sample
-/// count back off the first one.
+/// Replaces `PassFramebuffers::build` and `clear_values` together: an attachment
+/// carries its own clear, so there is no positional list to keep in step with a
+/// framebuffer, and no telling four forward shapes apart by counting
+/// attachments.
 pub(super) fn rendering_info(
     ids: &FrameIds,
     images: &GraphImages,
@@ -213,15 +194,12 @@ pub(super) fn rendering_info(
             ),
             [1.0, 0.0, 0.0, 0.0].into(),
         )),
-        // The four shapes that used to be four render passes and four
-        // framebuffers, now two independent questions asked in the order they
-        // are decided: does this frame resolve, and does it diffuse.
+        // Four render passes and four framebuffers, now two independent
+        // questions: does this frame resolve, and does it diffuse.
         //
-        // The diffusible target is cleared to zero, and that clear is the
-        // feature's mask: the skybox and the debug lines render alongside this
-        // pass and write nothing to that attachment, so zero is what a pixel
-        // they covered holds — and a zero radius is exactly "nothing scattered
-        // here".
+        // The diffusible clear is the feature's mask — the skybox and debug
+        // lines write nothing to that attachment, and a zero radius is exactly
+        // "nothing scattered here".
         PassBody::Forward => {
             let color = ClearValue::from([background.x, background.y, background.z, 1.0]);
             let diffusible = ClearValue::from([0.0, 0.0, 0.0, 0.0]);
@@ -326,12 +304,10 @@ pub(super) fn rendering_info(
             ))),
             ..Default::default()
         },
-        // The atlas is not re-rendered whole. It holds up to 64 tiles of which a
-        // frame lights a fraction, so it loads `DontCare` and `record_atlas`
-        // clears the tiles actually assigned.
-        //
-        // Under render pass objects that difference — one `load_op` — cost a
-        // second render pass object. Here it is this arm.
+        // Not re-rendered whole: it holds up to 64 tiles of which a frame lights
+        // a fraction, so it loads `DontCare` and `record_atlas` clears the ones
+        // assigned. That difference — one `load_op` — cost a second render pass
+        // object before; here it is this arm.
         PassBody::PunctualShadows => RenderingInfo {
             depth_attachment: Some(RenderingAttachmentInfo {
                 load_op: AttachmentLoadOp::DontCare,

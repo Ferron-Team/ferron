@@ -222,16 +222,13 @@ pub struct VulkanRenderer {
     shadow_texture_set: Option<Arc<DescriptorSet>>,
     /// Frames the GPU has not finished with, oldest first.
     ///
-    /// A frame is retired when its fence *happens* to have signalled, so the CPU
-    /// records ahead of the GPU rather than lock-stepping with it. What bounds
-    /// the run-ahead is [`FRAMES_IN_FLIGHT`]; what makes it safe is that
-    /// everything a frame named — its command buffer, descriptor sets, uniform
-    /// subbuffers and semaphores — is held here until then.
+    /// Retired when a fence *happens* to have signalled, so the CPU records
+    /// ahead rather than lock-stepping; [`FRAMES_IN_FLIGHT`] bounds the
+    /// run-ahead, and everything a frame named is held here until then.
     ///
-    /// The frames' *GPU* work is still serialised, each waiting on the one
-    /// before through `frame_chain`, because there is one set of graph images
-    /// and frame `n + 1` writes the ones frame `n` is reading. Overlapping that
-    /// is #64 item 7, and needs per-frame resource sets.
+    /// Their GPU work is still serialised through `frame_chain`: there is one
+    /// set of graph images, so frame `n + 1` writes what frame `n` is reading.
+    /// Overlapping that is #64 item 7.
     in_flight: VecDeque<InFlight>,
     /// Signalled when the last submitted frame finishes, and waited by the next.
     frame_chain: Option<Arc<Semaphore>>,
@@ -490,10 +487,9 @@ impl VulkanRenderer {
 
     /// Which Vulkan object one resource in the compiled plan names.
     ///
-    /// The graph is device-free by design, so it tracks `ResourceId`s and leaves
-    /// this mapping to the renderer. Four kinds arrive here: graph-owned images,
-    /// images imported from the pass that owns them across a frame boundary, the
-    /// acquired swapchain image, and imported buffers.
+    /// The graph is device-free, so it tracks `ResourceId`s and leaves this to
+    /// the renderer: graph-owned images, images imported from the pass that owns
+    /// them across a frame boundary, the swapchain image, and buffers.
     fn barrier_target(&self, id: ResourceId, swapchain: &Arc<ImageView>) -> Option<record::Target> {
         let ids = &self.frame.ids;
 
@@ -906,9 +902,8 @@ impl VulkanRenderer {
         while self.in_flight.front().is_some_and(InFlight::is_complete) {
             self.in_flight.pop_front();
         }
-        // Only block when the CPU is a whole frame ahead. Recording raw means
-        // this crate owns the lifetime of everything a frame named, and the
-        // bound is what keeps that list from growing without limit.
+        // Only block when the CPU is a whole frame ahead: recording raw means
+        // this crate owns those lifetimes, and the bound caps the list.
         while self.in_flight.len() >= FRAMES_IN_FLIGHT {
             profile_scope!("wait");
             let oldest = self
@@ -1287,12 +1282,9 @@ impl VulkanRenderer {
             let pass_id = self.frame.graph.order()[index];
             let body = self.frame.bodies[pass_id.index()];
 
-            // What this pass needs to have finished, and the layouts it needs
-            // its resources in — derived by `gfx/graph/` from what the passes
-            // declared, and recorded here rather than inferred from what the
-            // commands below happen to touch. This is #64 item 1: until it
-            // existed the plan was compiled, asserted against a golden file, and
-            // then thrown away while vulkano's tracker derived its own.
+            // What this pass needs finished, and the layouts it needs — derived
+            // by `gfx/graph/` from what the passes declared, rather than
+            // inferred from what the commands below happen to touch.
             builder.barriers(self.frame.graph.barriers_before(index), |id| {
                 self.barrier_target(id, &swapchain_view)
             });
@@ -1922,19 +1914,13 @@ impl VulkanRenderer {
         // Leave every import in the layout its owner expects — for the
         // swapchain image, the `PresentSrc` the presentation engine requires.
         //
-        // Emitted even when an overlay follows in its own command buffer, and
-        // that is not a formality. Vulkano gives a swapchain image a *fixed*
-        // layout requirement of `PresentSrc` (`Image::from_swapchain`), so an
-        // auto-synchronised buffer — which the overlay's is — assumes it arrives
-        // in `PresentSrc` and emits a barrier saying so before drawing. Leaving
-        // it in `ColorAttachmentOptimal` instead makes that barrier's
-        // `oldLayout` a lie, and a barrier whose source layout does not match
-        // leaves the contents *undefined*: the frame under the overlay survives
-        // on some presents and not others.
-        //
-        // Transitioning here does not present anything, which is what makes it
-        // safe to do before the overlay has drawn: the present happens later, on
-        // the overlay's own future.
+        // Emitted even when an overlay follows in its own command buffer:
+        // vulkano gives a swapchain image a fixed layout requirement of
+        // `PresentSrc` (`Image::from_swapchain`), so the overlay's
+        // auto-synchronised buffer assumes it arrives in that layout. Leaving it
+        // in `ColorAttachmentOptimal` makes that barrier's `oldLayout` a lie,
+        // and the contents undefined. Transitioning here presents nothing — the
+        // present happens later, on the overlay's own future.
         let overlay_pass = raw_passes.iter().any(|body| *body == PassBody::Overlay);
         builder.barriers(self.frame.graph.final_barriers(), |id| {
             self.barrier_target(id, &swapchain_view)
@@ -1952,11 +1938,10 @@ impl VulkanRenderer {
 
         let submitting = crate::profile::scope("submit");
 
-        // The overlay is the one thing in the frame this command buffer does not
-        // contain: `Gui::draw_on_image` builds *and submits* its own, chained
-        // onto a `GpuFuture` it is handed. What it is handed is a
+        // The one thing this command buffer does not contain:
+        // `Gui::draw_on_image` builds and submits its own, chained onto a
         // [`SemaphoreWait`] on this frame's completion, so the dependency stays
-        // on the GPU and the CPU never blocks for it.
+        // on the GPU.
         let semaphore = || {
             Arc::new(
                 Semaphore::from_pool(self.ctx.device.clone())
