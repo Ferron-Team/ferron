@@ -68,7 +68,10 @@ fn generate_mips(recording: &mut RecordingCommandBuffer, image: &Arc<Image>) {
 
         record::image_barrier(
             recording,
-            record::transfer_dst_to_src(image.clone(), level_range(image, level_index - 1..level_index)),
+            record::transfer_dst_to_src(
+                image.clone(),
+                level_range(image, level_index - 1..level_index),
+            ),
         );
 
         // SAFETY: the barrier above orders this blit's read of `level - 1`

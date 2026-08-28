@@ -7,7 +7,6 @@ use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, Copy
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
 use vulkano::format::Format;
-use vulkano::image::ImageLayout;
 use vulkano::image::SampleCount;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -26,10 +25,6 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{
-    AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass,
-    RenderPassCreateInfo, Subpass, SubpassDescription,
-};
 use vulkano::sync::{self, GpuFuture};
 
 use crate::geom::Aabb;
@@ -45,10 +40,12 @@ use crate::scene::{Camera, EnvironmentSettings};
 use super::context::VkContext;
 use super::fog::GpuFog;
 use super::instances::GpuObject;
+use super::rendering;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 use super::{MSAA_SAMPLES, ShadowFrame, VulkanRenderer};
+use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
 
 pub struct GpuMesh {
     /// Position and texture coordinate, bound at binding 0 by every pass that
@@ -588,31 +585,64 @@ impl ForwardPipelines {
     }
 }
 
+/// The four attachment shapes the lit frame is rasterised into.
+///
+/// Two independent questions, and they are independent: does this frame resolve
+/// multisamples, and does it write a second target for subsurface diffusion.
+///
+/// - **Resolving** changes the colour format as well as the sample count. The
+///   multisampled pair writes `msaa_color_format` and resolves into `hdr_color`,
+///   which the graph declares at that same wider format precisely so the resolve
+///   is legal (`frame.rs`); the one-sample pair writes `hdr_color` at the
+///   narrower packed format directly.
+/// - **Diffusing** appends `SUBSURFACE_FORMAT` as a second colour target. The
+///   skybox and the debug lines rasterise into these same shapes and write
+///   nothing to that attachment, which is what `co_tenant_blend_states` is for.
+///
+/// The depth format is the same in all four; what differs is what the pass does
+/// with it, and that is now a record-time decision rather than a property baked
+/// into a pass object. At more than one sample the pass rasterises its own depth
+/// and discards it; at one sample it borrows the geometry prepass's read-only
+/// and tests `EQUAL`. See [`rendering`](super::rendering).
+#[derive(Clone)]
+pub struct ForwardTargets {
+    pub multisampled: PipelineRenderingCreateInfo,
+    pub multisampled_subsurface: PipelineRenderingCreateInfo,
+    pub single: PipelineRenderingCreateInfo,
+    pub single_subsurface: PipelineRenderingCreateInfo,
+}
+
+impl ForwardTargets {
+    fn new(color_format: Format, msaa_color_format: Format) -> Self {
+        let depth = Some(DEPTH_FORMAT);
+        Self {
+            multisampled: rendering::pipeline_info(&[msaa_color_format], depth),
+            multisampled_subsurface: rendering::pipeline_info(
+                &[msaa_color_format, SUBSURFACE_FORMAT],
+                depth,
+            ),
+            single: rendering::pipeline_info(&[color_format], depth),
+            single_subsurface: rendering::pipeline_info(&[color_format, SUBSURFACE_FORMAT], depth),
+        }
+    }
+}
+
 pub struct ForwardPass {
-    pub render_pass: Arc<RenderPass>,
-    /// The same pass with a second colour target and a second resolve, for the
-    /// frame that diffuses subsurface light.
+    /// The four shapes this pass rasterises into, and the only thing a pipeline
+    /// needs to know about any of them.
     ///
-    /// Built alongside the first rather than in place of it, and both kept for
-    /// the whole session. Which one a frame uses is structural — it comes out of
-    /// `FrameConfig` — but a render pass is not something the graph owns, and
-    /// rebuilding this one on a toggle would mean rebuilding every pipeline that
-    /// shares it: this pass's, the skybox's and the debug lines'. Two of each,
-    /// made once, costs three extra pipelines at startup and nothing at all
-    /// afterwards.
-    pub subsurface_render_pass: Arc<RenderPass>,
-    /// The same two at one sample, which is the default path.
+    /// Four render pass objects until dynamic rendering: two written by
+    /// `single_pass_renderpass!` and two built by hand, because the macro could
+    /// not express a depth attachment referenced in
+    /// `DepthStencilReadOnlyOptimal`. They are four *descriptions* now, all of
+    /// them made the same way, and the read-only depth is a field on the
+    /// attachment at record time rather than a property of a pass object — see
+    /// [`rendering`](super::rendering).
     ///
-    /// Different in more than a sample count, which is why they are separate
-    /// render passes rather than the same ones with `MultisampleState` changed.
-    /// There is no resolve, so the colour attachment *is* `hdr_color` and is
-    /// stored rather than discarded; and the depth attachment is the geometry
-    /// prepass's, attached read-only in `DepthStencilReadOnlyOptimal` and loaded
-    /// rather than cleared. That layout is what `single_pass_renderpass!` cannot
-    /// express and why these two are built by hand, exactly as `oit.rs` and
-    /// `refraction.rs` build theirs.
-    pub single_render_pass: Arc<RenderPass>,
-    pub single_subsurface_render_pass: Arc<RenderPass>,
+    /// Still four, and still all made up front: which one a frame uses comes out
+    /// of `FrameConfig`, and the skybox and the debug lines rasterise alongside
+    /// this pass, so all three modules build one pipeline per shape at startup.
+    pub targets: ForwardTargets,
     /// Indexed by frame: `multisampled` when `FrameConfig::msaa` is on, `single`
     /// otherwise. Eight pipelines at startup rather than four — see
     /// [`ForwardPipelines`] for the two axes, and `single_render_pass` for the
@@ -643,99 +673,14 @@ impl ForwardPass {
     pub fn new(ctx: &VkContext, color_format: Format, msaa_color_format: Format) -> Self {
         let device = &ctx.device;
         let memory_allocator = &ctx.memory_allocator;
-        let render_pass = vulkano::single_pass_renderpass!(
-            device.clone(),
-            attachments: {
-                msaa_color: {
-                    format: msaa_color_format,
-                    samples: 4,
-                    load_op: Clear,
-                    store_op: DontCare,
-                },
-                depth: {
-                    format: DEPTH_FORMAT,
-                    samples: 4,
-                    load_op: Clear,
-                    store_op: DontCare,
-                },
-
-                color: {
-                    format: msaa_color_format,
-                    samples: 1,
-                    load_op: DontCare,
-                    store_op: Store,
-                },
-            },
-            pass: {
-                color: [msaa_color],
-                color_resolve: [color],
-                depth_stencil: {depth},
-            },
-        )
-        .unwrap();
-
-        // The second target is `DontCare`/resolve in exactly the shape the first
-        // is, and cleared for one reason: every other pipeline that shares this
-        // render pass — the skybox, the debug lines — masks the channel off rather
-        // than writing to it, so the clear is what a pixel they covered is left
-        // holding. Zero there reads as "nothing scattered here", which is the only
-        // mask the diffusion passes need.
-        let subsurface_render_pass = vulkano::single_pass_renderpass!(
-            device.clone(),
-            attachments: {
-                msaa_color: {
-                    format: msaa_color_format,
-                    samples: 4,
-                    load_op: Clear,
-                    store_op: DontCare,
-                },
-                msaa_subsurface: {
-                    format: SUBSURFACE_FORMAT,
-                    samples: 4,
-                    load_op: Clear,
-                    store_op: DontCare,
-                },
-                depth: {
-                    format: DEPTH_FORMAT,
-                    samples: 4,
-                    load_op: Clear,
-                    store_op: DontCare,
-                },
-
-                color: {
-                    format: msaa_color_format,
-                    samples: 1,
-                    load_op: DontCare,
-                    store_op: Store,
-                },
-                subsurface: {
-                    format: SUBSURFACE_FORMAT,
-                    samples: 1,
-                    load_op: DontCare,
-                    store_op: Store,
-                },
-            },
-            pass: {
-                color: [msaa_color, msaa_subsurface],
-                color_resolve: [color, subsurface],
-                depth_stencil: {depth},
-            },
-        )
-        .unwrap();
-
-        // The one-sample pair. `hdr_color` is the colour target directly, and
-        // the depth is the prepass's — loaded, never written, and left in the
-        // layout it arrived in.
-        let single_render_pass = build_single_render_pass(device, color_format, &[]);
-        let single_subsurface_render_pass =
-            build_single_render_pass(device, color_format, &[SUBSURFACE_FORMAT]);
+        let targets = ForwardTargets::new(color_format, msaa_color_format);
 
         // One sampler for all eight pipelines. See `build_pipeline`.
         let shadow_sampler = super::shadow::comparison_sampler(device);
         let multisampled = ForwardPipelines {
             plain: build_pipeline(
                 ctx,
-                &render_pass,
+                &targets.multisampled,
                 fs::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 true,
@@ -743,7 +688,7 @@ impl ForwardPass {
             ),
             subsurface: build_pipeline(
                 ctx,
-                &subsurface_render_pass,
+                &targets.multisampled_subsurface,
                 fs_sss::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 true,
@@ -751,7 +696,7 @@ impl ForwardPass {
             ),
             masked: build_pipeline(
                 ctx,
-                &render_pass,
+                &targets.multisampled,
                 fs::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 false,
@@ -759,7 +704,7 @@ impl ForwardPass {
             ),
             masked_subsurface: build_pipeline(
                 ctx,
-                &subsurface_render_pass,
+                &targets.multisampled_subsurface,
                 fs_sss::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 false,
@@ -772,7 +717,7 @@ impl ForwardPass {
         let single = ForwardPipelines {
             plain: build_pipeline(
                 ctx,
-                &single_render_pass,
+                &targets.single,
                 fs::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 true,
@@ -780,7 +725,7 @@ impl ForwardPass {
             ),
             subsurface: build_pipeline(
                 ctx,
-                &single_subsurface_render_pass,
+                &targets.single_subsurface,
                 fs_sss::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 true,
@@ -788,7 +733,7 @@ impl ForwardPass {
             ),
             masked: build_pipeline(
                 ctx,
-                &single_render_pass,
+                &targets.single,
                 fs_masked::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 false,
@@ -796,7 +741,7 @@ impl ForwardPass {
             ),
             masked_subsurface: build_pipeline(
                 ctx,
-                &single_subsurface_render_pass,
+                &targets.single_subsurface,
                 fs_sss_masked::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 false,
@@ -863,10 +808,7 @@ impl ForwardPass {
         .unwrap();
 
         Self {
-            render_pass,
-            subsurface_render_pass,
-            single_render_pass,
-            single_subsurface_render_pass,
+            targets,
             multisampled,
             single,
             uniform_buffer_allocator,
@@ -1636,9 +1578,9 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
 /// near a silhouette. An empty write mask is the whole fix, and unlike disabling
 /// the write it needs no device feature: the attachment keeps its clear, and a
 /// clear of zero is exactly "nothing scattered here".
-pub(super) fn co_tenant_blend_states(subpass: &Subpass) -> ColorBlendState {
+pub(super) fn co_tenant_blend_states(target: &PipelineRenderingCreateInfo) -> ColorBlendState {
     let mut state = ColorBlendState::with_attachment_states(
-        subpass.num_color_attachments(),
+        target.color_attachment_formats.len() as u32,
         ColorBlendAttachmentState::default(),
     );
     for attachment in state.attachments.iter_mut().skip(1) {
@@ -1668,7 +1610,7 @@ pub(super) fn vertex_shader(device: &Arc<Device>) -> vulkano::shader::EntryPoint
 /// binds are bound once for whichever opaque variant ran.
 fn build_pipeline(
     ctx: &VkContext,
-    render_pass: &Arc<RenderPass>,
+    target: &PipelineRenderingCreateInfo,
     fragment: Arc<vulkano::shader::ShaderModule>,
     // Passed in rather than made here, and that is the whole reason this parameter
     // exists: Vulkan compares immutable samplers by *identity*, so two calls to
@@ -1736,8 +1678,6 @@ fn build_pipeline(
     )
     .unwrap();
 
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-
     GraphicsPipeline::new(
         device.clone(),
         ctx.pipeline_cache(),
@@ -1775,88 +1715,15 @@ fn build_pipeline(
                 ..Default::default()
             }),
             color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
+                target.color_attachment_formats.len() as u32,
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(target.clone().into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
     .unwrap()
-}
-
-/// A forward render pass at one sample: colour straight into `hdr_color`, and
-/// the geometry prepass's depth attached read-only.
-///
-/// `extra_color` is the subsurface variant's second target, empty for the plain
-/// one — the only difference between the two, exactly as it is for the
-/// multisampled pair above.
-///
-/// Built by hand rather than with `single_pass_renderpass!` for the reason
-/// `oit.rs` documents: the depth attachment has to be referenced in
-/// `DepthStencilReadOnlyOptimal` and to enter and leave in it. The macro emits
-/// `DepthStencilAttachmentOptimal`, which would make this render pass transition
-/// an image the barrier plan says nobody wrote — and every pass after this one
-/// still samples that depth, in a layout it was never told about.
-fn build_single_render_pass(
-    device: &Arc<Device>,
-    color_format: Format,
-    extra_color: &[Format],
-) -> Arc<RenderPass> {
-    // Cleared and stored, unlike the multisampled colour target: there is no
-    // resolve behind it, so this attachment is the lit frame itself.
-    let color = |format: Format| AttachmentDescription {
-        format,
-        samples: SampleCount::Sample1,
-        load_op: AttachmentLoadOp::Clear,
-        store_op: AttachmentStoreOp::Store,
-        initial_layout: ImageLayout::ColorAttachmentOptimal,
-        final_layout: ImageLayout::ColorAttachmentOptimal,
-        ..Default::default()
-    };
-
-    let mut attachments = vec![color(color_format)];
-    attachments.extend(extra_color.iter().copied().map(color));
-    let depth_index = attachments.len() as u32;
-    attachments.push(AttachmentDescription {
-        format: DEPTH_FORMAT,
-        samples: SampleCount::Sample1,
-        // Loaded, because the prepass wrote it and testing `EQUAL` against a
-        // clear would reject the entire frame.
-        load_op: AttachmentLoadOp::Load,
-        // Nothing was written, so there is nothing to discard — and `DontCare`
-        // would license a driver to leave the prepass depth undefined for the
-        // passes that read it after this one, which is most of them.
-        store_op: AttachmentStoreOp::Store,
-        initial_layout: ImageLayout::DepthStencilReadOnlyOptimal,
-        final_layout: ImageLayout::DepthStencilReadOnlyOptimal,
-        ..Default::default()
-    });
-
-    let create_info = RenderPassCreateInfo {
-        subpasses: vec![SubpassDescription {
-            color_attachments: (0..depth_index)
-                .map(|attachment| {
-                    Some(AttachmentReference {
-                        attachment,
-                        layout: ImageLayout::ColorAttachmentOptimal,
-                        ..Default::default()
-                    })
-                })
-                .collect(),
-            depth_stencil_attachment: Some(AttachmentReference {
-                attachment: depth_index,
-                layout: ImageLayout::DepthStencilReadOnlyOptimal,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }],
-        attachments,
-        ..Default::default()
-    };
-
-    RenderPass::new(device.clone(), create_info).unwrap()
 }
 
 mod vs {

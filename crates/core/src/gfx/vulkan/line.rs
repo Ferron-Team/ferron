@@ -13,24 +13,27 @@ use std::sync::Arc;
 
 use crate::scene::DebugLine;
 
+use super::MSAA_SAMPLES;
 use super::context::VkContext;
+use super::forward::ForwardTargets;
 use super::taa::FrameView;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
+use vulkano::image::SampleCount;
 use vulkano::memory::allocator::MemoryTypeFilter;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
+use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
 use vulkano::pipeline::graphics::vertex_input::{Vertex as VertexTrait, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{RenderPass, Subpass};
 
 /// One endpoint of a debug line: world-space position + RGBA colour. Two of
 /// these make a segment, drawn with `PrimitiveTopology::LineList`.
@@ -44,22 +47,16 @@ pub struct LineVertex {
 }
 
 pub struct LinePass {
-    /// Indexed `[msaa][subsurface]`. A pipeline is tied to the render pass it
-    /// was built against, and the forward pass now has four of them: two sample
-    /// counts, each with and without the diffusible colour target.
+    /// Indexed `[msaa][subsurface]`, matching the four shapes of
+    /// [`ForwardTargets`]: two sample counts, each with and without the
+    /// diffusible colour target.
     pipelines: [[Arc<GraphicsPipeline>; 2]; 2],
     subbuffer_allocator: SubbufferAllocator,
 }
 
 impl LinePass {
-    /// Build the line pipelines against subpass 0 of each forward render pass.
-    pub fn new(
-        ctx: &VkContext,
-        render_pass: &Arc<RenderPass>,
-        subsurface_render_pass: &Arc<RenderPass>,
-        single_render_pass: &Arc<RenderPass>,
-        single_subsurface_render_pass: &Arc<RenderPass>,
-    ) -> Self {
+    /// Build one line pipeline per forward target shape.
+    pub fn new(ctx: &VkContext, targets: &ForwardTargets) -> Self {
         let subbuffer_allocator = SubbufferAllocator::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -73,12 +70,12 @@ impl LinePass {
         Self {
             pipelines: [
                 [
-                    build_pipeline(ctx, single_render_pass),
-                    build_pipeline(ctx, single_subsurface_render_pass),
+                    build_pipeline(ctx, &targets.single, SampleCount::Sample1),
+                    build_pipeline(ctx, &targets.single_subsurface, SampleCount::Sample1),
                 ],
                 [
-                    build_pipeline(ctx, render_pass),
-                    build_pipeline(ctx, subsurface_render_pass),
+                    build_pipeline(ctx, &targets.multisampled, MSAA_SAMPLES),
+                    build_pipeline(ctx, &targets.multisampled_subsurface, MSAA_SAMPLES),
                 ],
             ],
             subbuffer_allocator,
@@ -100,7 +97,7 @@ impl LinePass {
             return;
         }
 
-        // Whichever render pass the executor opened around this call.
+        // Whichever shape the executor opened the rendering instance with.
         let pipeline = &self.pipelines[msaa as usize][subsurface as usize];
 
         // Flatten each segment into its two endpoints for `LineList` topology.
@@ -155,7 +152,11 @@ impl LinePass {
     }
 }
 
-fn build_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+fn build_pipeline(
+    ctx: &VkContext,
+    target: &PipelineRenderingCreateInfo,
+    samples: SampleCount,
+) -> Arc<GraphicsPipeline> {
     let device = &ctx.device;
     let vs = vs::load(device.clone())
         .unwrap()
@@ -181,8 +182,6 @@ fn build_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<Graphic
     )
     .unwrap();
 
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-
     GraphicsPipeline::new(
         device.clone(),
         ctx.pipeline_cache(),
@@ -195,13 +194,13 @@ fn build_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<Graphic
             }),
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState::default()),
-            // Taken from the render pass this pipeline is being built against
-            // rather than named here, so the two cannot disagree — a pipeline
-            // whose sample count differs from its subpass's fails to create.
+            // Passed in rather than read back off a render pass object: a
+            // description carries formats, not a sample count, and a pipeline
+            // whose count disagrees with the attachments it is used with is
+            // invalid. The two travel together from `ForwardTargets` for that
+            // reason.
             multisample_state: Some(MultisampleState {
-                rasterization_samples: subpass
-                    .num_samples()
-                    .unwrap_or(vulkano::image::SampleCount::Sample1),
+                rasterization_samples: samples,
                 ..Default::default()
             }),
             depth_stencil_state: Some(DepthStencilState {
@@ -213,10 +212,10 @@ fn build_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<Graphic
                 ..Default::default()
             }),
             // Masked past the first attachment: this shader declares one output,
-            // and the subsurface render pass has two. See `co_tenant_blend_states`.
-            color_blend_state: Some(super::forward::co_tenant_blend_states(&subpass)),
+            // and the subsurface target shape has two. See `co_tenant_blend_states`.
+            color_blend_state: Some(super::forward::co_tenant_blend_states(target)),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(target.clone().into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )

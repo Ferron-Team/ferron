@@ -110,11 +110,7 @@ fn light_up(light_dir: Vec3) -> Vec3 {
 ///
 /// `light_dir` must be unit length, as everywhere else in this module.
 pub fn light_rotation(light_dir: Vec3) -> Mat3 {
-    Mat3::from_mat4(Mat4::look_at_rh(
-        Vec3::ZERO,
-        light_dir,
-        light_up(light_dir),
-    ))
+    Mat3::from_mat4(Mat4::look_at_rh(Vec3::ZERO, light_dir, light_up(light_dir)))
 }
 
 /// Element-wise `|m|`. Along each light-space axis the farthest corner of a

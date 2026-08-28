@@ -37,13 +37,11 @@ use std::sync::Arc;
 use vulkano::buffer::BufferContents;
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{
     LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
 };
 use vulkano::image::view::ImageView;
-use vulkano::image::{ImageLayout, SampleCount};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
@@ -60,10 +58,6 @@ use vulkano::pipeline::{
     ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{
-    AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass,
-    RenderPassCreateInfo, Subpass, SubpassDescription,
-};
 
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
@@ -71,6 +65,7 @@ use super::VulkanRenderer;
 use super::context::VkContext;
 use super::forward::ForwardSets;
 use super::hdr::HDR_WIDE_FORMAT;
+use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -97,14 +92,6 @@ struct PyramidPush {
 }
 
 pub struct RefractionPass {
-    /// One subpass, one colour target and the prepass depth attached read-only.
-    /// Built by hand rather than through `single_pass_renderpass!` for the
-    /// reason [`OitPass`](super::oit::OitPass) documents: that macro hard-codes
-    /// a depth attachment's reference layout to `DepthStencilAttachmentOptimal`,
-    /// and this pass declares
-    /// [`Access::DepthAttachmentRead`](crate::gfx::graph::Access::DepthAttachmentRead),
-    /// so the graph leaves the image in `DepthStencilReadOnlyOptimal`.
-    pub(super) render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
     pyramid_pipeline: Arc<ComputePipeline>,
     composite_pipeline: Arc<ComputePipeline>,
@@ -126,8 +113,7 @@ impl RefractionPass {
     /// first five set layouts are lifted from it verbatim; see `build_pipeline`.
     pub fn new(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Self {
         let device = &ctx.device;
-        let render_pass = build_render_pass(device);
-        let pipeline = build_pipeline(ctx, &render_pass, forward_layout);
+        let pipeline = build_pipeline(ctx, forward_layout);
 
         let clamp = |info: SamplerCreateInfo| {
             Sampler::new(
@@ -141,7 +127,6 @@ impl RefractionPass {
         };
 
         Self {
-            render_pass,
             pipeline,
             pyramid_pipeline: build_compute(ctx, pyramid_cs::load(device.clone()).unwrap()),
             composite_pipeline: build_compute(ctx, composite_cs::load(device.clone()).unwrap()),
@@ -347,61 +332,7 @@ impl RefractionPass {
     }
 }
 
-/// The draw pass's render pass.
-///
-/// The depth attachment is referenced in `DepthStencilReadOnlyOptimal` and never
-/// transitions, exactly as the transparency accumulation's does — see the note
-/// there for why a reference layout that disagreed with the barrier plan is the
-/// class of bug the graph exists to prevent.
-fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
-    let create_info = RenderPassCreateInfo {
-        attachments: vec![
-            AttachmentDescription {
-                format: HDR_WIDE_FORMAT,
-                samples: SampleCount::Sample1,
-                load_op: AttachmentLoadOp::Clear,
-                store_op: AttachmentStoreOp::Store,
-                initial_layout: ImageLayout::ColorAttachmentOptimal,
-                final_layout: ImageLayout::ColorAttachmentOptimal,
-                ..Default::default()
-            },
-            AttachmentDescription {
-                format: DEPTH_FORMAT,
-                samples: SampleCount::Sample1,
-                load_op: AttachmentLoadOp::Load,
-                // Nothing was written, so there is nothing to discard — and
-                // `DontCare` would license a driver to leave the prepass depth
-                // undefined for the passes that read it after this one.
-                store_op: AttachmentStoreOp::Store,
-                initial_layout: ImageLayout::DepthStencilReadOnlyOptimal,
-                final_layout: ImageLayout::DepthStencilReadOnlyOptimal,
-                ..Default::default()
-            },
-        ],
-        subpasses: vec![SubpassDescription {
-            color_attachments: vec![Some(AttachmentReference {
-                attachment: 0,
-                layout: ImageLayout::ColorAttachmentOptimal,
-                ..Default::default()
-            })],
-            depth_stencil_attachment: Some(AttachmentReference {
-                attachment: 1,
-                layout: ImageLayout::DepthStencilReadOnlyOptimal,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-
-    RenderPass::new(device.clone(), create_info).unwrap()
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    render_pass: &Arc<RenderPass>,
-    forward_layout: &Arc<PipelineLayout>,
-) -> Arc<GraphicsPipeline> {
+fn build_pipeline(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Arc<GraphicsPipeline> {
     let device = &ctx.device;
     // The forward pass's vertex shader, unchanged: a refractive surface is the
     // same geometry read from the same per-object rows, and `shading.glsl` reads
@@ -429,7 +360,7 @@ fn build_pipeline(
     // `Sampler::new` of the identical description is a different sampler and
     // therefore an incompatible set. Lifting the objects is what makes the five
     // sets the executor already built bind to this pipeline at all.
-    let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
+    let layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
     layout_info
         .set_layouts
         .get(SCENE_SET)
@@ -444,8 +375,6 @@ fn build_pipeline(
     );
 
     let layout = PipelineLayout::new(device.clone(), create_info).unwrap();
-
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
 
     GraphicsPipeline::new(
         device.clone(),
@@ -497,7 +426,7 @@ fn build_pipeline(
                 ..Default::default()
             }),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(rendering::pipeline_info(&[HDR_WIDE_FORMAT], Some(DEPTH_FORMAT)).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )

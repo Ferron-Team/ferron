@@ -20,7 +20,6 @@ use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInf
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -38,13 +37,13 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{RenderPass, Subpass};
 
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
 use super::VulkanRenderer;
 use super::context::VkContext;
 use super::instances::GpuObject;
+use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -111,7 +110,6 @@ struct PrepassPush {
 }
 
 pub struct GeometryPrepass {
-    pub(super) render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
     /// The same pass for a `Masked` run: back faces kept, and a fragment shader
     /// that cuts the texels below the material's cutoff away.
@@ -132,19 +130,9 @@ pub struct GeometryPrepass {
 impl GeometryPrepass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
-        let render_pass = build_render_pass(device);
-        let pipeline = build_pipeline(
-            ctx,
-            &render_pass,
-            prepass_fs::load(device.clone()).unwrap(),
-            false,
-        );
-        let masked_pipeline = build_pipeline(
-            ctx,
-            &render_pass,
-            prepass_fs_masked::load(device.clone()).unwrap(),
-            true,
-        );
+        let pipeline = build_pipeline(ctx, prepass_fs::load(device.clone()).unwrap(), false);
+        let masked_pipeline =
+            build_pipeline(ctx, prepass_fs_masked::load(device.clone()).unwrap(), true);
         let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
             device
                 .physical_device()
@@ -171,7 +159,6 @@ impl GeometryPrepass {
         );
 
         Self {
-            render_pass,
             pipeline,
             masked_pipeline,
             sampler,
@@ -368,23 +355,8 @@ impl GeometryPrepass {
     }
 }
 
-fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
-    vulkano::single_pass_renderpass!(
-        device.clone(),
-        attachments: {
-            normal:   { format: NORMAL_FORMAT,   samples: 1, load_op: Clear, store_op: Store },
-            velocity: { format: VELOCITY_FORMAT, samples: 1, load_op: Clear, store_op: Store },
-            material: { format: MATERIAL_FORMAT, samples: 1, load_op: Clear, store_op: Store },
-            depth:    { format: DEPTH_FORMAT,    samples: 1, load_op: Clear, store_op: Store },
-        },
-        pass: { color: [normal, velocity, material], depth_stencil: {depth}}
-    )
-    .unwrap()
-}
-
 fn build_pipeline(
     ctx: &VkContext,
-    render_pass: &Arc<RenderPass>,
     fragment: Arc<vulkano::shader::ShaderModule>,
     masked: bool,
 ) -> Arc<GraphicsPipeline> {
@@ -410,7 +382,6 @@ fn build_pipeline(
             .unwrap(),
     )
     .unwrap();
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
     GraphicsPipeline::new(
         device.clone(),
         ctx.pipeline_cache(),
@@ -436,11 +407,17 @@ fn build_pipeline(
                 ..Default::default()
             }),
             color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
+                3,
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(
+                rendering::pipeline_info(
+                    &[NORMAL_FORMAT, VELOCITY_FORMAT, MATERIAL_FORMAT],
+                    Some(DEPTH_FORMAT),
+                )
+                .into(),
+            ),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )

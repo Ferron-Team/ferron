@@ -540,7 +540,10 @@ mod tests {
         let suppressed = std::thread::spawn(|| {
             suppress_on_this_thread();
             assert!(!is_collecting());
-            (scope("worker").is_none(), COLLECTOR.with(|cell| cell.borrow().spans.len()))
+            (
+                scope("worker").is_none(),
+                COLLECTOR.with(|cell| cell.borrow().spans.len()),
+            )
         })
         .join()
         .expect("the worker thread panicked");

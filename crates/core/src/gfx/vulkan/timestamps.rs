@@ -171,9 +171,9 @@ impl GpuTimestamps {
 
     /// Reset this frame's queries and open the reserved whole-frame pair.
     ///
-    /// Must be recorded before the first `begin_render_pass`: a reset inside a
-    /// render pass is invalid, and which passes will run isn't known yet, so the
-    /// entire pool is reset in one go.
+    /// Must be recorded before the first `begin_rendering`: a reset inside a
+    /// render pass instance is invalid, and which passes will run isn't known
+    /// yet, so the entire pool is reset in one go.
     pub fn record_resets(
         &mut self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,

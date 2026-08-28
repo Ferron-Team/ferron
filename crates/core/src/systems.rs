@@ -572,7 +572,8 @@ mod shadow_culling_tests {
                         let hoisted = casts(&set, &bounds, index);
                         let reference = reference_casts_into(&bounds, &set.cascades[index]);
                         assert_eq!(
-                            hoisted, reference,
+                            hoisted,
+                            reference,
                             "cascade {index} disagrees about a box of half-extent {half} at \
                              {:?}",
                             bounds.center(),

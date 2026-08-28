@@ -16,6 +16,7 @@ mod pipeline_cache;
 mod prepass;
 mod record;
 mod refraction;
+mod rendering;
 mod resources;
 mod shadow;
 mod ssao;
@@ -32,7 +33,6 @@ use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, CopyImageToBufferInfo, PrimaryAutoCommandBuffer,
-    SubpassBeginInfo, SubpassContents,
 };
 use vulkano::descriptor_set::DescriptorSet;
 use vulkano::device::Queue;
@@ -40,7 +40,6 @@ use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::instance::Instance;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::render_pass::RenderPass;
 use vulkano::swapchain::{Surface, SwapchainPresentInfo, acquire_next_image};
 use vulkano::sync::GpuFuture;
 use vulkano::sync::{self, future::FenceSignalFuture};
@@ -75,7 +74,7 @@ use self::hdr::HdrPass;
 use self::line::LinePass;
 use self::motion_blur::MotionBlurPass;
 use self::prepass::GeometryPrepass;
-use self::resources::{GraphImages, PassFramebuffers, begin_info};
+use self::resources::GraphImages;
 use self::shadow::ShadowPass;
 use self::ssao::SsaoPass;
 use self::ssr::SsrPass;
@@ -229,7 +228,6 @@ pub struct VulkanRenderer {
     config: FrameConfig,
     frame: Frame,
     images: GraphImages,
-    framebuffers: PassFramebuffers,
 }
 
 impl VulkanRenderer {
@@ -241,15 +239,9 @@ impl VulkanRenderer {
     ) -> Self {
         let ctx = VkContext::new(instance, Some(&surface));
         let format = swapchain_color_format(&ctx, &surface);
-        Self::build(
-            ctx,
-            format,
-            extent,
-            present,
-            |ctx, render_pass, format, extent| {
-                SwapchainState::new(ctx, &surface, render_pass, format, extent, present)
-            },
-        )
+        Self::build(ctx, format, extent, present, |ctx, format, extent| {
+            SwapchainState::new(ctx, &surface, format, extent, present)
+        })
     }
 
     /// A renderer that draws into an image instead of a window.
@@ -273,14 +265,12 @@ impl VulkanRenderer {
     }
 
     /// The half of construction that does not know where the frame ends up.
-    /// `make_target` is handed the tonemap render pass because a framebuffer
-    /// needs it, and it is built partway through.
     fn build(
         ctx: VkContext,
         format: Format,
         extent: [u32; 2],
         present: PresentSettings,
-        make_target: impl FnOnce(&VkContext, &Arc<RenderPass>, Format, [u32; 2]) -> SwapchainState,
+        make_target: impl FnOnce(&VkContext, Format, [u32; 2]) -> SwapchainState,
     ) -> Self {
         let forward = ForwardPass::new(&ctx, hdr::HDR_FORMAT, hdr::HDR_WIDE_FORMAT);
         let hdr = HdrPass::new(&ctx, format);
@@ -298,21 +288,9 @@ impl VulkanRenderer {
         let dof = DofPass::new(&ctx);
         let motion_blur = MotionBlurPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx);
-        let line = LinePass::new(
-            &ctx,
-            &forward.render_pass,
-            &forward.subsurface_render_pass,
-            &forward.single_render_pass,
-            &forward.single_subsurface_render_pass,
-        );
-        let environment = EnvironmentPass::new(
-            &ctx,
-            &forward.render_pass,
-            &forward.subsurface_render_pass,
-            &forward.single_render_pass,
-            &forward.single_subsurface_render_pass,
-        );
-        let swapchain = make_target(&ctx, &hdr.tonemap_rp, format, extent);
+        let line = LinePass::new(&ctx, &forward.targets);
+        let environment = EnvironmentPass::new(&ctx, &forward.targets);
+        let swapchain = make_target(&ctx, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
 
         // Default textures so every material slot resolves to a valid view:
@@ -359,17 +337,6 @@ impl VulkanRenderer {
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let images = GraphImages::allocate(&ctx.memory_allocator, &frame.graph, extent);
-        let framebuffers = PassFramebuffers::build(
-            &frame,
-            &images,
-            &forward,
-            &prepass,
-            &ssao,
-            &contact_shadows,
-            &oit,
-            &refraction,
-            &shadow,
-        );
 
         Self {
             instances: InstanceStore::new(&ctx),
@@ -411,7 +378,6 @@ impl VulkanRenderer {
             config,
             frame,
             images,
-            framebuffers,
         }
     }
 
@@ -518,17 +484,6 @@ impl VulkanRenderer {
             &self.ctx.memory_allocator,
             &self.frame.graph,
             self.swapchain.extent,
-        );
-        self.framebuffers = PassFramebuffers::build(
-            &self.frame,
-            &self.images,
-            &self.forward,
-            &self.prepass,
-            &self.ssao,
-            &self.contact_shadows,
-            &self.oit,
-            &self.refraction,
-            &self.shadow,
         );
     }
 }
@@ -819,10 +774,7 @@ impl VulkanRenderer {
         }
 
         if self.recreate_swapchain {
-            if self
-                .swapchain
-                .recreate(&self.hdr.tonemap_rp, self.pending_extent, self.present)
-            {
+            if self.swapchain.recreate(self.pending_extent, self.present) {
                 self.recreate_swapchain = false;
             } else {
                 return;
@@ -1639,19 +1591,18 @@ impl VulkanRenderer {
                 continue;
             }
 
-            let framebuffer = self
-                .framebuffers
-                .get(pass_id.index())
-                .unwrap_or_else(|| self.swapchain.framebuffers[image_index as usize].clone());
-            builder
-                .begin_render_pass(
-                    begin_info(framebuffer, body, environment.background),
-                    SubpassBeginInfo {
-                        contents: SubpassContents::Inline,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
+            // Attachments, load and store ops and clears together, decided
+            // here rather than split between a framebuffer built at allocation
+            // time and a positional clear list that had to match its order.
+            let rendering = rendering::rendering_info(
+                &self.frame.ids,
+                &self.images,
+                &self.swapchain.image_views[image_index as usize],
+                body,
+                environment.background,
+            )
+            .expect("the executor reached a graphics pass with nothing to render into");
+            builder.begin_rendering(rendering).unwrap();
 
             match body {
                 PassBody::ShadowCascade(cascade) => {
@@ -1850,7 +1801,7 @@ impl VulkanRenderer {
                 | PassBody::BloomUpsample(_) => unreachable!("handled above"),
             }
 
-            builder.end_render_pass(Default::default()).unwrap();
+            builder.end_rendering().unwrap();
             if let Some(timestamps) = timestamps.as_mut() {
                 timestamps.end_pass(&mut builder, timed);
             }

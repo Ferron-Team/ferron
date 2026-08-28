@@ -3,12 +3,12 @@ use std::sync::Arc;
 use super::VulkanRenderer;
 use super::context::VkContext;
 use super::prepass::{FrameUbo, NORMAL_FORMAT};
+use super::rendering;
 use super::texture::MipPolicy;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -25,7 +25,6 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{RenderPass, Subpass};
 use vulkano::shader::EntryPoint;
 
 pub(super) const AO_FORMAT: Format = Format::R8_UNORM;
@@ -90,20 +89,8 @@ fn build_noise(ctx: &VkContext) -> Arc<ImageView> {
     )
 }
 
-fn ao_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
-    vulkano::single_pass_renderpass!(
-        device.clone(),
-        attachments: {
-            ao: { format: AO_FORMAT, samples: 1, load_op: Clear, store_op: Store },
-        },
-        pass: { color: [ao], depth_stencil: {} },
-    )
-    .unwrap()
-}
-
 fn build_fullscreen_pipeline(
     ctx: &VkContext,
-    render_pass: &Arc<RenderPass>,
     vs: EntryPoint,
     fs: EntryPoint,
 ) -> Arc<GraphicsPipeline> {
@@ -119,7 +106,6 @@ fn build_fullscreen_pipeline(
             .unwrap(),
     )
     .unwrap();
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
     GraphicsPipeline::new(
         device.clone(),
         ctx.pipeline_cache(),
@@ -132,11 +118,11 @@ fn build_fullscreen_pipeline(
             multisample_state: Some(MultisampleState::default()),
             depth_stencil_state: None,
             color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
+                1,
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(rendering::pipeline_info(&[AO_FORMAT], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
@@ -154,8 +140,6 @@ pub(super) struct SsaoUniforms {
 }
 
 pub struct SsaoPass {
-    pub(super) ssao_rp: Arc<RenderPass>,
-    pub(super) blur_rp: Arc<RenderPass>,
     ssao_pipeline: Arc<GraphicsPipeline>,
     blur_pipeline: Arc<GraphicsPipeline>,
     uniform_allocator: SubbufferAllocator,
@@ -176,9 +160,6 @@ pub struct SsaoPass {
 impl SsaoPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
-        let ssao_rp = ao_render_pass(device);
-        let blur_rp = ao_render_pass(device);
-
         let full_vs = fullscreen_vs::load(device.clone())
             .unwrap()
             .entry_point("main")
@@ -191,8 +172,11 @@ impl SsaoPass {
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let ssao_pipeline = build_fullscreen_pipeline(ctx, &ssao_rp, full_vs.clone(), ssao_fs);
-        let blur_pipeline = build_fullscreen_pipeline(ctx, &blur_rp, full_vs, blur_fs);
+        // One description for both, where there were two identical render pass
+        // objects: the resolve and the blur write the same format to the same
+        // shape of target, and that was always the only thing either declared.
+        let ssao_pipeline = build_fullscreen_pipeline(ctx, full_vs.clone(), ssao_fs);
+        let blur_pipeline = build_fullscreen_pipeline(ctx, full_vs, blur_fs);
 
         let uniform_allocator = SubbufferAllocator::new(
             ctx.memory_allocator.clone(),
@@ -226,8 +210,6 @@ impl SsaoPass {
         .unwrap();
 
         Self {
-            ssao_rp,
-            blur_rp,
             ssao_pipeline,
             blur_pipeline,
             uniform_allocator,

@@ -26,11 +26,9 @@ use std::sync::Arc;
 
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
-use vulkano::image::{ImageLayout, SampleCount};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
@@ -47,10 +45,6 @@ use vulkano::pipeline::{
     ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{
-    AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass,
-    RenderPassCreateInfo, Subpass, SubpassDescription,
-};
 
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
@@ -58,6 +52,7 @@ use super::VulkanRenderer;
 use super::context::VkContext;
 use super::forward::ForwardSets;
 use super::hdr::HDR_WIDE_FORMAT;
+use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -79,15 +74,6 @@ pub(super) const ACCUM_FORMAT: Format = HDR_WIDE_FORMAT;
 pub(super) const REVEAL_FORMAT: Format = Format::R8_UNORM;
 
 pub struct OitPass {
-    /// One subpass, two colour targets and the prepass depth attached read-only.
-    /// Built by hand rather than through `single_pass_renderpass!`, because that
-    /// macro hard-codes a depth attachment's reference layout to
-    /// `DepthStencilAttachmentOptimal` — and this pass declares
-    /// [`Access::DepthAttachmentRead`](crate::gfx::graph::Access::DepthAttachmentRead),
-    /// so the graph leaves the image in `DepthStencilReadOnlyOptimal`. A render
-    /// pass that disagreed with the barrier plan is precisely the class of bug
-    /// the graph exists to make impossible.
-    pub(super) render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
     composite_pipeline: Arc<ComputePipeline>,
     /// Nearest and clamped: the composite reads all three of its inputs at
@@ -100,8 +86,7 @@ impl OitPass {
     /// derived — see the module docs.
     pub fn new(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Self {
         let device = &ctx.device;
-        let render_pass = build_render_pass(device);
-        let pipeline = build_pipeline(ctx, &render_pass, forward_layout);
+        let pipeline = build_pipeline(ctx, forward_layout);
         let composite_pipeline = build_composite_pipeline(ctx);
         let nearest_clamp = Sampler::new(
             device.clone(),
@@ -113,7 +98,6 @@ impl OitPass {
         .unwrap();
 
         Self {
-            render_pass,
             pipeline,
             composite_pipeline,
             nearest_clamp,
@@ -233,74 +217,7 @@ impl OitPass {
     }
 }
 
-/// The accumulation pass's render pass.
-///
-/// The depth attachment is referenced in `DepthStencilReadOnlyOptimal` and never
-/// transitions: it enters and leaves in the layout the graph put it in, and the
-/// pipeline below writes no depth. That is the whole of the contract with
-/// `Access::DepthAttachmentRead` — a reference layout of
-/// `DepthStencilAttachmentOptimal` would make the render pass transition an
-/// image the barrier plan says nobody wrote, and the readers after this one
-/// would find it in a layout they were not told about.
-fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
-    let color = |format: Format| AttachmentDescription {
-        format,
-        samples: SampleCount::Sample1,
-        load_op: AttachmentLoadOp::Clear,
-        store_op: AttachmentStoreOp::Store,
-        initial_layout: ImageLayout::ColorAttachmentOptimal,
-        final_layout: ImageLayout::ColorAttachmentOptimal,
-        ..Default::default()
-    };
-
-    let create_info = RenderPassCreateInfo {
-        attachments: vec![
-            color(ACCUM_FORMAT),
-            color(REVEAL_FORMAT),
-            AttachmentDescription {
-                format: DEPTH_FORMAT,
-                samples: SampleCount::Sample1,
-                load_op: AttachmentLoadOp::Load,
-                // Nothing was written, so there is nothing to discard — and
-                // `DontCare` would license a driver to leave the prepass depth
-                // undefined for the passes that read it after this one.
-                store_op: AttachmentStoreOp::Store,
-                initial_layout: ImageLayout::DepthStencilReadOnlyOptimal,
-                final_layout: ImageLayout::DepthStencilReadOnlyOptimal,
-                ..Default::default()
-            },
-        ],
-        subpasses: vec![SubpassDescription {
-            color_attachments: vec![
-                Some(AttachmentReference {
-                    attachment: 0,
-                    layout: ImageLayout::ColorAttachmentOptimal,
-                    ..Default::default()
-                }),
-                Some(AttachmentReference {
-                    attachment: 1,
-                    layout: ImageLayout::ColorAttachmentOptimal,
-                    ..Default::default()
-                }),
-            ],
-            depth_stencil_attachment: Some(AttachmentReference {
-                attachment: 2,
-                layout: ImageLayout::DepthStencilReadOnlyOptimal,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-
-    RenderPass::new(device.clone(), create_info).unwrap()
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    render_pass: &Arc<RenderPass>,
-    layout: &Arc<PipelineLayout>,
-) -> Arc<GraphicsPipeline> {
+fn build_pipeline(ctx: &VkContext, layout: &Arc<PipelineLayout>) -> Arc<GraphicsPipeline> {
     let device = &ctx.device;
     // The forward pass's vertex shader, unchanged: a blended surface is the same
     // geometry with the same per-object rows, and `shading.glsl` reads the same
@@ -318,8 +235,6 @@ fn build_pipeline(
         PipelineShaderStageCreateInfo::new(vs),
         PipelineShaderStageCreateInfo::new(fs),
     ];
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-
     GraphicsPipeline::new(
         device.clone(),
         ctx.pipeline_cache(),
@@ -381,7 +296,9 @@ fn build_pipeline(
                 ..Default::default()
             }),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(
+                rendering::pipeline_info(&[ACCUM_FORMAT, REVEAL_FORMAT], Some(DEPTH_FORMAT)).into(),
+            ),
             ..GraphicsPipelineCreateInfo::layout(layout.clone())
         },
     )

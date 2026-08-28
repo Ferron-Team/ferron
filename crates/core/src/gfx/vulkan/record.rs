@@ -136,7 +136,9 @@ pub(super) fn submit_one_shot(ctx: &VkContext, record: impl FnOnce(&mut Recordin
             .expect("failed to submit a raw command buffer");
     });
 
-    fence.wait(None).expect("failed to wait on the upload fence");
+    fence
+        .wait(None)
+        .expect("failed to wait on the upload fence");
 }
 
 /// Every mip level and array layer of a colour image.
@@ -153,10 +155,7 @@ pub(super) fn whole_image(image: &Arc<Image>) -> ImageSubresourceRange {
 /// Verbose by design: the point of this seam is that a transition is written
 /// down where it happens rather than derived, so the call site reads as the
 /// dependency it is.
-pub(super) fn image_barrier(
-    recording: &mut RecordingCommandBuffer,
-    barrier: ImageMemoryBarrier,
-) {
+pub(super) fn image_barrier(recording: &mut RecordingCommandBuffer, barrier: ImageMemoryBarrier) {
     // SAFETY: the caller is asserting the dependency this expresses is the one
     // the surrounding commands need; vulkano validates the barrier itself.
     unsafe {

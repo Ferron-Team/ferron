@@ -368,13 +368,16 @@ fn model_load_cost() {
             if widest > 1 { vec![1, widest] } else { vec![1] }
         }
     };
-    assert!(!axis.is_empty(), "ORRIN_PERF_THREADS named no valid setting");
+    assert!(
+        !axis.is_empty(),
+        "ORRIN_PERF_THREADS named no valid setting"
+    );
 
     // Warm the page cache, and fail here rather than inside the timed loop if
     // the model is missing — a first row of "file not found" would otherwise be
     // reported as a very fast import.
-    let warm = model::load(&path, &settings)
-        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let warm =
+        model::load(&path, &settings).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let images = warm.images.len();
     let megapixels: f64 = warm
         .images

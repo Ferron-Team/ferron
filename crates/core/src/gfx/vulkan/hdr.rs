@@ -3,7 +3,6 @@ use std::sync::Arc;
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -19,10 +18,10 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{RenderPass, Subpass};
 
 use super::context::VkContext;
 use super::exposure::GpuExposure;
+use super::rendering;
 
 /// Offscreen colour format the frame's radiance is carried in. Float, so values
 /// can exceed 1.0 before tonemapping clamps them back to displayable range.
@@ -71,7 +70,6 @@ struct TonemapPush {
 }
 
 pub struct HdrPass {
-    pub tonemap_rp: Arc<RenderPass>,
     tonemap_pipeline: Arc<GraphicsPipeline>,
     sampler: Arc<Sampler>,
     /// The exposure applied when metering is off, already carrying the
@@ -87,8 +85,7 @@ pub struct HdrPass {
 impl HdrPass {
     pub fn new(ctx: &VkContext, swapchain_format: Format) -> Self {
         let device = &ctx.device;
-        let tonemap_rp = tonemap_render_pass(device, swapchain_format);
-        let tonemap_pipeline = build_tonemap_pipeline(ctx, &tonemap_rp);
+        let tonemap_pipeline = build_tonemap_pipeline(ctx, swapchain_format);
 
         let sampler = Sampler::new(
             device.clone(),
@@ -100,7 +97,6 @@ impl HdrPass {
         .unwrap();
 
         Self {
-            tonemap_rp,
             tonemap_pipeline,
             sampler,
             manual_exposure: 1.0,
@@ -168,18 +164,7 @@ impl HdrPass {
     }
 }
 
-fn tonemap_render_pass(device: &Arc<Device>, format: Format) -> Arc<RenderPass> {
-    vulkano::single_pass_renderpass!(
-        device.clone(),
-        attachments: {
-            color: { format: format, samples: 1, load_op: DontCare, store_op: Store },
-        },
-        pass: { color: [color], depth_stencil: {} },
-    )
-    .unwrap()
-}
-
-fn build_tonemap_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+fn build_tonemap_pipeline(ctx: &VkContext, color_format: Format) -> Arc<GraphicsPipeline> {
     let device = &ctx.device;
     let vs = fullscreen_vs::load(device.clone())
         .unwrap()
@@ -200,7 +185,6 @@ fn build_tonemap_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc
             .unwrap(),
     )
     .unwrap();
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
     GraphicsPipeline::new(
         device.clone(),
         ctx.pipeline_cache(),
@@ -213,11 +197,11 @@ fn build_tonemap_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc
             multisample_state: Some(MultisampleState::default()),
             depth_stencil_state: None,
             color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
+                1,
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(rendering::pipeline_info(&[color_format], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )

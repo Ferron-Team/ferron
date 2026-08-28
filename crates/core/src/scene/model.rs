@@ -445,15 +445,13 @@ fn load_images(
                 let start = view.offset();
                 let end = start + view.length();
                 let name = format!("image {}", image.index());
-                let bytes = buffer
-                    .get(start..end)
-                    .ok_or_else(|| ModelError::Resource {
-                        uri: name.clone(),
-                        reason: format!(
-                            "its buffer view runs to {end} bytes, past the {} the buffer holds",
-                            buffer.len()
-                        ),
-                    })?;
+                let bytes = buffer.get(start..end).ok_or_else(|| ModelError::Resource {
+                    uri: name.clone(),
+                    reason: format!(
+                        "its buffer view runs to {end} bytes, past the {} the buffer holds",
+                        buffer.len()
+                    ),
+                })?;
                 Ok(ImageSource::View { bytes, name })
             }
         })

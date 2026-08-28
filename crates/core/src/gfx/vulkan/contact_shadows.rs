@@ -23,7 +23,6 @@ use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInf
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -40,13 +39,13 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{RenderPass, Subpass};
 
 use crate::scene::ContactShadowSettings;
 
 use super::VulkanRenderer;
 use super::context::VkContext;
 use super::prepass::FrameUbo;
+use super::rendering;
 use super::taa::FrameView;
 use super::texture::MipPolicy;
 
@@ -86,7 +85,6 @@ pub(super) struct ContactShadowUniforms {
 }
 
 pub struct ContactShadowPass {
-    pub(super) render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
     uniform_allocator: SubbufferAllocator,
     /// Nearest, because depth and normals are fetched at exact texels: filtering
@@ -106,8 +104,7 @@ pub struct ContactShadowPass {
 impl ContactShadowPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
-        let render_pass = build_render_pass(device);
-        let pipeline = build_pipeline(ctx, &render_pass);
+        let pipeline = build_pipeline(ctx);
 
         let uniform_allocator = SubbufferAllocator::new(
             ctx.memory_allocator.clone(),
@@ -131,7 +128,6 @@ impl ContactShadowPass {
         .unwrap();
 
         Self {
-            render_pass,
             pipeline,
             uniform_allocator,
             nearest_clamp,
@@ -261,18 +257,7 @@ impl ContactShadowPass {
     }
 }
 
-fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
-    vulkano::single_pass_renderpass!(
-        device.clone(),
-        attachments: {
-            shadow: { format: MASK_FORMAT, samples: 1, load_op: Clear, store_op: Store },
-        },
-        pass: { color: [shadow], depth_stencil: {} },
-    )
-    .unwrap()
-}
-
-fn build_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+fn build_pipeline(ctx: &VkContext) -> Arc<GraphicsPipeline> {
     let device = &ctx.device;
     let vs = fullscreen_vs::load(device.clone())
         .unwrap()
@@ -293,7 +278,6 @@ fn build_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<Graphic
             .unwrap(),
     )
     .unwrap();
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
     GraphicsPipeline::new(
         device.clone(),
         ctx.pipeline_cache(),
@@ -306,11 +290,11 @@ fn build_pipeline(ctx: &VkContext, render_pass: &Arc<RenderPass>) -> Arc<Graphic
             multisample_state: Some(MultisampleState::default()),
             depth_stencil_state: None,
             color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
+                1,
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(rendering::pipeline_info(&[MASK_FORMAT], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )

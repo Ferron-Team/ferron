@@ -168,6 +168,19 @@ impl VkContext {
             device_extensions.ext_memory_budget = true;
         }
 
+        // Every pass renders without a render pass object; see `rendering.rs`.
+        // Promoted to core in 1.3, so the extension is only needed below that —
+        // vulkano reads the feature either way. Asserted rather than fallen back
+        // on: there is no second recording path to fall back to, and the whole
+        // of `gfx/vulkan/` is built around the dynamic form.
+        assert!(
+            physical_device.supported_features().dynamic_rendering,
+            "this device does not support dynamic rendering, which every pass requires",
+        );
+        if physical_device.api_version() < Version::V1_3 {
+            device_extensions.khr_dynamic_rendering = true;
+        }
+
         let (device, mut queues) = Device::new(
             physical_device,
             DeviceCreateInfo {
@@ -181,6 +194,7 @@ impl VkContext {
                     sampler_anisotropy: anisotropy,
                     independent_blend: true,
                     descriptor_binding_partially_bound: partially_bound,
+                    dynamic_rendering: true,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
