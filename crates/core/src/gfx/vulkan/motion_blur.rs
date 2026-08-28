@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -31,6 +30,7 @@ use vulkano::pipeline::{
 use crate::scene::{Camera, MotionBlurSettings};
 
 use super::context::VkContext;
+use super::record::Recorder;
 use super::taa::FrameView;
 
 /// Side of the compute workgroup for every pass here.
@@ -172,7 +172,7 @@ impl MotionBlurPass {
 
     pub(super) fn record_tile_max(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         view: &FrameView,
         velocity: Arc<ImageView>,
@@ -193,21 +193,19 @@ impl MotionBlurPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.tile_max_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.tile_max_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.tile_max_pipeline.layout().clone(),
+                self.tile_max_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 
     pub fn record_neighbour_max(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         tiles: Arc<ImageView>,
         target: Arc<ImageView>,
@@ -224,22 +222,20 @@ impl MotionBlurPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.neighbour_max_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.neighbour_max_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.neighbour_max_pipeline.layout().clone(),
+                self.neighbour_max_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_gather(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         view: &FrameView,
         color: Arc<ImageView>,
@@ -264,34 +260,25 @@ impl MotionBlurPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.gather_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.gather_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.gather_pipeline.layout().clone(),
+                self.gather_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 }
 
-fn dispatch_over(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    target: &Arc<ImageView>,
-) {
+fn dispatch_over(builder: &mut Recorder, target: &Arc<ImageView>) {
     let extent = target.image().extent();
 
     // SAFETY: the dispatch covers exactly `extent`, and each shader discards
     // invocations past `imageSize`, so nothing writes outside the image. The
     // descriptors bound above match the shader's layout, and the graph declared
     // every resource this pass touches, so its barriers precede it.
-    unsafe {
-        builder
-            .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
-            .unwrap()
-    };
+    builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
 }
 
 fn build_pipeline(

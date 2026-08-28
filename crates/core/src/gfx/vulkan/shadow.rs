@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use glam::Mat4;
 use vulkano::buffer::{BufferContents, Subbuffer};
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, ClearDepthStencilImageInfo, CommandBufferUsage,
-    PrimaryAutoCommandBuffer,
-};
+use vulkano::command_buffer::ClearDepthStencilImageInfo;
 use vulkano::command_buffer::{ClearAttachment, ClearRect};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
@@ -14,7 +11,7 @@ use vulkano::image::sampler::{
     BorderColor, Filter, Sampler, SamplerAddressMode, SamplerCreateInfo,
 };
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
+use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage};
 use vulkano::memory::allocator::AllocationCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
@@ -28,7 +25,6 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::sync::GpuFuture;
 
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::{DrawList, PositionVertex};
@@ -36,6 +32,7 @@ use crate::gfx::{DrawList, PositionVertex};
 use super::VulkanRenderer;
 use super::context::VkContext;
 use super::instances::GpuObject;
+use super::record::{self, Recorder};
 use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 
@@ -202,7 +199,7 @@ impl ShadowPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         renderer: &VulkanRenderer,
         casters: DrawList<'_>,
         view_proj: Mat4,
@@ -217,9 +214,7 @@ impl ShadowPass {
         // pipeline is bound, which is fine and is the point of dynamic state: it
         // survives the pipeline switches `draw` makes between cutout runs and
         // the rest.
-        builder
-            .set_depth_bias(self.constant_bias, 0.0, self.slope_bias)
-            .unwrap();
+        builder.set_depth_bias(self.constant_bias, 0.0, self.slope_bias);
 
         self.draw(builder, renderer, casters, view_proj, object_base, sets);
     }
@@ -234,7 +229,7 @@ impl ShadowPass {
     /// frustums apart would cost more test than it saved draw.
     pub(super) fn record_atlas(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         renderer: &VulkanRenderer,
         atlas: &ShadowAtlas,
         casters: &[DrawList<'_>],
@@ -273,16 +268,9 @@ impl ShadowPass {
         if tiles.is_empty() {
             return;
         }
-        builder
-            .clear_attachments(
-                [ClearAttachment::Depth(1.0)].into_iter().collect(),
-                tiles.into_iter().collect(),
-            )
-            .unwrap();
+        builder.clear_attachments([ClearAttachment::Depth(1.0)], tiles);
 
-        builder
-            .set_depth_bias(self.punctual_constant_bias, 0.0, self.punctual_slope_bias)
-            .unwrap();
+        builder.set_depth_bias(self.punctual_constant_bias, 0.0, self.punctual_slope_bias);
 
         for (index, caster) in atlas.casters.iter().enumerate() {
             let (Some(list), Some(&base)) = (casters.get(index), bases.get(index)) else {
@@ -304,34 +292,23 @@ impl ShadowPass {
     /// NDC *lands*, and an implementation is allowed a guard band around the
     /// clip volume — so without a scissor a triangle straddling a tile's edge
     /// may write a fragment into the neighbour, which is another light's depth.
-    fn set_tile(
-        &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        offset: [u32; 2],
-        size: u32,
-    ) {
+    fn set_tile(&self, builder: &mut Recorder, offset: [u32; 2], size: u32) {
         builder
             .set_viewport(
                 0,
-                [Viewport {
+                &[Viewport {
                     offset: [offset[0] as f32, offset[1] as f32],
                     extent: [size as f32, size as f32],
                     depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
+                }],
             )
-            .unwrap()
             .set_scissor(
                 0,
-                [Scissor {
+                &[Scissor {
                     offset,
                     extent: [size, size],
-                }]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap();
+                }],
+            );
     }
 
     /// The draw loop both callers share: one instanced draw per (mesh, material)
@@ -345,7 +322,7 @@ impl ShadowPass {
     /// foliage with everything else.
     fn draw(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         renderer: &VulkanRenderer,
         casters: DrawList<'_>,
         view_proj: Mat4,
@@ -373,15 +350,13 @@ impl ShadowPass {
             };
             if bound != Some(wants_masked) {
                 builder
-                    .bind_pipeline_graphics(pipeline.clone())
-                    .unwrap()
+                    .bind_pipeline_graphics(&pipeline)
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
-                        pipeline.layout().clone(),
+                        pipeline.layout(),
                         0,
-                        sets.for_pipeline(wants_masked),
-                    )
-                    .unwrap();
+                        &sets.for_pipeline(wants_masked),
+                    );
                 bound = Some(wants_masked);
             }
 
@@ -391,39 +366,29 @@ impl ShadowPass {
             // material index in its range and pushing one would run past its
             // end — see `MaskedPushConstants`.
             if wants_masked {
-                builder
-                    .push_constants(
-                        pipeline.layout().clone(),
-                        0,
-                        MaskedPushConstants {
-                            light_view_proj,
-                            object_base,
-                            material_index: item.material.0,
-                        },
-                    )
-                    .unwrap();
+                builder.push_constants(
+                    pipeline.layout(),
+                    0,
+                    &MaskedPushConstants {
+                        light_view_proj,
+                        object_base,
+                        material_index: item.material.0,
+                    },
+                );
             } else {
-                builder
-                    .push_constants(
-                        pipeline.layout().clone(),
-                        0,
-                        PushConstants {
-                            light_view_proj,
-                            object_base,
-                        },
-                    )
-                    .unwrap();
+                builder.push_constants(
+                    pipeline.layout(),
+                    0,
+                    &PushConstants {
+                        light_view_proj,
+                        object_base,
+                    },
+                );
             }
             builder
                 .bind_vertex_buffers(0, mesh.position_buffer.clone())
-                .unwrap()
-                .bind_index_buffer(mesh.index_buffer.clone())
-                .unwrap();
-            unsafe {
-                builder
-                    .draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0)
-                    .unwrap();
-            }
+                .bind_index_buffer(mesh.index_buffer.clone());
+            builder.draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0);
         }
     }
 }
@@ -597,13 +562,15 @@ fn build_lit_depth(ctx: &VkContext, view_type: ImageViewType) -> Arc<ImageView> 
     )
     .expect("failed to allocate the shadows-off depth texture");
 
-    let mut builder = AutoCommandBufferBuilder::primary(
-        ctx.command_buffer_allocator.clone(),
-        ctx.queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
+    let mut builder = Recorder::new(ctx);
+    // Fresh from `Image::new`, so there is nothing to preserve; cleared once and
+    // then only ever sampled, so this is the whole of its synchronisation.
     builder
+        .image_barrier(record::to_transfer_dst(
+            image.clone(),
+            record::whole_image(&image),
+            ImageLayout::Undefined,
+        ))
         .clear_depth_stencil_image(ClearDepthStencilImageInfo {
             clear_value: ClearDepthStencilValue {
                 depth: 1.0,
@@ -611,14 +578,12 @@ fn build_lit_depth(ctx: &VkContext, view_type: ImageViewType) -> Arc<ImageView> 
             },
             ..ClearDepthStencilImageInfo::image(image.clone())
         })
-        .unwrap();
-    vulkano::sync::now(ctx.device.clone())
-        .then_execute(ctx.queue.clone(), builder.build().unwrap())
-        .unwrap()
-        .then_signal_fence_and_flush()
-        .unwrap()
-        .wait(None)
-        .unwrap();
+        .image_barrier(record::to_shader_read(
+            image.clone(),
+            record::whole_image(&image),
+            ImageLayout::TransferDstOptimal,
+        ));
+    builder.submit_and_wait(ctx);
 
     ImageView::new(
         image.clone(),

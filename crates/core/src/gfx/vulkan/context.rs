@@ -168,6 +168,22 @@ impl VkContext {
             device_extensions.ext_memory_budget = true;
         }
 
+        // Required to submit the graph's barrier plan as it is written. Without
+        // it vulkano's `pipeline_barrier` takes its `VK_VERSION_1_0` path, which
+        // narrows the 64-bit `AccessFlags2` to 32 bits with an `as u32` — and
+        // every bit the plan actually uses for a shader read (`SHADER_SAMPLED_READ`,
+        // `SHADER_STORAGE_READ`, `SHADER_STORAGE_WRITE`) sits at 32 or above, so
+        // each would truncate to a barrier carrying no access mask at all. See
+        // `Access::flags` in `gfx/graph/access.rs` for what is being emitted.
+        assert!(
+            physical_device.supported_features().synchronization2,
+            "this device does not support synchronization2, which submitting the \
+             graph's barrier plan requires",
+        );
+        if physical_device.api_version() < Version::V1_3 {
+            device_extensions.khr_synchronization2 = true;
+        }
+
         // Every pass renders without a render pass object; see `rendering.rs`.
         // Promoted to core in 1.3, so the extension is only needed below that —
         // vulkano reads the feature either way. Asserted rather than fallen back
@@ -195,6 +211,7 @@ impl VkContext {
                     independent_blend: true,
                     descriptor_binding_partially_bound: partially_bound,
                     dynamic_rendering: true,
+                    synchronization2: true,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()

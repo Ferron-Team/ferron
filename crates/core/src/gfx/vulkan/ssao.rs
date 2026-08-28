@@ -3,11 +3,11 @@ use std::sync::Arc;
 use super::VulkanRenderer;
 use super::context::VkContext;
 use super::prepass::{FrameUbo, NORMAL_FORMAT};
+use super::record::Recorder;
 use super::rendering;
 use super::texture::MipPolicy;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
@@ -260,7 +260,7 @@ impl SsaoPass {
     /// as this pass's `Sampled` inputs.
     pub(super) fn record_ao(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         renderer: &VulkanRenderer,
         extent: [u32; 2],
         uniforms: &SsaoUniforms,
@@ -295,16 +295,14 @@ impl SsaoPass {
 
         set_viewport(builder, extent);
         builder
-            .bind_pipeline_graphics(self.ssao_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_graphics(&self.ssao_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.ssao_pipeline.layout().clone(),
+                self.ssao_pipeline.layout(),
                 0,
-                vec![uniform_set, texture_set],
-            )
-            .unwrap();
-        unsafe { builder.draw(3, 1, 0, 0).unwrap() };
+                &[uniform_set, texture_set],
+            );
+        builder.draw(3, 1, 0, 0);
     }
 
     /// The blur is also the upsample when the occlusion was resolved at half the
@@ -313,7 +311,7 @@ impl SsaoPass {
     /// bleeding across silhouettes. See `ssao_blur.frag`.
     pub(super) fn record_blur(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         renderer: &VulkanRenderer,
         extent: [u32; 2],
         raw_ao_view: Arc<ImageView>,
@@ -343,31 +341,24 @@ impl SsaoPass {
 
         set_viewport(builder, extent);
         builder
-            .bind_pipeline_graphics(self.blur_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_graphics(&self.blur_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.blur_pipeline.layout().clone(),
+                self.blur_pipeline.layout(),
                 0,
-                vec![input, frame_set],
-            )
-            .unwrap();
-        unsafe { builder.draw(3, 1, 0, 0).unwrap() };
+                &[input, frame_set],
+            );
+        builder.draw(3, 1, 0, 0);
     }
 }
 
-fn set_viewport(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    extent: [u32; 2],
-) {
+fn set_viewport(builder: &mut Recorder, extent: [u32; 2]) {
     let viewport = Viewport {
         offset: [0.0, 0.0],
         extent: [extent[0] as f32, extent[1] as f32],
         depth_range: 0.0..=1.0,
     };
-    builder
-        .set_viewport(0, [viewport].into_iter().collect())
-        .unwrap();
+    builder.set_viewport(0, &[viewport]);
 }
 
 mod fullscreen_vs {

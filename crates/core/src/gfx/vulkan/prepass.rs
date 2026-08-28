@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
@@ -43,6 +42,7 @@ use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 use super::VulkanRenderer;
 use super::context::VkContext;
 use super::instances::GpuObject;
+use super::record::Recorder;
 use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
@@ -258,7 +258,7 @@ impl GeometryPrepass {
 
     pub(super) fn record(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         renderer: &VulkanRenderer,
         draws: DrawList<'_>,
         extent: [u32; 2],
@@ -283,18 +283,14 @@ impl GeometryPrepass {
         )
         .unwrap();
 
-        builder
-            .set_viewport(
-                0,
-                [Viewport {
-                    offset: [0.0, 0.0],
-                    extent: [extent[0] as f32, extent[1] as f32],
-                    depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap();
+        builder.set_viewport(
+            0,
+            &[Viewport {
+                offset: [0.0, 0.0],
+                extent: [extent[0] as f32, extent[1] as f32],
+                depth_range: 0.0..=1.0,
+            }],
+        );
 
         let sets = vec![frame_set, object_set, material_set, texture_set];
         let mut bound: Option<bool> = None;
@@ -321,15 +317,13 @@ impl GeometryPrepass {
             };
             if bound != Some(wants_masked) {
                 builder
-                    .bind_pipeline_graphics(pipeline.clone())
-                    .unwrap()
+                    .bind_pipeline_graphics(&pipeline)
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
-                        pipeline.layout().clone(),
+                        pipeline.layout(),
                         0,
-                        sets.clone(),
-                    )
-                    .unwrap();
+                        &sets.clone(),
+                    );
                 bound = Some(wants_masked);
             }
             let push = PrepassPush {
@@ -337,20 +331,13 @@ impl GeometryPrepass {
                 material_index: item.material.0,
             };
             builder
-                .push_constants(pipeline.layout().clone(), 0, push)
-                .unwrap()
+                .push_constants(pipeline.layout(), 0, &push)
                 .bind_vertex_buffers(
                     0,
                     (mesh.position_buffer.clone(), mesh.surface_buffer.clone()),
                 )
-                .unwrap()
-                .bind_index_buffer(mesh.index_buffer.clone())
-                .unwrap();
-            unsafe {
-                builder
-                    .draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0)
-                    .unwrap()
-            };
+                .bind_index_buffer(mesh.index_buffer.clone());
+            builder.draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0);
         }
     }
 }

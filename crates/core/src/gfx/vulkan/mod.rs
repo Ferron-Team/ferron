@@ -28,21 +28,23 @@ mod texture;
 mod timestamps;
 mod vendor;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, CopyImageToBufferInfo, PrimaryAutoCommandBuffer,
-};
+use vulkano::command_buffer::CopyImageToBufferInfo;
 use vulkano::descriptor_set::DescriptorSet;
 use vulkano::device::Queue;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::instance::Instance;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::swapchain::{Surface, SwapchainPresentInfo, acquire_next_image};
+use vulkano::swapchain::{
+    AcquireNextImageInfo, PresentInfo, SemaphorePresentInfo, Surface, SwapchainPresentInfo,
+};
 use vulkano::sync::GpuFuture;
-use vulkano::sync::{self, future::FenceSignalFuture};
+use vulkano::sync::future::FenceSignalFuture;
+use vulkano::sync::semaphore::Semaphore;
 use vulkano::{Validated, VulkanError};
 
 use crate::geom::Aabb;
@@ -74,6 +76,14 @@ use self::hdr::HdrPass;
 use self::line::LinePass;
 use self::motion_blur::MotionBlurPass;
 use self::prepass::GeometryPrepass;
+use self::record::{InFlight, Recorder};
+
+/// How far the CPU may record ahead of the GPU.
+///
+/// Two, which is one frame of overlap and what the `GpuFuture` chain gave before
+/// the renderer recorded raw. More would need per-frame *resource* sets rather
+/// than only per-frame lifetimes — #64 item 7.
+const FRAMES_IN_FLIGHT: usize = 2;
 use self::resources::GraphImages;
 use self::shadow::ShadowPass;
 use self::ssao::SsaoPass;
@@ -87,8 +97,6 @@ use super::{DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, Text
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::DebugLine;
-
-type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
 
 /// MSAA sample count for the forward pass. One definition, because the forward
 /// pipeline, its render pass attachments, and the graph's declaration of the
@@ -212,7 +220,24 @@ pub struct VulkanRenderer {
     /// objects, which is what keeps the three passes agreeing about a material.
     shadow_material_set: Option<Arc<DescriptorSet>>,
     shadow_texture_set: Option<Arc<DescriptorSet>>,
-    previous_frame_end: Option<FrameFuture>,
+    /// Frames the GPU has not finished with, oldest first.
+    ///
+    /// A frame is retired when its fence *happens* to have signalled, so the CPU
+    /// records ahead of the GPU rather than lock-stepping with it. What bounds
+    /// the run-ahead is [`FRAMES_IN_FLIGHT`]; what makes it safe is that
+    /// everything a frame named — its command buffer, descriptor sets, uniform
+    /// subbuffers and semaphores — is held here until then.
+    ///
+    /// The frames' *GPU* work is still serialised, each waiting on the one
+    /// before through `frame_chain`, because there is one set of graph images
+    /// and frame `n + 1` writes the ones frame `n` is reading. Overlapping that
+    /// is #64 item 7, and needs per-frame resource sets.
+    in_flight: VecDeque<InFlight>,
+    /// Signalled when the last submitted frame finishes, and waited by the next.
+    frame_chain: Option<Arc<Semaphore>>,
+    /// The overlay's submission and present, when one ran. Held only so its
+    /// resources are released once it signals; nothing waits on it.
+    overlay_present: Option<FenceSignalFuture<Box<dyn GpuFuture>>>,
     recreate_swapchain: bool,
     pending_extent: [u32; 2],
     /// What the swapchain should be built with. Changing it takes the same route
@@ -370,7 +395,9 @@ impl VulkanRenderer {
             prepass_texture_set: None,
             shadow_material_set: None,
             shadow_texture_set: None,
-            previous_frame_end: None,
+            in_flight: VecDeque::new(),
+            frame_chain: None,
+            overlay_present: None,
             recreate_swapchain: false,
             pending_extent: extent,
             present,
@@ -407,10 +434,8 @@ impl VulkanRenderer {
     pub fn capture(&mut self) -> Option<(Vec<u8>, [u32; 2])> {
         let image = self.swapchain.readback.first()?.clone();
 
-        if let Some(previous) = self.previous_frame_end.as_mut() {
-            previous
-                .wait(None)
-                .expect("the offscreen frame never completed");
+        while let Some(previous) = self.in_flight.pop_front() {
+            previous.wait();
         }
 
         let extent = self.swapchain.extent;
@@ -430,28 +455,15 @@ impl VulkanRenderer {
         .expect("failed to allocate the capture buffer");
 
         let mut builder = self.new_command_buffer();
-        builder
-            .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(image, buffer.clone()))
-            .unwrap();
-        sync::now(self.ctx.device.clone())
-            .then_execute(self.ctx.queue.clone(), builder.build().unwrap())
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap()
-            .wait(None)
-            .unwrap();
+        builder.copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(image, buffer.clone()));
+        builder.submit_and_wait(&self.ctx);
 
         let pixels = buffer.read().unwrap().to_vec();
         Some((pixels, extent))
     }
 
-    fn new_command_buffer(&self) -> AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> {
-        AutoCommandBufferBuilder::primary(
-            self.ctx.command_buffer_allocator.clone(),
-            self.ctx.queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap()
+    fn new_command_buffer(&self) -> Recorder {
+        Recorder::new(&self.ctx)
     }
 
     /// The view backing a graph resource, whoever owns the allocation.
@@ -474,6 +486,55 @@ impl VulkanRenderer {
             Some(taa) if id == taa.output => self.taa.output_view(),
             _ => self.images.view(id),
         }
+    }
+
+    /// Which Vulkan object one resource in the compiled plan names.
+    ///
+    /// The graph is device-free by design, so it tracks `ResourceId`s and leaves
+    /// this mapping to the renderer. Four kinds arrive here: graph-owned images,
+    /// images imported from the pass that owns them across a frame boundary, the
+    /// acquired swapchain image, and imported buffers.
+    fn barrier_target(&self, id: ResourceId, swapchain: &Arc<ImageView>) -> Option<record::Target> {
+        let ids = &self.frame.ids;
+
+        if id == ids.swapchain_color {
+            return Some(record::Target::Image(swapchain.image().clone()));
+        }
+        // The imported buffers. See `record::Target::Memory` for why these do
+        // not need resolving to their `Subbuffer`s.
+        if id == ids.object_transforms
+            || id == ids.instance_index
+            || id == ids.exposure
+            || Some(id) == ids.histogram
+        {
+            return Some(record::Target::Memory);
+        }
+        // Imported images: a history has to survive a frame boundary, and a
+        // transient by contract does not, so the pass that ping-pongs it owns
+        // the allocation.
+        if let Some(fog) = ids.fog
+            && id == fog.scatter
+        {
+            return Some(record::Target::Image(
+                self.fog.scatter_view().image().clone(),
+            ));
+        }
+        if let Some(taa) = ids.taa {
+            if id == taa.output {
+                return Some(record::Target::Image(
+                    self.taa.output_view().image().clone(),
+                ));
+            }
+            if id == taa.history {
+                return Some(record::Target::Image(
+                    self.taa.history_view().image().clone(),
+                ));
+            }
+        }
+
+        self.images
+            .try_view(id)
+            .map(|view| record::Target::Image(view.image().clone()))
     }
 
     fn reallocate(&mut self) {
@@ -838,14 +899,54 @@ impl VulkanRenderer {
             }),
         });
 
+        if let Some(overlay) = self.overlay_present.as_mut() {
+            overlay.cleanup_finished();
+        }
+        // Retire whatever the GPU has already finished, without blocking on it.
+        while self.in_flight.front().is_some_and(InFlight::is_complete) {
+            self.in_flight.pop_front();
+        }
+        // Only block when the CPU is a whole frame ahead. Recording raw means
+        // this crate owns the lifetime of everything a frame named, and the
+        // bound is what keeps that list from growing without limit.
+        while self.in_flight.len() >= FRAMES_IN_FLIGHT {
+            profile_scope!("wait");
+            let oldest = self
+                .in_flight
+                .pop_front()
+                .expect("the queue is non-empty inside this loop");
+            oldest.wait();
+        }
+
         // Split out because under Fifo this blocks until the presentation engine
         // hands back an image — a vsync wait, not work. Folded into a single
         // "render" scope it swamps the numbers and hides real regressions.
-        let (image_index, suboptimal, acquire_future) = match self.swapchain.swapchain.clone() {
+        let (image_index, suboptimal, acquire_semaphore) = match self.swapchain.swapchain.clone() {
             Some(swapchain) => {
                 profile_scope!("acquire");
-                match acquire_next_image(swapchain, None).map_err(Validated::unwrap) {
-                    Ok((index, suboptimal, future)) => (index, suboptimal, Some(future)),
+                // The raw form, because the frame is submitted raw: the
+                // `SwapchainAcquireFuture` the safe one returns owns its
+                // semaphore privately, and nothing can read it back out to put
+                // in a `VkSubmitInfo`.
+                let semaphore = Arc::new(
+                    Semaphore::from_pool(self.ctx.device.clone())
+                        .expect("failed to create the acquire semaphore"),
+                );
+                // SAFETY: the semaphore is unsignalled and has no pending wait —
+                // it was made a line above — and the previous frame's fence has
+                // been waited on, so nothing else is using this swapchain.
+                let acquired = unsafe {
+                    swapchain.acquire_next_image(&AcquireNextImageInfo {
+                        semaphore: Some(semaphore.clone()),
+                        ..Default::default()
+                    })
+                };
+                match acquired.map_err(Validated::unwrap) {
+                    Ok(acquired) => (
+                        acquired.image_index,
+                        acquired.is_suboptimal,
+                        Some(semaphore),
+                    ),
                     Err(VulkanError::OutOfDate) => {
                         self.recreate_swapchain = true;
                         return;
@@ -1181,9 +1282,20 @@ impl VulkanRenderer {
         // gets there by changing its declarations, not by being moved here.
         let extent = self.swapchain.extent;
         let mut raw_passes = Vec::new();
+        let swapchain_view = self.swapchain.image_views[image_index as usize].clone();
         for index in 0..self.frame.graph.order().len() {
             let pass_id = self.frame.graph.order()[index];
             let body = self.frame.bodies[pass_id.index()];
+
+            // What this pass needs to have finished, and the layouts it needs
+            // its resources in — derived by `gfx/graph/` from what the passes
+            // declared, and recorded here rather than inferred from what the
+            // commands below happen to touch. This is #64 item 1: until it
+            // existed the plan was compiled, asserted against a golden file, and
+            // then thrown away while vulkano's tracker derived its own.
+            builder.barriers(self.frame.graph.barriers_before(index), |id| {
+                self.barrier_target(id, &swapchain_view)
+            });
 
             let kind = self.frame.graph.pass_kind(pass_id);
             if kind == PassKind::Raw {
@@ -1602,7 +1714,7 @@ impl VulkanRenderer {
                 environment.background,
             )
             .expect("the executor reached a graphics pass with nothing to render into");
-            builder.begin_rendering(rendering).unwrap();
+            builder.begin_rendering(rendering);
 
             match body {
                 PassBody::ShadowCascade(cascade) => {
@@ -1801,11 +1913,32 @@ impl VulkanRenderer {
                 | PassBody::BloomUpsample(_) => unreachable!("handled above"),
             }
 
-            builder.end_rendering().unwrap();
+            builder.end_rendering();
             if let Some(timestamps) = timestamps.as_mut() {
                 timestamps.end_pass(&mut builder, timed);
             }
         }
+
+        // Leave every import in the layout its owner expects — for the
+        // swapchain image, the `PresentSrc` the presentation engine requires.
+        //
+        // Emitted even when an overlay follows in its own command buffer, and
+        // that is not a formality. Vulkano gives a swapchain image a *fixed*
+        // layout requirement of `PresentSrc` (`Image::from_swapchain`), so an
+        // auto-synchronised buffer — which the overlay's is — assumes it arrives
+        // in `PresentSrc` and emits a barrier saying so before drawing. Leaving
+        // it in `ColorAttachmentOptimal` instead makes that barrier's
+        // `oldLayout` a lie, and a barrier whose source layout does not match
+        // leaves the contents *undefined*: the frame under the overlay survives
+        // on some presents and not others.
+        //
+        // Transitioning here does not present anything, which is what makes it
+        // safe to do before the overlay has drawn: the present happens later, on
+        // the overlay's own future.
+        let overlay_pass = raw_passes.iter().any(|body| *body == PassBody::Overlay);
+        builder.barriers(self.frame.graph.final_barriers(), |id| {
+            self.barrier_target(id, &swapchain_view)
+        });
 
         if let Some(timestamps) = timestamps.as_mut() {
             timestamps.end_frame(&mut builder);
@@ -1814,65 +1947,154 @@ impl VulkanRenderer {
             self.timestamps = timestamps;
         }
 
-        let command_buffer = builder.build().unwrap();
+        let (command_buffer, keep) = builder.end();
         drop(recording);
 
-        if let Some(prev) = self.previous_frame_end.as_mut() {
-            prev.cleanup_finished();
-        }
-
-        let mut future = self
-            .previous_frame_end
-            .take()
-            .map(|f| f.boxed())
-            .unwrap_or_else(|| sync::now(self.ctx.device.clone()).boxed());
-        if let Some(acquired) = acquire_future {
-            future = future.join(acquired).boxed();
-        }
-        let mut future = future
-            .then_execute(self.ctx.queue.clone(), command_buffer)
-            .unwrap()
-            .boxed();
-
-        let mut overlay = overlay;
-        for body in raw_passes {
-            match body {
-                PassBody::Overlay => {
-                    profile_scope!("overlay");
-                    let draw = overlay
-                        .take()
-                        .expect("the graph scheduled an overlay pass but none was supplied");
-                    future = draw(
-                        future,
-                        self.swapchain.image_views[image_index as usize].clone(),
-                    );
-                }
-                other => unreachable!("{other:?} is not a raw pass"),
-            }
-        }
-        let before_present = future;
-
         let submitting = crate::profile::scope("submit");
-        let future = match self.swapchain.swapchain.clone() {
-            Some(swapchain) => before_present
-                .then_swapchain_present(
-                    self.ctx.queue.clone(),
-                    SwapchainPresentInfo::swapchain_image_index(swapchain, image_index),
-                )
-                .boxed()
-                .then_signal_fence_and_flush(),
-            // Nothing to present to. The fence is still what `capture` waits on
-            // before reading the image back.
-            None => before_present.then_signal_fence_and_flush(),
+
+        // The overlay is the one thing in the frame this command buffer does not
+        // contain: `Gui::draw_on_image` builds *and submits* its own, chained
+        // onto a `GpuFuture` it is handed. What it is handed is a
+        // [`SemaphoreWait`] on this frame's completion, so the dependency stays
+        // on the GPU and the CPU never blocks for it.
+        let semaphore = || {
+            Arc::new(
+                Semaphore::from_pool(self.ctx.device.clone())
+                    .expect("failed to create a frame semaphore"),
+            )
         };
 
-        match future.map_err(Validated::unwrap) {
-            Ok(f) => self.previous_frame_end = Some(f),
-            Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
-            Err(e) => {
-                eprintln!("failed to flush future: {e}");
+        // One signal per waiter: a binary semaphore's signal may be waited
+        // exactly once, so the present and the next frame cannot share one.
+        // With an overlay, the present is the overlay's to make, so the frame
+        // signals a semaphore for *it* to wait on instead.
+        let render_finished =
+            (self.swapchain.swapchain.is_some() && !overlay_pass).then(&semaphore);
+        let overlay_ready = overlay_pass.then(&semaphore);
+        let chain = semaphore();
+
+        let mut waits = Vec::new();
+        if let Some(acquired) = acquire_semaphore {
+            // The acquired image is only written by the passes that render into
+            // it, and the earliest of those is the tonemap's colour write.
+            // Waiting at colour-attachment output rather than top-of-pipe lets
+            // every shadow, prepass, lighting and post dispatch in the frame run
+            // while the presentation engine still owns the image.
+            waits.push((
+                acquired,
+                ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            ));
+        }
+        if let Some(previous) = self.frame_chain.take() {
+            // What the old `GpuFuture` chain did, and for the same reason: one
+            // set of graph images means this frame writes what the last one is
+            // still reading. The dependency is on the GPU, so the CPU does not
+            // wait for it.
+            waits.push((previous, ash::vk::PipelineStageFlags::ALL_COMMANDS));
+        }
+
+        let signals: Vec<_> = render_finished
+            .clone()
+            .into_iter()
+            .chain(overlay_ready.clone())
+            .chain(Some(chain.clone()))
+            .collect();
+
+        let in_flight = record::submit_frame(&self.ctx, command_buffer, keep, &waits, &signals);
+        self.frame_chain = Some(chain);
+
+        if overlay_pass {
+            self.in_flight.push_back(in_flight);
+            let ready = overlay_ready.expect("an overlay frame signals its own semaphore");
+            let mut future = record::SemaphoreWait::new(
+                self.ctx.queue.clone(),
+                ready,
+                self.swapchain
+                    .swapchain
+                    .clone()
+                    .map(|swapchain| (swapchain, image_index)),
+            )
+            .boxed();
+            let mut overlay = overlay;
+            for body in raw_passes {
+                match body {
+                    PassBody::Overlay => {
+                        profile_scope!("overlay");
+                        let draw = overlay
+                            .take()
+                            .expect("the graph scheduled an overlay pass but none was supplied");
+                        future = draw(
+                            future,
+                            self.swapchain.image_views[image_index as usize].clone(),
+                        );
+                    }
+                    other => unreachable!("{other:?} is not a raw pass"),
+                }
+            }
+            // Presented through the overlay's own future rather than by the raw
+            // path below: it is the last writer, so it owns the transition to
+            // `PresentSrc` that this frame's `final_barriers` deliberately left
+            // out. Not waited on — the next frame's acquire is what bounds it,
+            // exactly as it did before the renderer recorded raw.
+            let presented = match self.swapchain.swapchain.clone() {
+                Some(swapchain) => future
+                    .then_swapchain_present(
+                        self.ctx.queue.clone(),
+                        SwapchainPresentInfo::swapchain_image_index(swapchain, image_index),
+                    )
+                    .boxed()
+                    .then_signal_fence_and_flush(),
+                None => future.then_signal_fence_and_flush(),
+            };
+            match presented.map_err(Validated::unwrap) {
+                Ok(future) => self.overlay_present = Some(future),
+                Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
+                Err(e) => eprintln!("failed to flush the overlay: {e}"),
+            }
+        } else {
+            debug_assert!(raw_passes.is_empty());
+            self.in_flight.push_back(in_flight);
+        }
+
+        if let Some(swapchain) = self.swapchain.swapchain.clone().filter(|_| !overlay_pass) {
+            // Raw, like the submit — but for the opposite reason: this one is
+            // simply what vulkano exposes for a present that waits on a
+            // semaphore the caller owns.
+            let wait_semaphores = render_finished
+                .iter()
+                .map(|semaphore| SemaphorePresentInfo::new(semaphore.clone()))
+                .collect();
+            let present_info = PresentInfo {
+                wait_semaphores,
+                swapchain_infos: vec![SwapchainPresentInfo::swapchain_image_index(
+                    swapchain,
+                    image_index,
+                )],
+                ..Default::default()
+            };
+            let result = self.ctx.queue.clone().with(|mut queue| {
+                // SAFETY: the image was acquired from this swapchain above and
+                // has not been presented since; the wait semaphore is the one
+                // the submission above signals, or none, in which case the
+                // overlay path has already waited on the CPU.
+                unsafe { queue.present(&present_info) }
+                    .map(|results| results.into_iter().collect::<Vec<_>>())
+            });
+            match result.map_err(Validated::unwrap) {
+                Ok(results) => {
+                    for result in results {
+                        match result {
+                            Ok(suboptimal) => self.recreate_swapchain |= suboptimal,
+                            Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
+                            Err(e) => eprintln!("failed to present: {e}"),
+                        }
+                    }
+                }
+                Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
+                Err(e) => eprintln!("failed to present: {e}"),
             }
         }
+
         drop(submitting);
     }
 }

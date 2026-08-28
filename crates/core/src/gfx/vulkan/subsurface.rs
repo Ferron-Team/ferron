@@ -25,7 +25,6 @@
 use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
@@ -39,6 +38,7 @@ use vulkano::pipeline::{
 use crate::scene::{Camera, SubsurfaceSettings};
 
 use super::context::VkContext;
+use super::record::Recorder;
 
 /// Side of the compute workgroup, matching both shaders' `local_size`.
 const TILE: u32 = 8;
@@ -161,7 +161,7 @@ impl SubsurfacePass {
     /// two dispatches, which is why they share a pipeline.
     pub(super) fn record_blur(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         source: Arc<ImageView>,
         depth: Arc<ImageView>,
@@ -181,27 +181,20 @@ impl SubsurfacePass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.blur_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.blur_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.blur_pipeline.layout().clone(),
+                self.blur_pipeline.layout(),
                 0,
-                vec![set],
+                &[set],
             )
-            .unwrap()
-            .push_constants(
-                self.blur_pipeline.layout().clone(),
-                0,
-                self.push_for(vertical),
-            )
-            .unwrap();
+            .push_constants(self.blur_pipeline.layout(), 0, &self.push_for(vertical));
         dispatch_over(builder, &target);
     }
 
     pub(super) fn record_composite(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         source: Arc<ImageView>,
         diffused: Arc<ImageView>,
@@ -220,34 +213,25 @@ impl SubsurfacePass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.composite_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.composite_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.composite_pipeline.layout().clone(),
+                self.composite_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 }
 
-fn dispatch_over(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    target: &Arc<ImageView>,
-) {
+fn dispatch_over(builder: &mut Recorder, target: &Arc<ImageView>) {
     let extent = target.image().extent();
 
     // SAFETY: the dispatch covers exactly `extent`, and both shaders discard
     // invocations past `imageSize`, so nothing writes outside the image. The
     // descriptors bound above match the shader's layout, and the graph declared
     // every resource these passes touch, so its barriers precede them.
-    unsafe {
-        builder
-            .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
-            .unwrap()
-    };
+    builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
 }
 
 fn build_pipeline(

@@ -78,15 +78,37 @@
 //! carries no access mask. Until the feature is enabled, stay on flags that
 //! existed in 1.0: `SHADER_READ` rather than `SHADER_SAMPLED_READ`.
 
+use std::any::Any;
+use std::ops::Range;
 use std::sync::Arc;
 
 use ash::vk;
 use vulkano::VulkanObject;
-use vulkano::command_buffer::{CommandBufferBeginInfo, RecordingCommandBuffer};
-use vulkano::command_buffer::{CommandBufferLevel, CommandBufferUsage};
-use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceRange};
+use vulkano::buffer::{Buffer, BufferContents, IndexBuffer};
+use vulkano::command_buffer::{
+    BlitImageInfo, ClearAttachment, ClearDepthStencilImageInfo, ClearRect, CommandBuffer,
+    CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, CopyBufferInfo,
+    CopyBufferToImageInfo, CopyImageToBufferInfo, RecordingCommandBuffer, RenderingInfo,
+};
+use vulkano::descriptor_set::DescriptorSet;
+use vulkano::image::{Image, ImageLayout, ImageSubresourceRange};
+use vulkano::pipeline::graphics::vertex_input::VertexBuffersCollection;
+use vulkano::pipeline::graphics::viewport::{Scissor, Viewport};
+use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, PipelineBindPoint, PipelineLayout};
+use vulkano::query::QueryPool;
+use vulkano::sync::PipelineStage;
 use vulkano::sync::fence::{Fence, FenceCreateInfo};
-use vulkano::sync::{AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages};
+use vulkano::sync::future::{AccessCheckError, GpuFuture, SubmitAnyBuilder};
+use vulkano::sync::semaphore::Semaphore;
+use vulkano::sync::{
+    AccessFlags, DependencyInfo, ImageMemoryBarrier, MemoryBarrier, PipelineStages,
+};
+
+use vulkano::device::{Device, DeviceOwned, Queue};
+use vulkano::swapchain::Swapchain;
+use vulkano::{DeviceSize, Validated, VulkanError};
+
+use crate::gfx::graph::{Barrier, ResourceId};
 
 use super::context::VkContext;
 
@@ -120,6 +142,14 @@ pub(super) fn submit_one_shot(ctx: &VkContext, record: impl FnOnce(&mut Recordin
     let fence = Fence::new(ctx.device.clone(), FenceCreateInfo::default())
         .expect("failed to create the upload fence");
 
+    submit_and_wait(ctx, &command_buffer, &fence);
+}
+
+/// Submit one finished command buffer and block until it has executed.
+///
+/// Shared by [`submit_one_shot`] and [`Recorder::submit_and_wait`], which differ
+/// only in how the buffer was recorded.
+fn submit_and_wait(ctx: &VkContext, command_buffer: &CommandBuffer, fence: &Fence) {
     let handles = [command_buffer.handle()];
     let submit = vk::SubmitInfo::default().command_buffers(&handles);
 
@@ -141,10 +171,15 @@ pub(super) fn submit_one_shot(ctx: &VkContext, record: impl FnOnce(&mut Recordin
         .expect("failed to wait on the upload fence");
 }
 
-/// Every mip level and array layer of a colour image.
+/// Every mip level and array layer of an image, in whichever aspects its format
+/// carries.
+///
+/// Derived from the format rather than named, because the barrier plan is
+/// emitted for depth targets as readily as colour ones and a barrier naming the
+/// wrong aspect covers nothing.
 pub(super) fn whole_image(image: &Arc<Image>) -> ImageSubresourceRange {
     ImageSubresourceRange {
-        aspects: ImageAspects::COLOR,
+        aspects: image.format().aspects(),
         mip_levels: 0..image.mip_levels(),
         array_layers: 0..image.array_layers(),
     }
@@ -224,5 +259,780 @@ pub(super) fn to_shader_read(
         new_layout: ImageLayout::ShaderReadOnlyOptimal,
         subresource_range,
         ..ImageMemoryBarrier::image(image)
+    }
+}
+
+/// What one [`Barrier`] from the compiled plan actually names.
+///
+/// The graph tracks resources, not Vulkan objects: a `ResourceId` may be a
+/// graph-owned image, an image imported from a pass that owns it across frames
+/// (the TAA history, the fog scatter volume), the acquired swapchain image, or
+/// an imported buffer. Resolving one to this is the renderer's job, because the
+/// graph is deliberately device-free — see `gfx/graph/mod.rs`.
+pub(super) enum Target {
+    Image(Arc<Image>),
+    /// A buffer, covered by a global memory barrier rather than a buffer one.
+    ///
+    /// Not a shortcut: every buffer barrier the compiler derives spans the whole
+    /// buffer, so the range a `BufferMemoryBarrier` would add says nothing the
+    /// stage and access pair does not, and the renderer would have to resolve
+    /// four imported buffers to their `Subbuffer`s to say it. A memory barrier
+    /// carries the same dependency over all buffer memory.
+    Memory,
+}
+
+/// Record one pass's worth of the compiled barrier plan.
+///
+/// This is the call the whole of tier 3 item 1 exists to make. `gfx/graph/`
+/// derives these — precise stages, access masks and layout transitions, asserted
+/// against a golden file on a runner with no GPU — and until now nothing
+/// submitted them: vulkano's `AutoCommandBufferBuilder` tracked every resource
+/// on the CPU and inserted its own, necessarily wider, barriers instead. The
+/// engine paid for two synchronisation compilers and used neither result.
+///
+/// All of a pass's barriers go into one `DependencyInfo` rather than one call
+/// each. That is not only fewer commands: barriers submitted together are one
+/// dependency the driver can satisfy with a single stall, where a sequence of
+/// them is a sequence of stalls.
+///
+/// `resolve` returning `None` drops the barrier, which is correct for exactly
+/// one case — a resource the frame declared but this configuration does not
+/// allocate. Anything else reaching here unresolved is a bug in the resolver,
+/// not something to synchronise around, and the caller is expected to panic.
+pub(super) fn emit_plan(
+    recording: &mut RecordingCommandBuffer,
+    barriers: &[Barrier],
+    mut resolve: impl FnMut(ResourceId) -> Option<Target>,
+) {
+    if barriers.is_empty() {
+        return;
+    }
+
+    let mut image_memory_barriers = Vec::new();
+    let mut memory_barriers = Vec::new();
+
+    for barrier in barriers {
+        let Some(target) = resolve(barrier.resource) else {
+            continue;
+        };
+        match target {
+            Target::Image(image) => {
+                let subresource_range = whole_image(&image);
+                image_memory_barriers.push(ImageMemoryBarrier {
+                    src_stages: barrier.src_stages,
+                    src_access: barrier.src_access,
+                    dst_stages: barrier.dst_stages,
+                    dst_access: barrier.dst_access,
+                    old_layout: barrier.old_layout,
+                    new_layout: barrier.new_layout,
+                    subresource_range,
+                    ..ImageMemoryBarrier::image(image)
+                });
+            }
+            // A buffer has no layout, and the compiler knows it: `old_layout`
+            // and `new_layout` are both `Undefined` for one, so there is nothing
+            // here to drop on the floor.
+            Target::Memory => {
+                memory_barriers.push(MemoryBarrier {
+                    src_stages: barrier.src_stages,
+                    src_access: barrier.src_access,
+                    dst_stages: barrier.dst_stages,
+                    dst_access: barrier.dst_access,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    if image_memory_barriers.is_empty() && memory_barriers.is_empty() {
+        return;
+    }
+
+    // SAFETY: every dependency this expresses was derived by the graph compiler
+    // from what the passes declared, which is the one place in the engine that
+    // knows the whole frame's data flow. Vulkano validates each barrier's own
+    // consistency.
+    unsafe {
+        recording.pipeline_barrier(&DependencyInfo {
+            image_memory_barriers: image_memory_barriers.into_iter().collect(),
+            memory_barriers: memory_barriers.into_iter().collect(),
+            ..Default::default()
+        })
+    }
+    .expect("invalid barrier in the compiled plan");
+}
+
+/// Everything a recorded command named, held until the GPU is done with it.
+///
+/// [`RecordingCommandBuffer`] retains nothing — that is the cost of dropping the
+/// tracking, and the one obligation it hands back. An auto-synchronised builder
+/// cloned an `Arc` into its own list for every pipeline, descriptor set, buffer
+/// and image view a command mentioned; recording raw means the caller does it,
+/// and dropping this before the frame's fence signals is a use-after-free the
+/// validation layers will not catch.
+///
+/// Deliberately untyped. What has to be held is "the things this frame touched",
+/// which spans a dozen unrelated types, and the only operation ever performed on
+/// the list is dropping it.
+#[derive(Default)]
+pub(super) struct KeepAlive(Vec<Box<dyn Any + Send + Sync>>);
+
+impl KeepAlive {
+    /// Hold one resource for the frame's lifetime.
+    pub(super) fn hold<T: Any + Send + Sync>(&mut self, resource: T) {
+        self.0.push(Box::new(resource));
+    }
+}
+
+/// The engine's recording surface: a raw command buffer, the resources it named,
+/// and nothing else.
+///
+/// Every pass in `gfx/vulkan/` records through this rather than through
+/// vulkano's [`AutoCommandBufferBuilder`]. The two differences that matter are
+/// both invisible at a call site, which is why they are argued here once instead
+/// of at each of the hundred-odd commands:
+///
+/// 1. **Nothing is synchronised for you.** An auto builder tracked every
+///    resource's state per recorded command and derived barriers from what it
+///    saw. Ordering now comes from [`Recorder::barriers`], which submits the plan
+///    `gfx/graph/` compiled from what the passes *declared* — earlier, once per
+///    frame, and checked against a golden file on a machine with no GPU. A
+///    command recorded here is ordered against the ones before it because the
+///    graph said so, not because a tracker inferred it.
+/// 2. **Nothing is kept alive for you.** An auto builder cloned an `Arc` into its
+///    own list for every object a command mentioned. Each method here does the
+///    same into [`KeepAlive`], so a pass author cannot forget; the frame drops
+///    that list only once its fence has signalled.
+///
+/// The methods mirror the auto builder's, minus the `Result` — a validation
+/// failure here is a bug in this crate, not a condition to handle, exactly as
+/// the `.unwrap()`s at the old call sites said.
+///
+/// [`AutoCommandBufferBuilder`]: vulkano::command_buffer::AutoCommandBufferBuilder
+pub(super) struct Recorder {
+    inner: RecordingCommandBuffer,
+    keep: KeepAlive,
+}
+
+impl Recorder {
+    pub(super) fn new(ctx: &VkContext) -> Self {
+        let inner = RecordingCommandBuffer::new(
+            ctx.command_buffer_allocator.clone(),
+            ctx.queue.queue_family_index(),
+            CommandBufferLevel::Primary,
+            CommandBufferBeginInfo {
+                usage: CommandBufferUsage::OneTimeSubmit,
+                ..Default::default()
+            },
+        )
+        .expect("failed to begin the frame's command buffer");
+        Self {
+            inner,
+            keep: KeepAlive::default(),
+        }
+    }
+
+    /// Finish recording, handing back the buffer and the resources it named.
+    ///
+    /// The two travel together because they have to: dropping the [`KeepAlive`]
+    /// before the buffer's fence signals frees objects the GPU is still reading.
+    pub(super) fn end(self) -> (CommandBuffer, KeepAlive) {
+        let Self { inner, keep } = self;
+        // SAFETY: recording is over — this consumes the recorder — and every
+        // command in the buffer was paired with the barriers the compiled plan
+        // derived for it.
+        let buffer = unsafe { inner.end() }.expect("failed to end the frame's command buffer");
+        (buffer, keep)
+    }
+
+    /// Submit this recording and block until the GPU has finished with it.
+    ///
+    /// The blocking wait is what discharges the keep-alive obligation without a
+    /// per-frame list: nothing this recorded named can be dropped before the GPU
+    /// is done, because the [`KeepAlive`] outlives the wait and is dropped after
+    /// it. The right shape for the load-time paths — an environment bake, a mesh
+    /// or texture upload — and the wrong one for a frame.
+    pub(super) fn submit_and_wait(self, ctx: &VkContext) {
+        let (command_buffer, keep) = self.end();
+        let fence = Fence::new(ctx.device.clone(), FenceCreateInfo::default())
+            .expect("failed to create the upload fence");
+        submit_and_wait(ctx, &command_buffer, &fence);
+        drop(keep);
+    }
+
+    /// Record one image barrier, for the load-time paths that have no compiled
+    /// plan to draw on: an upload or a bake is a handful of commands whose
+    /// dependencies are written where they happen.
+    pub(super) fn image_barrier(&mut self, barrier: ImageMemoryBarrier) -> &mut Self {
+        self.keep.hold(barrier.image.clone());
+        image_barrier(&mut self.inner, barrier);
+        self
+    }
+
+    /// Submit one pass's slice of the compiled barrier plan. See [`emit_plan`].
+    pub(super) fn barriers(
+        &mut self,
+        barriers: &[Barrier],
+        resolve: impl FnMut(ResourceId) -> Option<Target>,
+    ) -> &mut Self {
+        emit_plan(&mut self.inner, barriers, resolve);
+        self
+    }
+
+    pub(super) fn begin_rendering(&mut self, mut info: RenderingInfo) -> &mut Self {
+        set_auto_extent_layers(&mut info);
+        for attachment in info.color_attachments.iter().flatten() {
+            self.keep.hold(attachment.image_view.clone());
+            if let Some(resolve) = &attachment.resolve_info {
+                self.keep.hold(resolve.image_view.clone());
+            }
+        }
+        for attachment in info.depth_attachment.iter().chain(&info.stencil_attachment) {
+            self.keep.hold(attachment.image_view.clone());
+        }
+        unsafe { self.inner.begin_rendering(&info) }.expect("invalid rendering info");
+        self
+    }
+
+    pub(super) fn end_rendering(&mut self) -> &mut Self {
+        unsafe { self.inner.end_rendering() }
+            .expect("ended a rendering instance that was not open");
+        self
+    }
+
+    pub(super) fn clear_attachments(
+        &mut self,
+        attachments: impl IntoIterator<Item = ClearAttachment>,
+        rects: impl IntoIterator<Item = ClearRect>,
+    ) -> &mut Self {
+        let attachments: Vec<_> = attachments.into_iter().collect();
+        let rects: Vec<_> = rects.into_iter().collect();
+        unsafe { self.inner.clear_attachments(&attachments, &rects) }
+            .expect("invalid attachment clear");
+        self
+    }
+
+    pub(super) fn bind_pipeline_graphics(&mut self, pipeline: &Arc<GraphicsPipeline>) -> &mut Self {
+        unsafe { self.inner.bind_pipeline_graphics(pipeline) }.expect("invalid graphics pipeline");
+        self.keep.hold(pipeline.clone());
+        self
+    }
+
+    pub(super) fn bind_pipeline_compute(&mut self, pipeline: &Arc<ComputePipeline>) -> &mut Self {
+        unsafe { self.inner.bind_pipeline_compute(pipeline) }.expect("invalid compute pipeline");
+        self.keep.hold(pipeline.clone());
+        self
+    }
+
+    pub(super) fn bind_descriptor_sets(
+        &mut self,
+        bind_point: PipelineBindPoint,
+        layout: &Arc<PipelineLayout>,
+        first_set: u32,
+        sets: &[Arc<DescriptorSet>],
+    ) -> &mut Self {
+        // Unannotated on purpose: `bind_descriptor_sets` takes `&[&RawDescriptorSet]`
+        // and vulkano 0.35 does not export that type, so the elements can be
+        // produced and passed but the vector's type cannot be written down.
+        let raw: Vec<_> = sets.iter().map(|set| set.as_raw()).collect();
+        unsafe {
+            self.inner
+                .bind_descriptor_sets(bind_point, layout, first_set, &raw, &[])
+        }
+        .expect("invalid descriptor set binding");
+        self.keep.hold(layout.clone());
+        for set in sets {
+            self.keep.hold(set.clone());
+        }
+        self
+    }
+
+    /// Takes the same collection the auto builder did — a single buffer, or a
+    /// tuple of differently-typed ones — so a call site says what it binds
+    /// rather than how to erase it.
+    pub(super) fn bind_vertex_buffers(
+        &mut self,
+        first_binding: u32,
+        buffers: impl VertexBuffersCollection,
+    ) -> &mut Self {
+        let buffers = buffers.into_vec();
+        unsafe { self.inner.bind_vertex_buffers(first_binding, &buffers) }
+            .expect("invalid vertex buffer binding");
+        for buffer in buffers {
+            self.keep.hold(buffer);
+        }
+        self
+    }
+
+    pub(super) fn bind_index_buffer(&mut self, buffer: impl Into<IndexBuffer>) -> &mut Self {
+        let buffer = buffer.into();
+        unsafe { self.inner.bind_index_buffer(&buffer) }.expect("invalid index buffer binding");
+        self.keep.hold(buffer);
+        self
+    }
+
+    pub(super) fn push_constants<Pc: BufferContents>(
+        &mut self,
+        layout: &Arc<PipelineLayout>,
+        offset: u32,
+        constants: &Pc,
+    ) -> &mut Self {
+        unsafe { self.inner.push_constants(layout, offset, constants) }
+            .expect("invalid push constants");
+        self.keep.hold(layout.clone());
+        self
+    }
+
+    pub(super) fn set_viewport(&mut self, first: u32, viewports: &[Viewport]) -> &mut Self {
+        unsafe { self.inner.set_viewport(first, viewports) }.expect("invalid viewport");
+        self
+    }
+
+    pub(super) fn set_scissor(&mut self, first: u32, scissors: &[Scissor]) -> &mut Self {
+        unsafe { self.inner.set_scissor(first, scissors) }.expect("invalid scissor");
+        self
+    }
+
+    pub(super) fn set_depth_bias(&mut self, constant: f32, clamp: f32, slope: f32) -> &mut Self {
+        unsafe { self.inner.set_depth_bias(constant, clamp, slope) }.expect("invalid depth bias");
+        self
+    }
+
+    pub(super) fn draw(
+        &mut self,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) -> &mut Self {
+        unsafe {
+            self.inner
+                .draw(vertex_count, instance_count, first_vertex, first_instance)
+        }
+        .expect("invalid draw");
+        self
+    }
+
+    pub(super) fn draw_indexed(
+        &mut self,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) -> &mut Self {
+        unsafe {
+            self.inner.draw_indexed(
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+            )
+        }
+        .expect("invalid indexed draw");
+        self
+    }
+
+    pub(super) fn dispatch(&mut self, group_counts: [u32; 3]) -> &mut Self {
+        unsafe { self.inner.dispatch(group_counts) }.expect("invalid dispatch");
+        self
+    }
+
+    pub(super) fn copy_buffer(&mut self, info: impl Into<CopyBufferInfo>) -> &mut Self {
+        let info = info.into();
+        unsafe { self.inner.copy_buffer(&info) }.expect("invalid buffer copy");
+        self.keep.hold(info);
+        self
+    }
+
+    pub(super) fn copy_buffer_to_image(&mut self, info: CopyBufferToImageInfo) -> &mut Self {
+        unsafe { self.inner.copy_buffer_to_image(&info) }.expect("invalid buffer-to-image copy");
+        self.keep.hold(info);
+        self
+    }
+
+    pub(super) fn copy_image_to_buffer(&mut self, info: CopyImageToBufferInfo) -> &mut Self {
+        unsafe { self.inner.copy_image_to_buffer(&info) }.expect("invalid image-to-buffer copy");
+        self.keep.hold(info);
+        self
+    }
+
+    pub(super) fn clear_depth_stencil_image(
+        &mut self,
+        info: ClearDepthStencilImageInfo,
+    ) -> &mut Self {
+        unsafe { self.inner.clear_depth_stencil_image(&info) }.expect("invalid depth clear");
+        self.keep.hold(info);
+        self
+    }
+
+    pub(super) fn blit_image(&mut self, info: BlitImageInfo) -> &mut Self {
+        unsafe { self.inner.blit_image(&info) }.expect("invalid blit");
+        self.keep.hold(info);
+        self
+    }
+
+    pub(super) fn reset_query_pool(
+        &mut self,
+        pool: Arc<QueryPool>,
+        queries: Range<u32>,
+    ) -> &mut Self {
+        // SAFETY: the frame resets its whole pool before opening any rendering
+        // instance, so no query in the range is in flight — `timestamps.rs`
+        // documents why that has to happen there.
+        unsafe { self.inner.reset_query_pool(&pool, queries) }.expect("invalid query pool reset");
+        self.keep.hold(pool);
+        self
+    }
+
+    pub(super) fn write_timestamp(
+        &mut self,
+        pool: Arc<QueryPool>,
+        query: u32,
+        stage: PipelineStage,
+    ) -> &mut Self {
+        unsafe { self.inner.write_timestamp(&pool, query, stage) }
+            .expect("invalid timestamp write");
+        self.keep.hold(pool);
+        self
+    }
+}
+
+/// One frame's submission, and everything that must outlive it.
+///
+/// The frame's resources are released when this is dropped, which is why
+/// [`wait`](InFlight::wait) consumes it: the fence signalling is the only
+/// evidence the GPU is finished, and the keep-alive list must not be dropped
+/// before it.
+// Every field but the fence exists to be *held*, not read: dropping any of them
+// while the queue is still executing this frame is a use-after-free the
+// validation layers do not catch. That is the whole obligation raw recording
+// hands back, so the lint is silenced here rather than worked around.
+#[allow(dead_code)]
+pub(super) struct InFlight {
+    fence: Fence,
+    keep: KeepAlive,
+    /// The buffer the queue is executing. Held for the same reason everything
+    /// else here is — the allocator recycles a command buffer as soon as it is
+    /// dropped, and the GPU is still reading this one.
+    command_buffer: CommandBuffer,
+    /// A semaphore the queue is still waiting on or signalling must not be
+    /// destroyed either.
+    semaphores: Vec<Arc<Semaphore>>,
+}
+
+impl InFlight {
+    /// Whether the GPU has finished with this frame, without blocking on it.
+    ///
+    /// What lets the CPU run ahead: a frame is retired when its fence happens to
+    /// have signalled, not by waiting for it.
+    pub(super) fn is_complete(&self) -> bool {
+        self.fence.is_signaled().unwrap_or(true)
+    }
+
+    /// Block until this frame has executed, then release what it named.
+    pub(super) fn wait(self) {
+        self.fence
+            .wait(None)
+            .expect("failed to wait on the frame fence");
+    }
+}
+
+/// Submit one recorded frame.
+///
+/// `waits` are the semaphores this frame's execution must not begin before, each
+/// with the stage that has to wait: the presentation engine's hand-back of the
+/// acquired image, and the previous frame's completion. `signals` are the ones
+/// signalled when it finishes — one per waiter, because a binary semaphore's
+/// signal may be waited exactly once.
+///
+/// Submitted through `ash` rather than vulkano, and not for control: a raw
+/// [`CommandBuffer`] does not implement `PrimaryCommandBufferAbstract` and
+/// cannot be made to from outside the crate, so neither `GpuFuture::then_execute`
+/// nor `QueueGuard::submit` will take one. See the module docs.
+pub(super) fn submit_frame(
+    ctx: &VkContext,
+    command_buffer: CommandBuffer,
+    keep: KeepAlive,
+    waits: &[(Arc<Semaphore>, vk::PipelineStageFlags)],
+    signals: &[Arc<Semaphore>],
+) -> InFlight {
+    let fence = Fence::new(ctx.device.clone(), FenceCreateInfo::default())
+        .expect("failed to create the frame fence");
+
+    let handles = [command_buffer.handle()];
+    let wait_handles: Vec<_> = waits.iter().map(|(s, _)| s.handle()).collect();
+    let wait_stages: Vec<_> = waits.iter().map(|(_, stage)| *stage).collect();
+    let signal_handles: Vec<_> = signals.iter().map(|s| s.handle()).collect();
+
+    let mut submit = vk::SubmitInfo::default().command_buffers(&handles);
+    if !wait_handles.is_empty() {
+        submit = submit
+            .wait_semaphores(&wait_handles)
+            .wait_dst_stage_mask(&wait_stages);
+    }
+    if !signal_handles.is_empty() {
+        submit = submit.signal_semaphores(&signal_handles);
+    }
+
+    ctx.queue.clone().with(|_guard| {
+        let fns = ctx.device.fns();
+        // SAFETY: one submission of one command buffer that finished recording,
+        // on the queue whose family it was allocated from, under the queue's
+        // lock, with a fresh unsignalled fence and semaphores this frame owns.
+        unsafe { (fns.v1_0.queue_submit)(ctx.queue.handle(), 1, &submit, fence.handle()) }
+            .result()
+            .expect("failed to submit the frame");
+    });
+
+    InFlight {
+        fence,
+        keep,
+        command_buffer,
+        semaphores: waits
+            .iter()
+            .map(|(s, _)| s.clone())
+            .chain(signals.iter().cloned())
+            .collect(),
+    }
+}
+
+/// Fill in a [`RenderingInfo`]'s render area and layer count from its
+/// attachments, as the two zero defaults ask for.
+///
+/// Vulkano does this itself in `AutoCommandBufferBuilder::begin_rendering`, and
+/// only there: `RenderingInfo::set_auto_extent_layers` is `pub(crate)`, so the
+/// raw path leaves both fields at the zero that means "derive me" and then
+/// rejects them. The rule is the smallest of every attachment's extent and layer
+/// count, resolve targets included, less the render area's offset.
+fn set_auto_extent_layers(info: &mut RenderingInfo) {
+    let auto_extent = info.render_area_extent[0] == 0 || info.render_area_extent[1] == 0;
+    let auto_layers = info.layer_count == 0;
+    if !auto_extent && !auto_layers {
+        return;
+    }
+
+    let mut extent = [u32::MAX, u32::MAX];
+    let mut layers = u32::MAX;
+    let mut any = false;
+
+    for attachment in info
+        .color_attachments
+        .iter()
+        .flatten()
+        .chain(info.depth_attachment.iter())
+        .chain(info.stencil_attachment.iter())
+        .flat_map(|attachment| {
+            Some(&attachment.image_view).into_iter().chain(
+                attachment
+                    .resolve_info
+                    .as_ref()
+                    .map(|resolve| &resolve.image_view),
+            )
+        })
+    {
+        any = true;
+        let view_extent = attachment.image().extent();
+        extent[0] = extent[0].min(view_extent[0]);
+        extent[1] = extent[1].min(view_extent[1]);
+        layers = layers.min(attachment.subresource_range().array_layers.len() as u32);
+    }
+
+    if !any {
+        return;
+    }
+    if auto_extent {
+        for axis in 0..2 {
+            info.render_area_extent[axis] = extent[axis]
+                .checked_sub(info.render_area_offset[axis])
+                .unwrap_or(1);
+        }
+    }
+    if auto_layers {
+        info.layer_count = layers;
+    }
+}
+
+/// A run of mip levels of a cube or array image, all layers.
+pub(super) fn levels(image: &Arc<Image>, mip_levels: Range<u32>) -> ImageSubresourceRange {
+    ImageSubresourceRange {
+        aspects: image.format().aspects(),
+        mip_levels,
+        array_layers: 0..image.array_layers(),
+    }
+}
+
+/// The transition a level needs between being rendered into and being read as a
+/// blit source.
+pub(super) fn color_to_transfer_src(
+    image: Arc<Image>,
+    subresource_range: ImageSubresourceRange,
+) -> ImageMemoryBarrier {
+    ImageMemoryBarrier {
+        src_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+        src_access: AccessFlags::COLOR_ATTACHMENT_WRITE,
+        dst_stages: PipelineStages::ALL_TRANSFER,
+        dst_access: AccessFlags::TRANSFER_READ,
+        old_layout: ImageLayout::ColorAttachmentOptimal,
+        new_layout: ImageLayout::TransferSrcOptimal,
+        subresource_range,
+        ..ImageMemoryBarrier::image(image)
+    }
+}
+
+/// The transition a level needs before it can be rendered into, from a state
+/// whose contents do not matter.
+pub(super) fn to_color_attachment(
+    image: Arc<Image>,
+    subresource_range: ImageSubresourceRange,
+) -> ImageMemoryBarrier {
+    ImageMemoryBarrier {
+        src_stages: PipelineStages::TOP_OF_PIPE,
+        src_access: AccessFlags::empty(),
+        dst_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+        dst_access: AccessFlags::COLOR_ATTACHMENT_WRITE,
+        old_layout: ImageLayout::Undefined,
+        new_layout: ImageLayout::ColorAttachmentOptimal,
+        subresource_range,
+        ..ImageMemoryBarrier::image(image)
+    }
+}
+
+/// The transition that hands a rendered image to the shaders that sample it.
+pub(super) fn color_to_shader_read(
+    image: Arc<Image>,
+    subresource_range: ImageSubresourceRange,
+) -> ImageMemoryBarrier {
+    ImageMemoryBarrier {
+        src_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+        src_access: AccessFlags::COLOR_ATTACHMENT_WRITE,
+        dst_stages: PipelineStages::FRAGMENT_SHADER,
+        dst_access: AccessFlags::SHADER_READ,
+        old_layout: ImageLayout::ColorAttachmentOptimal,
+        new_layout: ImageLayout::ShaderReadOnlyOptimal,
+        subresource_range,
+        ..ImageMemoryBarrier::image(image)
+    }
+}
+
+/// A [`GpuFuture`] that is nothing but a wait on a semaphore this crate signalled.
+///
+/// The bridge between the frame — submitted raw, through `ash` — and the editor
+/// overlay, which is `egui_winit_vulkano`'s to submit and takes a `GpuFuture` to
+/// chain onto. Vulkano ships no future that waits on a semaphore the caller
+/// owns, but it does not need to: [`SubmitAnyBuilder::SemaphoresWait`] is public
+/// and is exactly that, so the whole bridge is one `build_submission`.
+///
+/// Without it the only way to order the overlay after the frame is to block the
+/// CPU on the frame's fence, which costs a full GPU frame of overlap every time
+/// the editor is open. With it the dependency stays on the GPU, where it was
+/// before the renderer recorded raw.
+///
+/// `queue_change_allowed` is false and `queue` names the one the semaphore is
+/// signalled on: a wait for a signal from another queue is a different
+/// synchronisation problem, and this type does not solve it.
+///
+/// `acquired` is the swapchain image the signalling submission rendered into,
+/// when there is one. Vulkano validates a present by walking the future chain
+/// for the acquire the image came from, and this future stands in for a
+/// submission it cannot see — one that waited on that acquire's semaphore
+/// itself. Naming the image here is how that fact reaches the check; without it
+/// a present behind this future is refused as unacquired.
+pub(super) struct SemaphoreWait {
+    queue: Arc<Queue>,
+    semaphore: Arc<Semaphore>,
+    acquired: Option<(Arc<Swapchain>, u32)>,
+}
+
+impl SemaphoreWait {
+    pub(super) fn new(
+        queue: Arc<Queue>,
+        semaphore: Arc<Semaphore>,
+        acquired: Option<(Arc<Swapchain>, u32)>,
+    ) -> Self {
+        Self {
+            queue,
+            semaphore,
+            acquired,
+        }
+    }
+}
+
+unsafe impl DeviceOwned for SemaphoreWait {
+    fn device(&self) -> &Arc<Device> {
+        self.queue.device()
+    }
+}
+
+unsafe impl GpuFuture for SemaphoreWait {
+    fn cleanup_finished(&mut self) {}
+
+    unsafe fn build_submission(&self) -> Result<SubmitAnyBuilder, Validated<VulkanError>> {
+        Ok(SubmitAnyBuilder::SemaphoresWait(
+            [self.semaphore.clone()].into_iter().collect(),
+        ))
+    }
+
+    fn flush(&self) -> Result<(), Validated<VulkanError>> {
+        Ok(())
+    }
+
+    unsafe fn signal_finished(&self) {}
+
+    fn queue_change_allowed(&self) -> bool {
+        false
+    }
+
+    fn queue(&self) -> Option<Arc<Queue>> {
+        Some(self.queue.clone())
+    }
+
+    /// `Unknown` for both, as `NowFuture` answers them: this future tracks no
+    /// resource, so it can say nothing about one. What it expresses is an
+    /// execution dependency, and the layouts on either side of it are the
+    /// compiled plan's business.
+    fn check_buffer_access(
+        &self,
+        _buffer: &Buffer,
+        _range: Range<DeviceSize>,
+        _exclusive: bool,
+        _queue: &Queue,
+    ) -> Result<(), AccessCheckError> {
+        Err(AccessCheckError::Unknown)
+    }
+
+    fn check_image_access(
+        &self,
+        _image: &Image,
+        _range: Range<DeviceSize>,
+        _exclusive: bool,
+        _expected_layout: ImageLayout,
+        _queue: &Queue,
+    ) -> Result<(), AccessCheckError> {
+        Err(AccessCheckError::Unknown)
+    }
+
+    /// Answered exactly as [`SwapchainAcquireFuture`] answers it, because it
+    /// stands for a submission that waited on that acquire's semaphore: the
+    /// image really has been acquired, and really is free to be drawn into and
+    /// presented behind this future.
+    ///
+    /// [`SwapchainAcquireFuture`]: vulkano::swapchain::SwapchainAcquireFuture
+    fn check_swapchain_image_acquired(
+        &self,
+        swapchain: &Swapchain,
+        image_index: u32,
+        before: bool,
+    ) -> Result<(), AccessCheckError> {
+        if before {
+            return Ok(());
+        }
+        match &self.acquired {
+            Some((acquired, index)) if acquired.as_ref() == swapchain && *index == image_index => {
+                Ok(())
+            }
+            _ => Err(AccessCheckError::Unknown),
+        }
     }
 }

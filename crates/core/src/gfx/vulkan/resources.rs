@@ -223,6 +223,16 @@ impl GraphImages {
     ///
     /// Panics for a resource the graph does not own, which can only happen if a
     /// pass reads a handle from a graph it was not declared against.
+    /// The view backing `id`, or `None` for a resource this graph does not own —
+    /// an imported image, or a buffer.
+    ///
+    /// Separate from [`view`](Self::view) because the two callers want opposite
+    /// things from a miss: a pass binding a resource it declared has hit a bug,
+    /// while the barrier resolver is *asking* which kind of resource this is.
+    pub fn try_view(&self, id: ResourceId) -> Option<Arc<ImageView>> {
+        self.views[id.index()].clone()
+    }
+
     pub fn view(&self, id: ResourceId) -> Arc<ImageView> {
         self.views[id.index()]
             .clone()

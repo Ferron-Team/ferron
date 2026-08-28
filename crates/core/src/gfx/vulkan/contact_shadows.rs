@@ -21,7 +21,6 @@ use std::sync::Arc;
 use glam::Vec3;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
@@ -45,6 +44,7 @@ use crate::scene::ContactShadowSettings;
 use super::VulkanRenderer;
 use super::context::VkContext;
 use super::prepass::FrameUbo;
+use super::record::Recorder;
 use super::rendering;
 use super::taa::FrameView;
 use super::texture::MipPolicy;
@@ -204,7 +204,7 @@ impl ContactShadowPass {
     /// as this pass's `Sampled` inputs.
     pub(super) fn record(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         renderer: &VulkanRenderer,
         extent: [u32; 2],
         uniforms: &ContactShadowUniforms,
@@ -235,25 +235,20 @@ impl ContactShadowPass {
         builder
             .set_viewport(
                 0,
-                [Viewport {
+                &[Viewport {
                     offset: [0.0, 0.0],
                     extent: [extent[0] as f32, extent[1] as f32],
                     depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
+                }],
             )
-            .unwrap()
-            .bind_pipeline_graphics(self.pipeline.clone())
-            .unwrap()
+            .bind_pipeline_graphics(&self.pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.pipeline.layout().clone(),
+                self.pipeline.layout(),
                 0,
-                vec![uniform_set, texture_set],
-            )
-            .unwrap();
-        unsafe { builder.draw(3, 1, 0, 0).unwrap() };
+                &[uniform_set, texture_set],
+            );
+        builder.draw(3, 1, 0, 0);
     }
 }
 

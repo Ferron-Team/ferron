@@ -15,7 +15,6 @@
 use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -28,6 +27,7 @@ use vulkano::pipeline::{
 use crate::scene::{Camera, DofSettings};
 
 use super::context::VkContext;
+use super::record::Recorder;
 
 /// Side of the compute workgroup for every pass here.
 const TILE: u32 = 8;
@@ -178,7 +178,7 @@ impl DofPass {
 
     pub fn record_prefilter(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         color: Arc<ImageView>,
         depth: Arc<ImageView>,
@@ -197,27 +197,24 @@ impl DofPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.prefilter_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.prefilter_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.prefilter_pipeline.layout().clone(),
+                self.prefilter_pipeline.layout(),
                 0,
-                vec![set],
+                &[set],
             )
-            .unwrap()
             .push_constants(
-                self.prefilter_pipeline.layout().clone(),
+                self.prefilter_pipeline.layout(),
                 0,
-                PrefilterPush {
+                &PrefilterPush {
                     coc_scale: self.coc_scale,
                     focus_distance: self.settings.focus_distance,
                     near: self.near,
                     far: self.far,
                     max_radius: MAX_COC_RADIUS,
                 },
-            )
-            .unwrap();
+            );
         dispatch_over(builder, &target);
     }
 
@@ -225,7 +222,7 @@ impl DofPass {
     /// sizes its kernel from.
     pub fn record_tile_max(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         prefiltered: Arc<ImageView>,
         target: Arc<ImageView>,
@@ -242,21 +239,19 @@ impl DofPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.tile_max_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.tile_max_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.tile_max_pipeline.layout().clone(),
+                self.tile_max_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 
     pub fn record_gather(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         prefiltered: Arc<ImageView>,
         tiles: Arc<ImageView>,
@@ -277,21 +272,19 @@ impl DofPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.gather_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.gather_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.gather_pipeline.layout().clone(),
+                self.gather_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &near);
     }
 
     pub fn record_composite(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         color: Arc<ImageView>,
         depth: Arc<ImageView>,
@@ -314,45 +307,35 @@ impl DofPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.composite_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.composite_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.composite_pipeline.layout().clone(),
+                self.composite_pipeline.layout(),
                 0,
-                vec![set],
+                &[set],
             )
-            .unwrap()
             .push_constants(
-                self.composite_pipeline.layout().clone(),
+                self.composite_pipeline.layout(),
                 0,
-                CompositePush {
+                &CompositePush {
                     coc_scale: self.coc_scale,
                     focus_distance: self.settings.focus_distance,
                     near: self.near,
                     far: self.far,
                 },
-            )
-            .unwrap();
+            );
         dispatch_over(builder, &target);
     }
 }
 
-fn dispatch_over(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    target: &Arc<ImageView>,
-) {
+fn dispatch_over(builder: &mut Recorder, target: &Arc<ImageView>) {
     let extent = target.image().extent();
 
     // SAFETY: the dispatch covers exactly `extent`, and each shader discards
     // invocations past `imageSize`, so nothing writes outside the image. The
     // descriptors bound above match the shader's layout, and the graph declared
     // every resource this pass touches, so its barriers precede it.
-    unsafe {
-        builder
-            .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
-            .unwrap()
-    };
+    builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
 }
 
 fn build_pipeline(

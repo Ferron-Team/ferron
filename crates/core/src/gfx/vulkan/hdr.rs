@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use vulkano::buffer::{BufferContents, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
@@ -21,6 +20,7 @@ use vulkano::pipeline::{
 
 use super::context::VkContext;
 use super::exposure::GpuExposure;
+use super::record::Recorder;
 use super::rendering;
 
 /// Offscreen colour format the frame's radiance is carried in. Float, so values
@@ -110,7 +110,7 @@ impl HdrPass {
     /// wrote, declared as its `StorageRead`.
     pub fn record_tonemap(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         extent: [u32; 2],
         hdr_view: Arc<ImageView>,
@@ -132,35 +132,29 @@ impl HdrPass {
         builder
             .set_viewport(
                 0,
-                [Viewport {
+                &[Viewport {
                     offset: [0.0, 0.0],
                     extent: [extent[0] as f32, extent[1] as f32],
                     depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
+                }],
             )
-            .unwrap()
-            .bind_pipeline_graphics(self.tonemap_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_graphics(&self.tonemap_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.tonemap_pipeline.layout().clone(),
+                self.tonemap_pipeline.layout(),
                 0,
-                vec![set],
+                &[set],
             )
-            .unwrap()
             .push_constants(
-                self.tonemap_pipeline.layout().clone(),
+                self.tonemap_pipeline.layout(),
                 0,
-                TonemapPush {
+                &TonemapPush {
                     manual_exposure: self.manual_exposure,
                     use_auto: self.auto_exposure as u32,
                     bloom_strength: self.bloom_strength,
                 },
-            )
-            .unwrap();
-        unsafe { builder.draw(3, 1, 0, 0).unwrap() };
+            );
+        builder.draw(3, 1, 0, 0);
     }
 }
 

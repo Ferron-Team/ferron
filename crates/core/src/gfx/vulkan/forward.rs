@@ -3,7 +3,7 @@ use std::sync::Arc;
 use glam::{Mat4, Vec3};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
+use vulkano::command_buffer::CopyBufferInfo;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
 use vulkano::format::Format;
@@ -25,7 +25,6 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::sync::{self, GpuFuture};
 
 use crate::geom::Aabb;
 use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
@@ -40,6 +39,7 @@ use crate::scene::{Camera, EnvironmentSettings};
 use super::context::VkContext;
 use super::fog::GpuFog;
 use super::instances::GpuObject;
+use super::record::Recorder;
 use super::rendering;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
@@ -1107,7 +1107,7 @@ impl ForwardPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &self,
-        builder: &mut AutoCommandBufferBuilder<vulkano::command_buffer::PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         renderer: &VulkanRenderer,
         draws: DrawList<'_>,
         view: &FrameView,
@@ -1125,18 +1125,14 @@ impl ForwardPass {
         let view_proj = view.view_proj;
         let (plain, masked) = self.pipelines(msaa).for_frame(subsurface);
 
-        builder
-            .set_viewport(
-                0,
-                [Viewport {
-                    offset: [0.0, 0.0],
-                    extent: [extent[0] as f32, extent[1] as f32],
-                    depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap();
+        builder.set_viewport(
+            0,
+            &[Viewport {
+                offset: [0.0, 0.0],
+                extent: [extent[0] as f32, extent[1] as f32],
+                depth_range: 0.0..=1.0,
+            }],
+        );
 
         // Nothing is bound yet, so the first run always binds. `None` rather
         // than "the plain one" so that a frame of nothing but foliage does not
@@ -1169,34 +1165,25 @@ impl ForwardPass {
                 // and this is a formality — but it is the formality that keeps
                 // it true if one of them ever stops being.
                 builder
-                    .bind_pipeline_graphics(pipeline.clone())
-                    .unwrap()
+                    .bind_pipeline_graphics(&pipeline)
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
-                        pipeline.layout().clone(),
+                        pipeline.layout(),
                         0,
-                        sets.as_vec(),
-                    )
-                    .unwrap();
+                        &sets.as_vec(),
+                    );
                 bound = Some(wants_masked);
             }
             let push = PushConstants::new(view_proj, item.material.0, run.start as u32);
 
             builder
-                .push_constants(pipeline.layout().clone(), 0, push)
-                .unwrap()
+                .push_constants(pipeline.layout(), 0, &push)
                 .bind_vertex_buffers(
                     0,
                     (mesh.position_buffer.clone(), mesh.surface_buffer.clone()),
                 )
-                .unwrap()
-                .bind_index_buffer(mesh.index_buffer.clone())
-                .unwrap();
-            unsafe {
-                builder
-                    .draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0)
-                    .unwrap();
-            }
+                .bind_index_buffer(mesh.index_buffer.clone());
+            builder.draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0);
         }
     }
 }
@@ -1328,27 +1315,12 @@ fn stage(
     let surface = staged_pair(ctx, BufferUsage::VERTEX_BUFFER, surfaces);
     let index = staged_pair(ctx, BufferUsage::INDEX_BUFFER, indices);
 
-    let mut builder = AutoCommandBufferBuilder::primary(
-        ctx.command_buffer_allocator.clone(),
-        ctx.queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
+    let mut builder = Recorder::new(ctx);
     builder
         .copy_buffer(CopyBufferInfo::buffers(position.0, position.1.clone()))
-        .unwrap()
         .copy_buffer(CopyBufferInfo::buffers(surface.0, surface.1.clone()))
-        .unwrap()
-        .copy_buffer(CopyBufferInfo::buffers(index.0, index.1.clone()))
-        .unwrap();
-
-    sync::now(ctx.device.clone())
-        .then_execute(ctx.queue.clone(), builder.build().unwrap())
-        .unwrap()
-        .then_signal_fence_and_flush()
-        .unwrap()
-        .wait(None)
-        .unwrap();
+        .copy_buffer(CopyBufferInfo::buffers(index.0, index.1.clone()));
+    builder.submit_and_wait(ctx);
 
     (position.1, surface.1, index.1)
 }

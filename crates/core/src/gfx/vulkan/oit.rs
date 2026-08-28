@@ -24,7 +24,6 @@
 
 use std::sync::Arc;
 
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
@@ -52,6 +51,7 @@ use super::VulkanRenderer;
 use super::context::VkContext;
 use super::forward::ForwardSets;
 use super::hdr::HDR_WIDE_FORMAT;
+use super::record::Recorder;
 use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
@@ -109,7 +109,7 @@ impl OitPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         renderer: &VulkanRenderer,
         draws: DrawList<'_>,
         sets: &ForwardSets,
@@ -120,24 +120,19 @@ impl OitPass {
         builder
             .set_viewport(
                 0,
-                [Viewport {
+                &[Viewport {
                     offset: [0.0, 0.0],
                     extent: [extent[0] as f32, extent[1] as f32],
                     depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
+                }],
             )
-            .unwrap()
-            .bind_pipeline_graphics(self.pipeline.clone())
-            .unwrap()
+            .bind_pipeline_graphics(&self.pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.pipeline.layout().clone(),
+                self.pipeline.layout(),
                 0,
-                sets.as_vec(),
-            )
-            .unwrap();
+                &sets.as_vec(),
+            );
 
         for run in draws.runs() {
             let item = draws.item(run.start);
@@ -152,20 +147,13 @@ impl OitPass {
                 object_base + run.start as u32,
             );
             builder
-                .push_constants(self.pipeline.layout().clone(), 0, push)
-                .unwrap()
+                .push_constants(self.pipeline.layout(), 0, &push)
                 .bind_vertex_buffers(
                     0,
                     (mesh.position_buffer.clone(), mesh.surface_buffer.clone()),
                 )
-                .unwrap()
-                .bind_index_buffer(mesh.index_buffer.clone())
-                .unwrap();
-            unsafe {
-                builder
-                    .draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0)
-                    .unwrap()
-            };
+                .bind_index_buffer(mesh.index_buffer.clone());
+            builder.draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0);
         }
     }
 
@@ -173,7 +161,7 @@ impl OitPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_composite(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         scene: Arc<ImageView>,
         accum: Arc<ImageView>,
@@ -194,26 +182,20 @@ impl OitPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.composite_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.composite_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.composite_pipeline.layout().clone(),
+                self.composite_pipeline.layout(),
                 0,
-                set,
-            )
-            .unwrap();
+                &[set],
+            );
 
         let extent = target.image().extent();
         // SAFETY: the dispatch covers exactly `extent`, and the shader discards
         // invocations past `imageSize`, so nothing writes outside the image. The
         // descriptors bound above match the shader's layout, and the graph
         // declared every resource this pass touches, so its barriers precede it.
-        unsafe {
-            builder
-                .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
-                .unwrap()
-        };
+        builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
     }
 }
 

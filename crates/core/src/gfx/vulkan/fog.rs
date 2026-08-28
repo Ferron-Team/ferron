@@ -26,7 +26,6 @@ use std::sync::Arc;
 use glam::{Mat4, Vec3};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
@@ -45,6 +44,7 @@ use crate::scene::FogSettings;
 use super::ShadowFrame;
 use super::context::VkContext;
 use super::forward::GpuCascades;
+use super::record::Recorder;
 use super::taa::FrameView;
 
 /// How far the froxel grid is reduced from the frame in each screen axis.
@@ -371,7 +371,7 @@ impl FogPass {
 
     pub(super) fn record_scatter(
         &mut self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         shadow_maps: Arc<ImageView>,
     ) {
@@ -399,29 +399,23 @@ impl FogPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.scatter_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.scatter_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.scatter_pipeline.layout().clone(),
+                self.scatter_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
 
         // SAFETY: the dispatch covers exactly the volume's extent and the shader
         // discards invocations past `imageSize`, so nothing writes outside it.
         // The descriptors bound above match the shader's layout, and the graph
         // declared every resource this pass touches, so its barriers precede it.
-        unsafe {
-            builder
-                .dispatch([
-                    extent[0].div_ceil(SCATTER_TILE),
-                    extent[1].div_ceil(SCATTER_TILE),
-                    extent[2].div_ceil(SCATTER_TILE),
-                ])
-                .unwrap()
-        };
+        builder.dispatch([
+            extent[0].div_ceil(SCATTER_TILE),
+            extent[1].div_ceil(SCATTER_TILE),
+            extent[2].div_ceil(SCATTER_TILE),
+        ]);
 
         // The volume that just scattered is the history the next frame reads, so
         // whatever made it untrustworthy is over.
@@ -430,7 +424,7 @@ impl FogPass {
 
     pub(super) fn record_integrate(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         target: Arc<ImageView>,
     ) {
@@ -453,29 +447,23 @@ impl FogPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.integrate_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.integrate_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.integrate_pipeline.layout().clone(),
+                self.integrate_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
 
         // SAFETY: one invocation per froxel *column* — the shader loops the depth
         // axis itself — so the dispatch covers the volume's `xy` only, and the
         // shader discards columns past `imageSize`. The descriptors match the
         // shader's layout and the graph declared what this pass touches.
-        unsafe {
-            builder
-                .dispatch([
-                    extent[0].div_ceil(INTEGRATE_TILE),
-                    extent[1].div_ceil(INTEGRATE_TILE),
-                    1,
-                ])
-                .unwrap()
-        };
+        builder.dispatch([
+            extent[0].div_ceil(INTEGRATE_TILE),
+            extent[1].div_ceil(INTEGRATE_TILE),
+            1,
+        ]);
     }
 }
 

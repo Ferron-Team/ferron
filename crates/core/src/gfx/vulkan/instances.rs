@@ -36,14 +36,13 @@ use glam::Mat4;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::BufferCopy;
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CopyBufferInfoTyped, PrimaryAutoCommandBuffer,
-};
+use vulkano::command_buffer::CopyBufferInfoTyped;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 
 use crate::gfx::RenderItem;
 
 use super::context::VkContext;
+use super::record::Recorder;
 
 /// Per-object transforms, indexed through [`InstanceLists`] from a storage
 /// buffer. std430 matches this `#[repr(C)]` layout exactly because every field
@@ -164,7 +163,7 @@ impl InstanceStore {
     pub(super) fn sync(
         &mut self,
         ctx: &VkContext,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         items: &[RenderItem],
     ) -> usize {
         // Growth first, because the dirty test below is against the mirror this
@@ -248,12 +247,10 @@ impl InstanceStore {
             start = end;
         }
 
-        builder
-            .copy_buffer(CopyBufferInfoTyped {
-                regions: regions.into_iter().collect(),
-                ..CopyBufferInfoTyped::buffers(staging, self.rows.clone())
-            })
-            .unwrap();
+        builder.copy_buffer(CopyBufferInfoTyped {
+            regions: regions.into_iter().collect(),
+            ..CopyBufferInfoTyped::buffers(staging, self.rows.clone())
+        });
 
         dirty.len()
     }

@@ -18,7 +18,6 @@ use std::sync::Arc;
 use glam::{Mat4, Vec2};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -34,6 +33,7 @@ use crate::scene::{Camera, TaaSettings};
 
 use super::context::VkContext;
 use super::hdr::HDR_FORMAT;
+use super::record::Recorder;
 
 /// Side of the resolve's compute workgroup.
 const TILE: u32 = 8;
@@ -216,7 +216,7 @@ impl TaaPass {
         self.pair()[(self.frame & 1) as usize].clone()
     }
 
-    fn history_view(&self) -> Arc<ImageView> {
+    pub(super) fn history_view(&self) -> Arc<ImageView> {
         self.pair()[((self.frame + 1) & 1) as usize].clone()
     }
 
@@ -228,7 +228,7 @@ impl TaaPass {
 
     pub(super) fn record(
         &mut self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         view: &FrameView,
         color: Arc<ImageView>,
@@ -270,26 +270,20 @@ impl TaaPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.pipeline.layout().clone(),
+                self.pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
 
         // SAFETY: the dispatch covers exactly the target's extent and the shader
         // discards invocations past `imageSize(u_target)`, so nothing writes
         // outside it. The descriptors bound above match the shader's layout, and
         // the graph declared every resource this pass touches, so its barriers
         // precede it.
-        unsafe {
-            builder
-                .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
-                .unwrap()
-        };
+        builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
 
         // The frame that just resolved is the history the next one reads, so
         // whatever made it untrustworthy is over.

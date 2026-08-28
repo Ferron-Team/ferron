@@ -16,10 +16,10 @@ use crate::scene::DebugLine;
 use super::MSAA_SAMPLES;
 use super::context::VkContext;
 use super::forward::ForwardTargets;
+use super::record::Recorder;
 use super::taa::FrameView;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::image::SampleCount;
 use vulkano::memory::allocator::MemoryTypeFilter;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
@@ -86,7 +86,7 @@ impl LinePass {
     /// forward render pass, after the scene geometry.
     pub fn record(
         &mut self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         lines: &[DebugLine],
         view: &FrameView,
         extent: [u32; 2],
@@ -126,29 +126,21 @@ impl LinePass {
         builder
             .set_viewport(
                 0,
-                [Viewport {
+                &[Viewport {
                     offset: [0.0, 0.0],
                     extent: [extent[0] as f32, extent[1] as f32],
                     depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
+                }],
             )
-            .unwrap()
-            .bind_pipeline_graphics(pipeline.clone())
-            .unwrap()
-            .push_constants(pipeline.layout().clone(), 0, view_proj)
-            .unwrap()
-            .bind_vertex_buffers(0, buffer)
-            .unwrap();
+            .bind_pipeline_graphics(&pipeline)
+            .push_constants(pipeline.layout(), 0, &view_proj)
+            .bind_vertex_buffers(0, buffer);
 
         let vertex_count = vertices.len() as u32;
 
         // SAFETY: the bound pipeline and vertex buffer cover [0, vertex_count); no
         // index buffer or instancing is used.
-        unsafe {
-            builder.draw(vertex_count, 1, 0, 0).unwrap();
-        }
+        builder.draw(vertex_count, 1, 0, 0);
     }
 }
 

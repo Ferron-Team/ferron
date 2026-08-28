@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use vulkano::buffer::{BufferContents, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
@@ -27,6 +26,7 @@ use crate::scene::{BloomSettings, HdrSettings};
 
 use super::context::VkContext;
 use super::exposure::GpuExposure;
+use super::record::Recorder;
 
 /// Most levels the chain will ever have. Six covers a 4K frame down to about
 /// 60x34, past which a level contributes nothing a wider tent filter would not.
@@ -164,7 +164,7 @@ impl BloomPass {
     /// Half the frame, exposure applied, fireflies weighted down.
     pub fn record_prefilter(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         source: Arc<ImageView>,
         target: Arc<ImageView>,
@@ -183,30 +183,27 @@ impl BloomPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.prefilter_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.prefilter_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.prefilter_pipeline.layout().clone(),
+                self.prefilter_pipeline.layout(),
                 0,
-                vec![set],
+                &[set],
             )
-            .unwrap()
             .push_constants(
-                self.prefilter_pipeline.layout().clone(),
+                self.prefilter_pipeline.layout(),
                 0,
-                PrefilterPush {
+                &PrefilterPush {
                     manual_exposure: self.hdr.manual_exposure(),
                     use_auto: self.hdr.auto_exposure as u32,
                 },
-            )
-            .unwrap();
+            );
         dispatch_over(builder, &target);
     }
 
     pub fn record_downsample(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         source: Arc<ImageView>,
         target: Arc<ImageView>,
@@ -223,15 +220,13 @@ impl BloomPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.downsample_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.downsample_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.downsample_pipeline.layout().clone(),
+                self.downsample_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 
@@ -239,7 +234,7 @@ impl BloomPass {
     /// level of the target's size, which the spread is added to.
     pub fn record_upsample(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         coarse: Arc<ImageView>,
         same_level: Arc<ImageView>,
@@ -258,24 +253,21 @@ impl BloomPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.upsample_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.upsample_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.upsample_pipeline.layout().clone(),
+                self.upsample_pipeline.layout(),
                 0,
-                vec![set],
+                &[set],
             )
-            .unwrap()
             .push_constants(
-                self.upsample_pipeline.layout().clone(),
+                self.upsample_pipeline.layout(),
                 0,
-                UpsamplePush {
+                &UpsamplePush {
                     radius: self.settings.radius,
                     scatter: self.settings.scatter,
                 },
-            )
-            .unwrap();
+            );
         dispatch_over(builder, &target);
     }
 }
@@ -283,10 +275,7 @@ impl BloomPass {
 /// Cover every texel of `target` with `TILE`-sized groups. Every shader in the
 /// chain bounds-checks against `imageSize`, so a partial group at the edge
 /// writes nothing extra.
-fn dispatch_over(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    target: &Arc<ImageView>,
-) {
+fn dispatch_over(builder: &mut Recorder, target: &Arc<ImageView>) {
     let extent = target.image().extent();
 
     // SAFETY: the dispatch covers exactly `extent`, and each shader discards
@@ -294,11 +283,7 @@ fn dispatch_over(
     // image. The descriptors bound above match the shader's layout, and the
     // graph declared every resource this pass touches, so its barriers precede
     // it.
-    unsafe {
-        builder
-            .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
-            .unwrap()
-    };
+    builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
 }
 
 fn build_pipeline(
