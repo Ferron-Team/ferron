@@ -14,6 +14,7 @@ mod motion_blur;
 mod oit;
 mod pipeline_cache;
 mod prepass;
+mod record;
 mod refraction;
 mod resources;
 mod shadow;

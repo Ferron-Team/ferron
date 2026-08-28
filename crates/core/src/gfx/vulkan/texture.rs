@@ -1,21 +1,21 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, CopyBufferToImageInfo, ImageBlit,
-    PrimaryAutoCommandBuffer,
+    BlitImageInfo, CopyBufferToImageInfo, ImageBlit, RecordingCommandBuffer,
 };
 use vulkano::format::{Format, FormatFeatures};
 use vulkano::image::sampler::Filter;
 use vulkano::image::view::ImageView;
 use vulkano::image::{
-    Image, ImageCreateInfo, ImageSubresourceLayers, ImageType, ImageUsage, max_mip_levels,
-    mip_level_extent,
+    Image, ImageAspects, ImageCreateInfo, ImageLayout, ImageSubresourceLayers,
+    ImageSubresourceRange, ImageType, ImageUsage, max_mip_levels, mip_level_extent,
 };
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::sync::{self, GpuFuture};
 
 use super::context::VkContext;
+use super::record;
 
 pub(super) enum MipPolicy {
     /// One level. For data textures (noise, LUTs) and 1x1 fallbacks.
@@ -24,43 +24,66 @@ pub(super) enum MipPolicy {
     Generate,
 }
 
+/// A run of mip levels, all layers.
+fn level_range(image: &Arc<Image>, mip_levels: Range<u32>) -> ImageSubresourceRange {
+    ImageSubresourceRange {
+        aspects: ImageAspects::COLOR,
+        mip_levels,
+        array_layers: 0..image.array_layers(),
+    }
+}
+
 /// Fills mip levels 1.. by successively halving level 0 with a linear blit.
 /// Assumes level 0 is already populated and the image carries `TRANSFER_SRC`.
-fn generate_mips(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    image: &Arc<Image>,
-) {
+///
+/// Every level is written as a blit destination and then read as the next
+/// blit's source, so each iteration needs two dependencies the auto-synchronised
+/// path used to derive: level `n-1` must finish being written before it is read,
+/// and it must be in `TransferSrcOptimal` when it is. The whole image is already
+/// in `TransferDstOptimal` on entry.
+fn generate_mips(recording: &mut RecordingCommandBuffer, image: &Arc<Image>) {
     let base = image.extent();
     let source_layers = image.subresource_layers();
     let aspects = source_layers.aspects;
 
-    for level in 1..image.mip_levels() {
-        let src_extent = mip_level_extent(base, level - 1).unwrap();
-        let dst_extent = mip_level_extent(base, level).unwrap();
+    for level_index in 1..image.mip_levels() {
+        let src_extent = mip_level_extent(base, level_index - 1).unwrap();
+        let dst_extent = mip_level_extent(base, level_index).unwrap();
 
         let region = ImageBlit {
             src_subresource: ImageSubresourceLayers {
                 aspects,
-                mip_level: level - 1,
+                mip_level: level_index - 1,
                 array_layers: 0..1,
             },
             src_offsets: [[0, 0, 0], src_extent],
             dst_subresource: ImageSubresourceLayers {
                 aspects,
-                mip_level: level,
+                mip_level: level_index,
                 array_layers: 0..1,
             },
             dst_offsets: [[0, 0, 0], dst_extent],
             ..Default::default()
         };
 
-        builder
-            .blit_image(BlitImageInfo {
+        record::image_barrier(
+            recording,
+            record::transfer_dst_to_src(image.clone(), level_range(image, level_index - 1..level_index)),
+        );
+
+        // SAFETY: the barrier above orders this blit's read of `level - 1`
+        // after the write that produced it, and has put that level in the
+        // source layout `BlitImageInfo::images` names; the destination level
+        // has been in `TransferDstOptimal` since the pre-copy transition and
+        // no earlier command in this buffer has touched it.
+        unsafe {
+            recording.blit_image(&BlitImageInfo {
                 regions: vec![region].into(),
                 filter: Filter::Linear,
                 ..BlitImageInfo::images(image.clone(), image.clone())
             })
-            .unwrap();
+        }
+        .expect("invalid mip blit");
     }
 }
 
@@ -124,29 +147,52 @@ pub(super) fn upload_texture(
     )
     .expect("failed to create texture image");
 
-    let mut builder = AutoCommandBufferBuilder::primary(
-        ctx.command_buffer_allocator.clone(),
-        ctx.queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
-    builder
-        .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging, image.clone()))
-        .unwrap();
+    let copy = CopyBufferToImageInfo::buffer_image(staging, image.clone());
 
-    if mip_levels > 1 {
-        generate_mips(&mut builder, &image);
-    }
+    record::submit_one_shot(ctx, |recording| {
+        // Fresh out of `Image::new`, so every level is `Undefined` and there is
+        // nothing to preserve — one barrier covers the whole chain, and the
+        // levels the copy does not write are the ones the blits below will.
+        record::image_barrier(
+            recording,
+            record::to_transfer_dst(
+                image.clone(),
+                record::whole_image(&image),
+                ImageLayout::Undefined,
+            ),
+        );
 
-    let command_buffer = builder.build().unwrap();
+        // SAFETY: the transition above put level 0 in the layout
+        // `CopyBufferToImageInfo::buffer_image` names, and the staging buffer is
+        // written and never touched again before `submit_one_shot` returns.
+        unsafe { recording.copy_buffer_to_image(&copy) }.expect("invalid texture copy");
 
-    sync::now(ctx.device.clone())
-        .then_execute(ctx.queue.clone(), command_buffer)
-        .unwrap()
-        .then_signal_fence_and_flush()
-        .unwrap()
-        .wait(None)
-        .unwrap();
+        if mip_levels > 1 {
+            generate_mips(recording, &image);
+        }
+
+        // What the chain left behind: every level but the last was read as a
+        // blit source, the last was only ever written. With no chain, level 0 is
+        // still the copy's destination.
+        if mip_levels > 1 {
+            record::image_barrier(
+                recording,
+                record::to_shader_read(
+                    image.clone(),
+                    level_range(&image, 0..mip_levels - 1),
+                    ImageLayout::TransferSrcOptimal,
+                ),
+            );
+        }
+        record::image_barrier(
+            recording,
+            record::to_shader_read(
+                image.clone(),
+                level_range(&image, mip_levels - 1..mip_levels),
+                ImageLayout::TransferDstOptimal,
+            ),
+        );
+    });
 
     ImageView::new_default(image).expect("failed to create texture image view")
 }
