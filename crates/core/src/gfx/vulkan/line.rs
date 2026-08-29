@@ -16,9 +16,9 @@ use crate::scene::DebugLine;
 use super::MSAA_SAMPLES;
 use super::context::VkContext;
 use super::forward::ForwardTargets;
-use super::record::Recorder;
+use super::record::{Arena, Recorder};
 use super::taa::FrameView;
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage};
 use vulkano::image::SampleCount;
 use vulkano::memory::allocator::MemoryTypeFilter;
@@ -51,13 +51,13 @@ pub struct LinePass {
     /// [`ForwardTargets`]: two sample counts, each with and without the
     /// diffusible colour target.
     pipelines: [[Arc<GraphicsPipeline>; 2]; 2],
-    subbuffer_allocator: SubbufferAllocator,
+    subbuffer_allocator: Arena,
 }
 
 impl LinePass {
     /// Build one line pipeline per forward target shape.
     pub fn new(ctx: &VkContext, targets: &ForwardTargets) -> Self {
-        let subbuffer_allocator = SubbufferAllocator::new(
+        let subbuffer_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::VERTEX_BUFFER,
@@ -85,7 +85,7 @@ impl LinePass {
     /// Record this frame's lines into `builder`. Must be called *inside* the
     /// forward render pass, after the scene geometry.
     pub fn record(
-        &mut self,
+        &self,
         builder: &mut Recorder,
         lines: &[DebugLine],
         view: &FrameView,
@@ -115,8 +115,7 @@ impl LinePass {
 
         let buffer = self
             .subbuffer_allocator
-            .allocate_slice::<LineVertex>(vertices.len() as u64)
-            .unwrap();
+            .allocate_slice::<LineVertex>(vertices.len() as u64);
         buffer.write().unwrap().copy_from_slice(&vertices);
 
         // The frame's jittered view-projection, so a line lands on the same

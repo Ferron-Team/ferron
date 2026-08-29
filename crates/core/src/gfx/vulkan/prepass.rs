@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
@@ -39,10 +39,10 @@ use vulkano::pipeline::{
 
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
-use super::VulkanRenderer;
+use super::PassCtx;
 use super::context::VkContext;
 use super::instances::GpuObject;
-use super::record::Recorder;
+use super::record::{Arena, Recorder};
 use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
@@ -124,7 +124,7 @@ pub struct GeometryPrepass {
     /// same mip selection the forward pass uses, so the two rasterisations
     /// cannot disagree about what a surface is.
     sampler: Arc<Sampler>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
 }
 
 impl GeometryPrepass {
@@ -148,7 +148,7 @@ impl GeometryPrepass {
             },
         )
         .unwrap();
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -168,7 +168,7 @@ impl GeometryPrepass {
 
     /// Upload the camera block once for every pass in the frame that reads it.
     pub(super) fn begin_frame(&self, view: &FrameView) -> Subbuffer<FrameUbo> {
-        let frame = self.uniform_allocator.allocate_sized::<FrameUbo>().unwrap();
+        let frame = self.uniform_allocator.allocate_sized::<FrameUbo>();
         *frame.write().unwrap() = FrameUbo {
             view: view.view.to_cols_array_2d(),
             proj: view.proj.to_cols_array_2d(),
@@ -259,7 +259,7 @@ impl GeometryPrepass {
     pub(super) fn record(
         &self,
         builder: &mut Recorder,
-        renderer: &VulkanRenderer,
+        renderer: &PassCtx<'_>,
         draws: DrawList<'_>,
         extent: [u32; 2],
         frame: Subbuffer<FrameUbo>,

@@ -60,7 +60,7 @@ use vulkano::pipeline::{
 
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
-use super::VulkanRenderer;
+use super::PassCtx;
 use super::context::VkContext;
 use super::forward::ForwardSets;
 use super::hdr::HDR_WIDE_FORMAT;
@@ -202,7 +202,7 @@ impl RefractionPass {
     pub(super) fn record(
         &self,
         builder: &mut Recorder,
-        renderer: &VulkanRenderer,
+        renderer: &PassCtx<'_>,
         draws: DrawList<'_>,
         sets: &ForwardSets,
         blur: Arc<ImageView>,

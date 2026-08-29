@@ -30,18 +30,21 @@
 use std::any::Any;
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use vulkano::VulkanObject;
-use vulkano::buffer::{Buffer, BufferContents, IndexBuffer};
+use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::{Buffer, BufferContents, IndexBuffer, Subbuffer};
 use vulkano::command_buffer::{
     BlitImageInfo, ClearAttachment, ClearDepthStencilImageInfo, ClearRect, CommandBuffer,
-    CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, CopyBufferInfo,
-    CopyBufferToImageInfo, CopyImageToBufferInfo, RecordingCommandBuffer, RenderingInfo,
+    CommandBufferBeginInfo, CommandBufferInheritanceInfo, CommandBufferLevel, CommandBufferUsage,
+    CopyBufferInfo, CopyBufferToImageInfo, CopyImageToBufferInfo, RecordingCommandBuffer,
+    RenderingInfo,
 };
 use vulkano::descriptor_set::DescriptorSet;
 use vulkano::image::{Image, ImageLayout, ImageSubresourceRange};
+use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::graphics::vertex_input::VertexBuffersCollection;
 use vulkano::pipeline::graphics::viewport::{Scissor, Viewport};
 use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, PipelineBindPoint, PipelineLayout};
@@ -303,6 +306,45 @@ pub(super) fn emit_plan(
     .expect("invalid barrier in the compiled plan");
 }
 
+/// A pass's own scratch buffer for the frame's uniforms, shareable while the
+/// frame records.
+///
+/// Nothing but a `SubbufferAllocator` behind a lock. It exists because that
+/// type keeps its arena in an `UnsafeCell` and is therefore `!Sync`, and a pass
+/// that holds one directly cannot be recorded from a worker at all — the whole
+/// pass struct stops being shareable. The lock is never contended: a pass
+/// records on one thread, and the passes that share nothing else share no arena
+/// either.
+pub(super) struct Arena(Mutex<SubbufferAllocator>);
+
+impl Arena {
+    pub(super) fn new(
+        memory_allocator: Arc<StandardMemoryAllocator>,
+        create_info: SubbufferAllocatorCreateInfo,
+    ) -> Self {
+        Self(Mutex::new(SubbufferAllocator::new(
+            memory_allocator,
+            create_info,
+        )))
+    }
+
+    pub(super) fn allocate_sized<T: BufferContents>(&self) -> Subbuffer<T> {
+        self.0
+            .lock()
+            .expect("a pass panicked while recording")
+            .allocate_sized()
+            .expect("failed to suballocate a frame uniform")
+    }
+
+    pub(super) fn allocate_slice<T: BufferContents>(&self, len: DeviceSize) -> Subbuffer<[T]> {
+        self.0
+            .lock()
+            .expect("a pass panicked while recording")
+            .allocate_slice(len)
+            .expect("failed to suballocate a frame buffer")
+    }
+}
+
 /// Everything a recorded command named, held until the GPU is done with it.
 ///
 /// Dropping this before the frame's fence signals is a use-after-free the
@@ -315,6 +357,12 @@ impl KeepAlive {
     /// Hold one resource for the frame's lifetime.
     pub(super) fn hold<T: Any + Send + Sync>(&mut self, resource: T) {
         self.0.push(Box::new(resource));
+    }
+
+    /// Take over another recording's obligations, for a secondary buffer whose
+    /// commands are now the primary's to keep alive.
+    pub(super) fn absorb(&mut self, other: KeepAlive) {
+        self.0.extend(other.0);
     }
 }
 
@@ -334,20 +382,60 @@ pub(super) struct Recorder {
 
 impl Recorder {
     pub(super) fn new(ctx: &VkContext) -> Self {
+        Self::begin(ctx, CommandBufferLevel::Primary, None)
+    }
+
+    /// A recording surface for one group of passes, to be executed by the
+    /// primary rather than submitted.
+    ///
+    /// It inherits no render pass, which is what lets the passes inside it open
+    /// and close their own rendering instances exactly as they do in the
+    /// primary — the alternative, inheriting one, would mean a secondary per
+    /// rendering instance and the attachment formats declared twice.
+    pub(super) fn secondary(ctx: &VkContext) -> Self {
+        Self::begin(
+            ctx,
+            CommandBufferLevel::Secondary,
+            Some(CommandBufferInheritanceInfo::default()),
+        )
+    }
+
+    fn begin(
+        ctx: &VkContext,
+        level: CommandBufferLevel,
+        inheritance_info: Option<CommandBufferInheritanceInfo>,
+    ) -> Self {
         let inner = RecordingCommandBuffer::new(
             ctx.command_buffer_allocator.clone(),
             ctx.queue.queue_family_index(),
-            CommandBufferLevel::Primary,
+            level,
             CommandBufferBeginInfo {
                 usage: CommandBufferUsage::OneTimeSubmit,
+                inheritance_info,
                 ..Default::default()
             },
         )
-        .expect("failed to begin the frame's command buffer");
+        .expect("failed to begin a command buffer");
         Self {
             inner,
             keep: KeepAlive::default(),
         }
+    }
+
+    /// Run a finished secondary recording here, in the position this is called.
+    ///
+    /// The buffer and everything it named become this recording's to keep
+    /// alive: the primary is what gets submitted, so its fence is the one that
+    /// says when either may be dropped.
+    pub(super) fn execute(&mut self, secondary: CommandBuffer, keep: KeepAlive) -> &mut Self {
+        // SAFETY: `secondary` was recorded at secondary level against this
+        // device, is executed exactly once — this recording is submitted once —
+        // and inherits no render pass, so no rendering instance is open here.
+        unsafe { self.inner.execute_commands(&[&secondary]) }
+            .expect("invalid secondary command buffer");
+        self.keep.absorb(keep);
+        self.keep.hold(secondary);
+        self
     }
 
     /// Finish recording, handing back the buffer and the resources it named.

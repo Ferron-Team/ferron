@@ -76,9 +76,13 @@ const SLOTS: usize = super::FRAMES_IN_FLIGHT + 1;
 /// also makes query 0 a guaranteed-written origin for the anchor below.
 const WHOLE_FRAME_PASS: &str = "frame";
 
-/// A pass whose opening timestamp has been recorded. Consumed by
-/// [`GpuTimestamps::end_pass`]; dropping one without ending it leaves a query
-/// that never gets written, which the pair guard in `drain_completed` discards.
+/// A query pair reserved for one pass. Dropping one without stamping it leaves
+/// queries that never get written, which the pair guard in `drain_completed`
+/// discards.
+///
+/// Copied rather than consumed because both halves are stamped from it, and the
+/// two may be recorded by different calls on the same worker.
+#[derive(Clone, Copy)]
 pub struct PassToken {
     base: u32,
 }
@@ -206,24 +210,30 @@ impl GpuTimestamps {
         // that has to survive turning per-pass timing off, since comparing the
         // two is the entire point of being able to.
         if crate::profile::is_enabled() {
-            drop(self.stamp(builder, WHOLE_FRAME_PASS));
+            let whole_frame = self.take_pair(WHOLE_FRAME_PASS);
+            self.open(builder, whole_frame);
         }
     }
 
-    /// Stamp the opening timestamp for `name` and reserve its pair.
+    /// Reserve a query pair for `name`, for the pass to stamp when it records.
+    ///
+    /// Reserving and stamping are separate because a pass may record on a
+    /// worker: taking the pair mutates the frame's slot and so belongs to the
+    /// thread that owns the frame, while the two writes are commands like any
+    /// other and go wherever the pass goes.
     ///
     /// `None` when profiling is off, when per-pass timing is off, or when
     /// `MAX_PASSES` is exhausted — so call sites stay `if let Some(..)` and never
     /// test for support themselves.
-    pub fn begin_pass(&mut self, builder: &mut Recorder, name: &'static str) -> Option<PassToken> {
+    pub fn reserve(&mut self, name: &'static str) -> Option<PassToken> {
         if !crate::profile::is_enabled() || !crate::profile::gpu_passes_enabled() {
             return None;
         }
-        self.stamp(builder, name)
+        self.take_pair(name)
     }
 
-    /// The half of [`begin_pass`](Self::begin_pass) past the switches.
-    fn stamp(&mut self, builder: &mut Recorder, name: &'static str) -> Option<PassToken> {
+    /// The half of [`reserve`](Self::reserve) past the switches.
+    fn take_pair(&mut self, name: &'static str) -> Option<PassToken> {
         let slot = &mut self.slots[self.write];
         if slot.passes.len() >= MAX_PASSES {
             debug_assert!(false, "more than {MAX_PASSES} timed passes in one frame");
@@ -233,21 +243,28 @@ impl GpuTimestamps {
         let base = slot.next_query;
         slot.next_query += 2;
         slot.passes.push(RecordedPass { name, base });
-
-        let pool = slot.pool.clone();
-        // SAFETY: `base` was just reserved from this slot's pool, which was reset
-        // this frame and is not in flight.
-        builder.write_timestamp(pool, base, PipelineStage::BottomOfPipe);
         Some(PassToken { base })
     }
 
-    pub fn end_pass(&mut self, builder: &mut Recorder, token: Option<PassToken>) {
+    /// Stamp the opening half of a reserved pair.
+    pub fn open(&self, builder: &mut Recorder, token: Option<PassToken>) {
+        let Some(token) = token else {
+            return;
+        };
+        let pool = self.slots[self.write].pool.clone();
+        // SAFETY: `base` was reserved from this slot's pool, which was reset
+        // this frame and is not in flight.
+        builder.write_timestamp(pool, token.base, PipelineStage::BottomOfPipe);
+    }
+
+    /// Stamp the closing half of a reserved pair.
+    pub fn close(&self, builder: &mut Recorder, token: Option<PassToken>) {
         let Some(token) = token else {
             return;
         };
         let pool = self.slots[self.write].pool.clone();
         // SAFETY: `base + 1` is the closing half of a pair reserved by
-        // `begin_pass` on this slot, reset this frame.
+        // `reserve` on this slot, reset this frame.
         builder.write_timestamp(pool, token.base + 1, PipelineStage::BottomOfPipe);
     }
 
@@ -256,7 +273,7 @@ impl GpuTimestamps {
         // Empty means profiling was off when the frame opened, so nothing was
         // stamped and there is no pair to close.
         if !self.slots[self.write].passes.is_empty() {
-            self.end_pass(builder, Some(PassToken { base: 0 }));
+            self.close(builder, Some(PassToken { base: 0 }));
         }
         self.slots[self.write].state = SlotState::Pending;
         self.write = (self.write + 1) % SLOTS;

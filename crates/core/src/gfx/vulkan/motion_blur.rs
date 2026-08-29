@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
@@ -30,7 +30,7 @@ use vulkano::pipeline::{
 use crate::scene::{Camera, MotionBlurSettings};
 
 use super::context::VkContext;
-use super::record::Recorder;
+use super::record::{Arena, Recorder};
 use super::taa::FrameView;
 
 /// Side of the compute workgroup for every pass here.
@@ -74,7 +74,7 @@ pub struct MotionBlurPass {
     /// describe a surface that is not there, and a tile maximum averaged with
     /// its neighbour is no longer a maximum.
     nearest_clamp: Arc<Sampler>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
     settings: MotionBlurSettings,
     near: f32,
     far: f32,
@@ -116,7 +116,7 @@ impl MotionBlurPass {
         )
         .unwrap();
 
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -151,10 +151,7 @@ impl MotionBlurPass {
     /// derived from the same [`FrameView`], so they cannot disagree about where
     /// the sky went.
     fn uniforms(&self, view: &FrameView) -> vulkano::buffer::Subbuffer<MotionBlurUbo> {
-        let uniforms = self
-            .uniform_allocator
-            .allocate_sized::<MotionBlurUbo>()
-            .unwrap();
+        let uniforms = self.uniform_allocator.allocate_sized::<MotionBlurUbo>();
         *uniforms.write().unwrap() = MotionBlurUbo {
             // Unjittered, so the sky's reprojection agrees with the motion
             // vectors the prepass wrote — those are unjittered too.

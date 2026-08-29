@@ -224,7 +224,13 @@ impl VkContext {
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
-            StandardCommandBufferAllocatorCreateInfo::default(),
+            StandardCommandBufferAllocatorCreateInfo {
+                // The default is zero, and a frame recorded across the pool
+                // takes one secondary per group of passes. One per group per
+                // frame in flight, rounded up to the pool's own reuse block.
+                secondary_buffer_count: 32,
+                ..Default::default()
+            },
         ));
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),

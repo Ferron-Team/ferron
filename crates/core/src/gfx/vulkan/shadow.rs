@@ -31,7 +31,7 @@ use crate::geom::Frustum;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::{DrawList, PositionVertex};
 
-use super::VulkanRenderer;
+use super::PassCtx;
 use super::context::VkContext;
 use super::instances::GpuObject;
 use super::record::{self, Recorder};
@@ -202,7 +202,7 @@ impl ShadowPass {
     pub(super) fn record(
         &self,
         builder: &mut Recorder,
-        renderer: &VulkanRenderer,
+        renderer: &PassCtx<'_>,
         casters: DrawList<'_>,
         view_proj: Mat4,
         object_base: u32,
@@ -247,7 +247,7 @@ impl ShadowPass {
     pub(super) fn record_atlas(
         &self,
         builder: &mut Recorder,
-        renderer: &VulkanRenderer,
+        renderer: &PassCtx<'_>,
         atlas: &ShadowAtlas,
         casters: &[DrawList<'_>],
         bases: &[u32],
@@ -374,7 +374,7 @@ impl ShadowPass {
     fn draw(
         &self,
         builder: &mut Recorder,
-        renderer: &VulkanRenderer,
+        renderer: &PassCtx<'_>,
         casters: DrawList<'_>,
         view_proj: Mat4,
         object_base: u32,

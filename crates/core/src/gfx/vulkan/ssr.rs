@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use glam::Vec3;
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
@@ -35,7 +35,7 @@ use vulkano::pipeline::{
 use crate::scene::SsrSettings;
 
 use super::context::VkContext;
-use super::record::Recorder;
+use super::record::{Arena, Recorder};
 use super::taa::FrameView;
 
 /// Side of the compute workgroup for the trace and the composite.
@@ -117,7 +117,7 @@ pub struct SsrPass {
     /// a cone that grows smoothly with distance would otherwise step between
     /// blurs, and the step would be visible as a ring on a curved surface.
     linear_mip: Arc<Sampler>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
     settings: SsrSettings,
     /// Advanced every frame the pass runs, and what decorrelates the sample
     /// sequence frame to frame. Without it every frame would trace the same ray
@@ -192,7 +192,7 @@ impl SsrPass {
         )
         .unwrap();
 
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -242,7 +242,7 @@ impl SsrPass {
         // put the reconstructed position half a pixel from the depth it came
         // from, and the march would start beside the surface rather than on it.
         let proj = view.proj;
-        let uniforms = self.uniform_allocator.allocate_sized::<SsrUbo>().unwrap();
+        let uniforms = self.uniform_allocator.allocate_sized::<SsrUbo>();
         *uniforms.write().unwrap() = SsrUbo {
             proj: proj.to_cols_array_2d(),
             inv_proj: proj.inverse().to_cols_array_2d(),

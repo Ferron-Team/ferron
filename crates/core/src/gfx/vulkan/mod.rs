@@ -12,6 +12,7 @@ mod instances;
 mod line;
 mod motion_blur;
 mod oit;
+mod parallel;
 mod pipeline_cache;
 mod prepass;
 mod record;
@@ -115,6 +116,7 @@ use super::{DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, Text
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::DebugLine;
+use crate::threads;
 
 /// MSAA sample count for the forward pass. One definition, because the forward
 /// pipeline, its render pass attachments, and the graph's declaration of the
@@ -157,6 +159,19 @@ pub struct ShadowFrame<'a> {
     pub atlas: &'a ShadowAtlas,
     pub punctual_casters: &'a [DrawList<'a>],
     pub settings: &'a ShadowSettings,
+}
+
+/// What a pass body needs of the renderer besides its own state: somewhere to
+/// allocate this frame's descriptor sets, and the meshes a draw list indexes.
+///
+/// Narrower than the `&VulkanRenderer` the passes used to take, because a pass
+/// may record on a worker and the renderer as a whole cannot cross a thread —
+/// it owns the frames in flight and the overlay's futures, and neither of those
+/// is `Send`.
+pub(super) struct PassCtx<'a> {
+    pub(crate) ctx: &'a VkContext,
+    pub(crate) meshes: &'a [GpuMesh],
+    pub(crate) materials: &'a [GpuMaterial],
 }
 
 pub struct VulkanRenderer {
@@ -1286,640 +1301,86 @@ impl VulkanRenderer {
         // finish before what — a pass that needs a different place in the frame
         // gets there by changing its declarations, not by being moved here.
         let extent = self.swapchain.extent;
-        let mut raw_passes = Vec::new();
         let swapchain_view = self.swapchain.image_views[image_index as usize].clone();
-        for index in 0..self.frame.graph.order().len() {
-            let pass_id = self.frame.graph.order()[index];
-            let body = self.frame.bodies[pass_id.index()];
+        // Passes that own their submission, gathered before anything records:
+        // they run on the future after this command buffer rather than inside
+        // it, and the walk below skips them.
+        let raw_passes: Vec<PassBody> = self
+            .frame
+            .graph
+            .order()
+            .iter()
+            .filter(|pass| self.frame.graph.pass_kind(**pass) == PassKind::Raw)
+            .map(|pass| self.frame.bodies[pass.index()])
+            .collect();
 
-            // What this pass needs finished, and the layouts it needs — derived
-            // by `gfx/graph/` from what the passes declared, rather than
-            // inferred from what the commands below happen to touch.
-            builder.barriers(self.frame.graph.barriers_before(index), |id| {
-                self.barrier_target(id, &swapchain_view)
-            });
+        // One query pair per timed pass, reserved here rather than as each pass
+        // records: taking a pair mutates the frame's slot, and a pass may be
+        // recording on a worker.
+        let tokens: Vec<Option<timestamps::PassToken>> = match timestamps.as_mut() {
+            Some(timestamps) => self
+                .frame
+                .graph
+                .order()
+                .iter()
+                .map(|pass| match self.frame.graph.pass_kind(*pass) {
+                    PassKind::Raw => None,
+                    _ => timestamps.reserve(self.frame.graph.pass_name(*pass)),
+                })
+                .collect(),
+            None => vec![None; self.frame.graph.order().len()],
+        };
 
-            let kind = self.frame.graph.pass_kind(pass_id);
-            if kind == PassKind::Raw {
-                // Escape-hatch passes own their submission, so they run on the
-                // future after this command buffer rather than inside it.
-                // `compile` has already established that none of them precedes
-                // an inline pass.
-                raw_passes.push(body);
-                continue;
-            }
-
-            let timed = timestamps.as_mut().and_then(|timestamps| {
-                timestamps.begin_pass(&mut builder, self.frame.graph.pass_name(pass_id))
-            });
-
-            // A dispatch is illegal inside a render pass, so a compute pass is
-            // recorded into the same command buffer with no bracket around it.
-            // That is the only thing the kind changes: ordering and barriers are
-            // derived for it exactly as for a draw.
-            if kind == PassKind::Compute {
-                match body {
-                    PassBody::SsrHiz => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .ssr
-                            .expect("reflections without their images");
-                        let prepass = self
-                            .frame
-                            .ids
-                            .prepass
-                            .expect("the graph scheduled reflections with no prepass");
-                        // One view per level, because a storage image descriptor
-                        // takes exactly one — the sampled view the trace reads
-                        // spans the whole pyramid instead.
-                        let mips: Vec<_> = (0..self.images.mip_levels(ids.hiz))
-                            .map(|level| self.images.mip_view(ids.hiz, level))
-                            .collect();
-                        self.ssr.record_hiz(
-                            &mut builder,
-                            &self.ctx,
-                            self.images.view(prepass.depth),
-                            &mips,
-                            extent,
-                        );
-                    }
-                    PassBody::SsrSource => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .ssr
-                            .expect("reflections without their images");
-                        let mips: Vec<_> = (0..self.images.mip_levels(ids.source_pyramid))
-                            .map(|level| self.images.mip_view(ids.source_pyramid, level))
-                            .collect();
-                        self.ssr.record_source(
-                            &mut builder,
-                            &self.ctx,
-                            self.view_of(ids.source),
-                            &mips,
-                        );
-                    }
-                    PassBody::SsrTrace => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .ssr
-                            .expect("reflections without their images");
-                        let prepass = self
-                            .frame
-                            .ids
-                            .prepass
-                            .expect("the graph scheduled reflections with no prepass");
-                        self.ssr.record_trace(
-                            &mut builder,
-                            &self.ctx,
-                            self.images.view(ids.hiz),
-                            self.images.view(prepass.depth),
-                            self.images.view(prepass.normal),
-                            self.images.view(prepass.material),
-                            self.images.view(ids.source_pyramid),
-                            self.images.view(ids.rays),
-                        );
-                    }
-                    PassBody::SsrResolve => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .ssr
-                            .expect("reflections without their images");
-                        let prepass = self
-                            .frame
-                            .ids
-                            .prepass
-                            .expect("the graph scheduled reflections with no prepass");
-                        self.ssr.record_resolve(
-                            &mut builder,
-                            &self.ctx,
-                            self.view_of(ids.source),
-                            self.images.view(ids.rays),
-                            self.images.view(prepass.depth),
-                            self.images.view(prepass.normal),
-                            self.images.view(prepass.material),
-                            self.environment.specular_view(),
-                            self.environment.sampler(),
-                            self.images.view(ids.output),
-                        );
-                    }
-                    PassBody::FogScatter => {
-                        self.fog
-                            .record_scatter(&mut builder, &self.ctx, shadow_view.clone());
-                    }
-                    PassBody::FogIntegrate => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .fog
-                            .expect("fog passes without their volumes");
-                        self.fog.record_integrate(
-                            &mut builder,
-                            &self.ctx,
-                            self.images.view(ids.volume),
-                        );
-                    }
-                    PassBody::SubsurfaceBlurHorizontal | PassBody::SubsurfaceBlurVertical => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .subsurface
-                            .expect("subsurface diffusion without its targets");
-                        let prepass = self
-                            .frame
-                            .ids
-                            .prepass
-                            .expect("the graph scheduled the diffusion with no prepass");
-                        let vertical = matches!(body, PassBody::SubsurfaceBlurVertical);
-                        // Mirrors what `declare` said each axis reads: the target
-                        // the forward pass resolved, then the other axis's output.
-                        let (source, target) = if vertical {
-                            (ids.blurred_x, ids.blurred_y)
-                        } else {
-                            (ids.diffusible, ids.blurred_x)
-                        };
-                        self.subsurface.record_blur(
-                            &mut builder,
-                            &self.ctx,
-                            self.images.view(source),
-                            self.images.view(prepass.depth),
-                            self.images.view(target),
-                            vertical,
-                        );
-                    }
-                    PassBody::SubsurfaceComposite => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .subsurface
-                            .expect("subsurface diffusion without its targets");
-                        self.subsurface.record_composite(
-                            &mut builder,
-                            &self.ctx,
-                            self.view_of(ids.source),
-                            self.images.view(ids.blurred_y),
-                            self.images.view(ids.output),
-                        );
-                    }
-                    PassBody::OitComposite => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .transparency
-                            .expect("transparency without its targets");
-                        self.oit.record_composite(
-                            &mut builder,
-                            &self.ctx,
-                            self.view_of(ids.source),
-                            self.images.view(ids.accum),
-                            self.images.view(ids.reveal),
-                            self.images.view(ids.output),
-                        );
-                    }
-                    PassBody::RefractionScene => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .refraction
-                            .expect("refraction without its images");
-                        let mips: Vec<_> = (0..self.images.mip_levels(ids.scene))
-                            .map(|level| self.images.mip_view(ids.scene, level))
-                            .collect();
-                        self.refraction.record_pyramid(
-                            &mut builder,
-                            &self.ctx,
-                            self.view_of(ids.source),
-                            &mips,
-                        );
-                    }
-                    PassBody::RefractionComposite => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .refraction
-                            .expect("refraction without its images");
-                        self.refraction.record_composite(
-                            &mut builder,
-                            &self.ctx,
-                            self.view_of(ids.source),
-                            self.images.view(ids.accum),
-                            self.images.view(ids.output),
-                        );
-                    }
-                    PassBody::TaaResolve => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .prepass
-                            .expect("the graph scheduled TAA with no prepass");
-                        let taa = self.frame.ids.taa.expect("TAA without its images");
-                        self.taa.record(
-                            &mut builder,
-                            &self.ctx,
-                            &view,
-                            self.view_of(taa.source),
-                            self.images.view(ids.velocity),
-                            self.images.view(ids.depth),
-                        );
-                    }
-                    PassBody::DofPrefilter => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .dof
-                            .expect("depth of field without its images");
-                        let prepass = self
-                            .frame
-                            .ids
-                            .prepass
-                            .expect("the graph scheduled depth of field with no prepass");
-                        self.dof.record_prefilter(
-                            &mut builder,
-                            &self.ctx,
-                            self.view_of(ids.source),
-                            self.images.view(prepass.depth),
-                            self.images.view(ids.prefiltered),
-                        );
-                    }
-                    PassBody::DofTileMax => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .dof
-                            .expect("depth of field without its images");
-                        self.dof.record_tile_max(
-                            &mut builder,
-                            &self.ctx,
-                            self.images.view(ids.prefiltered),
-                            self.images.view(ids.tile),
-                        );
-                    }
-                    PassBody::DofGather => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .dof
-                            .expect("depth of field without its images");
-                        self.dof.record_gather(
-                            &mut builder,
-                            &self.ctx,
-                            self.images.view(ids.prefiltered),
-                            self.images.view(ids.tile),
-                            self.images.view(ids.near),
-                            self.images.view(ids.far),
-                        );
-                    }
-                    PassBody::DofComposite => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .dof
-                            .expect("depth of field without its images");
-                        let prepass = self
-                            .frame
-                            .ids
-                            .prepass
-                            .expect("the graph scheduled depth of field with no prepass");
-                        self.dof.record_composite(
-                            &mut builder,
-                            &self.ctx,
-                            self.view_of(ids.source),
-                            self.images.view(prepass.depth),
-                            self.images.view(ids.near),
-                            self.images.view(ids.far),
-                            self.images.view(ids.output),
-                        );
-                    }
-                    PassBody::MotionBlurTileMax => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .motion_blur
-                            .expect("motion blur without its images");
-                        let prepass = self
-                            .frame
-                            .ids
-                            .prepass
-                            .expect("the graph scheduled motion blur with no prepass");
-                        self.motion_blur.record_tile_max(
-                            &mut builder,
-                            &self.ctx,
-                            &view,
-                            self.images.view(prepass.velocity),
-                            self.images.view(prepass.depth),
-                            self.images.view(ids.tile),
-                        );
-                    }
-                    PassBody::MotionBlurNeighbourMax => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .motion_blur
-                            .expect("motion blur without its images");
-                        self.motion_blur.record_neighbour_max(
-                            &mut builder,
-                            &self.ctx,
-                            self.images.view(ids.tile),
-                            self.images.view(ids.neighbour),
-                        );
-                    }
-                    PassBody::MotionBlurGather => {
-                        let ids = self
-                            .frame
-                            .ids
-                            .motion_blur
-                            .expect("motion blur without its images");
-                        let prepass = self
-                            .frame
-                            .ids
-                            .prepass
-                            .expect("the graph scheduled motion blur with no prepass");
-                        self.motion_blur.record_gather(
-                            &mut builder,
-                            &self.ctx,
-                            &view,
-                            self.view_of(ids.source),
-                            self.images.view(prepass.velocity),
-                            self.images.view(prepass.depth),
-                            self.images.view(ids.neighbour),
-                            self.images.view(ids.output),
-                        );
-                    }
-                    PassBody::LuminanceHistogram => self.exposure.record_histogram(
-                        &mut builder,
-                        &self.ctx,
-                        extent,
-                        scene_color.clone(),
-                    ),
-                    PassBody::LuminanceAverage => {
-                        self.exposure
-                            .record_average(&mut builder, &self.ctx, extent)
-                    }
-                    PassBody::BloomPrefilter => {
-                        let ids = self.frame.ids.bloom.expect("bloom pass without levels");
-                        self.bloom.record_prefilter(
-                            &mut builder,
-                            &self.ctx,
-                            scene_color.clone(),
-                            self.images.view(ids.down(0)),
-                            self.exposure.exposure_buffer(),
-                        );
-                    }
-                    PassBody::BloomDownsample(level) => {
-                        let ids = self.frame.ids.bloom.expect("bloom pass without levels");
-                        let level = level as usize;
-                        self.bloom.record_downsample(
-                            &mut builder,
-                            &self.ctx,
-                            self.images.view(ids.down(level - 1)),
-                            self.images.view(ids.down(level)),
-                        );
-                    }
-                    PassBody::BloomUpsample(level) => {
-                        let ids = self.frame.ids.bloom.expect("bloom pass without levels");
-                        let level = level as usize;
-                        // Mirrors what `declare` said this pass reads: an
-                        // up-chain level where there is one above, and the down
-                        // chain's last level at the top of the climb.
-                        let coarse = if level + 2 < ids.mips as usize {
-                            ids.up(level + 1)
-                        } else {
-                            ids.down(level + 1)
-                        };
-                        self.bloom.record_upsample(
-                            &mut builder,
-                            &self.ctx,
-                            self.images.view(coarse),
-                            self.images.view(ids.down(level)),
-                            self.images.view(ids.up(level)),
-                        );
-                    }
-                    other => unreachable!("{other:?} is not a compute pass"),
-                }
-                if let Some(timestamps) = timestamps.as_mut() {
-                    timestamps.end_pass(&mut builder, timed);
-                }
-                continue;
-            }
-
-            // Attachments, load and store ops and clears together, decided
-            // here rather than split between a framebuffer built at allocation
-            // time and a positional clear list that had to match its order.
-            let rendering = rendering::rendering_info(
-                &self.frame.ids,
-                &self.images,
-                &self.swapchain.image_views[image_index as usize],
-                body,
-                environment.background,
-            )
-            .expect("the executor reached a graphics pass with nothing to render into");
-            builder.begin_rendering(rendering);
-
-            match body {
-                PassBody::ShadowCascade(cascade) => {
-                    let shadows = shadows.expect("the graph scheduled a cascade with no shadows");
-                    let cascade_index = cascade as usize;
-                    self.shadow.record(
-                        &mut builder,
-                        self,
-                        shadows.casters[cascade_index],
-                        shadows.cascades.cascades[cascade_index].view_proj,
-                        objects.cascade_bases[cascade_index],
-                        self.config.shadow_resolution,
-                        caster_sets
-                            .as_ref()
-                            .expect("the graph scheduled a cascade with no shadows"),
-                    );
-                }
-                PassBody::PunctualShadows => {
-                    let shadows =
-                        shadows.expect("the graph scheduled the atlas with no shadow frame");
-                    self.shadow.record_atlas(
-                        &mut builder,
-                        self,
-                        shadows.atlas,
-                        shadows.punctual_casters,
-                        &objects.punctual_bases,
-                        caster_sets
-                            .as_ref()
-                            .expect("the graph scheduled the atlas with no shadow frame"),
-                    );
-                }
-                PassBody::GeometryPrepass => self.prepass.record(
-                    &mut builder,
-                    self,
-                    draws,
-                    extent,
-                    frame_uniforms.clone().unwrap(),
-                    decal_block.clone(),
-                    prepass_object_set.clone().unwrap(),
-                    prepass_material_set.clone(),
-                    prepass_texture_set.clone(),
-                ),
-                // Both AO passes take their viewport from the target they draw
-                // into rather than from the frame, because that target is the
-                // one thing here that is not always the frame's size. They still
-                // sample the prepass at full res: the resolve reads depth and
-                // normals by UV, and picking one of four texels is what makes
-                // the half-res version cheaper.
-                PassBody::SsaoResolve => {
-                    let prepass = self.frame.ids.prepass.unwrap();
-                    let ids = self.frame.ids.ssao.unwrap();
-                    self.ssao.record_ao(
-                        &mut builder,
-                        self,
-                        self.images.extent(ids.raw_ao),
-                        ssao_uniforms.as_ref().unwrap(),
-                        self.images.view(prepass.depth),
-                        self.images.view(prepass.normal),
-                    );
-                }
-                PassBody::SsaoBlur => {
-                    let ids = self.frame.ids.ssao.unwrap();
-                    let prepass = self.frame.ids.prepass.unwrap();
-                    self.ssao.record_blur(
-                        &mut builder,
-                        self,
-                        self.images.extent(ids.ao),
-                        self.images.view(ids.raw_ao),
-                        self.images.view(prepass.depth),
-                        ssao_uniforms.as_ref().unwrap(),
-                    );
-                }
-                PassBody::ContactShadows => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled contact shadows with no prepass");
-                    self.contact_shadows.record(
-                        &mut builder,
-                        self,
-                        extent,
-                        contact_shadow_uniforms
-                            .as_ref()
-                            .expect("contact shadows without their uniforms"),
-                        self.images.view(ids.depth),
-                        self.images.view(ids.normal),
-                    );
-                }
-                PassBody::Forward => {
-                    // One question, asked once: the graph decided which render
-                    // pass this frame opens, so the pipeline every draw inside it
-                    // binds follows from the same answer.
-                    let subsurface = self.frame.ids.subsurface.is_some();
-                    let msaa = self.frame.ids.msaa.is_some();
-                    self.forward.draw(
-                        &mut builder,
-                        self,
-                        draws,
-                        &view,
-                        extent,
-                        &forward_sets,
-                        subsurface,
-                        msaa,
-                    );
-                    // Between the geometry and the lines, and it has to be:
-                    // after the geometry so the depth test rejects the sky
-                    // wherever something was drawn, and before the lines
-                    // because the sky passes its own test at the depth clear
-                    // and would otherwise paint over them.
-                    self.environment.record_skybox(
-                        &mut builder,
-                        &self.ctx,
-                        &view,
-                        extent,
-                        environment,
-                        subsurface,
-                        msaa,
-                        self.fog.uniforms(),
-                        self.fog.volume_or_fallback(
-                            self.frame.ids.fog.map(|ids| self.images.view(ids.volume)),
-                        ),
-                        self.fog.sampler(),
-                    );
-                    // Debug lines share the forward subpass: depth-tested against
-                    // the scene, drawn on top of it, before the pass ends.
-                    self.line
-                        .record(&mut builder, debug_lines, &view, extent, subsurface, msaa);
-                }
-                PassBody::OitAccumulate => self.oit.record(
-                    &mut builder,
-                    self,
-                    transparent,
-                    &forward_sets,
-                    &view,
-                    extent,
-                    objects.transparent_base,
-                ),
-                PassBody::RefractionDraw => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .refraction
-                        .expect("refraction without its images");
-                    self.refraction.record(
-                        &mut builder,
-                        self,
-                        refractive,
-                        &forward_sets,
-                        self.images.view(ids.scene),
-                        self.view_of(ids.source),
-                        &view,
-                        extent,
-                        objects.refractive_base,
-                    );
-                }
-                PassBody::Tonemap => self.hdr.record_tonemap(
-                    &mut builder,
-                    &self.ctx,
-                    extent,
-                    scene_color.clone(),
-                    self.exposure.exposure_buffer(),
-                    // With bloom off the graph has no chain, so the tonemap
-                    // pass samples a 1x1 black view at a zero strength: "no
-                    // bloom" with no second shader path.
-                    match self.frame.ids.bloom {
-                        Some(ids) => self.images.view(ids.result()),
-                        None => self.bloom.black_view(),
-                    },
-                ),
-                PassBody::Overlay
-                | PassBody::SsrHiz
-                | PassBody::SsrSource
-                | PassBody::SsrTrace
-                | PassBody::SsrResolve
-                | PassBody::FogScatter
-                | PassBody::FogIntegrate
-                | PassBody::SubsurfaceBlurHorizontal
-                | PassBody::SubsurfaceBlurVertical
-                | PassBody::SubsurfaceComposite
-                | PassBody::OitComposite
-                | PassBody::RefractionScene
-                | PassBody::RefractionComposite
-                | PassBody::TaaResolve
-                | PassBody::DofPrefilter
-                | PassBody::DofTileMax
-                | PassBody::DofGather
-                | PassBody::DofComposite
-                | PassBody::MotionBlurTileMax
-                | PassBody::MotionBlurNeighbourMax
-                | PassBody::MotionBlurGather
-                | PassBody::LuminanceHistogram
-                | PassBody::LuminanceAverage
-                | PassBody::BloomPrefilter
-                | PassBody::BloomDownsample(_)
-                | PassBody::BloomUpsample(_) => unreachable!("handled above"),
-            }
-
-            builder.end_rendering();
-            if let Some(timestamps) = timestamps.as_mut() {
-                timestamps.end_pass(&mut builder, timed);
-            }
+        FrameRecord {
+            ctx: &self.ctx,
+            meshes: &self.meshes,
+            materials: &self.materials,
+            frame: &self.frame,
+            images: &self.images,
+            swapchain_view: swapchain_view.clone(),
+            shadow_resolution: self.config.shadow_resolution,
+            extent,
+            timestamps: timestamps.as_ref(),
+            tokens: &tokens,
+            bloom: &self.bloom,
+            contact_shadows: &self.contact_shadows,
+            dof: &self.dof,
+            environment: &self.environment,
+            exposure: &self.exposure,
+            fog: &self.fog,
+            forward: &self.forward,
+            hdr: &self.hdr,
+            line: &self.line,
+            motion_blur: &self.motion_blur,
+            oit: &self.oit,
+            prepass: &self.prepass,
+            refraction: &self.refraction,
+            shadow: &self.shadow,
+            ssao: &self.ssao,
+            ssr: &self.ssr,
+            subsurface: &self.subsurface,
+            taa: &self.taa,
+            view,
+            env: environment,
+            draws,
+            transparent,
+            refractive,
+            shadows,
+            objects,
+            caster_sets,
+            forward_sets,
+            frame_uniforms,
+            ssao_uniforms,
+            contact_shadow_uniforms,
+            prepass_object_set,
+            prepass_material_set,
+            prepass_texture_set,
+            decal_block,
+            scene_color,
+            shadow_view,
+            debug_lines,
         }
+        .record_frame(&mut builder);
 
         // Leave every import in the layout its owner expects — for the
         // swapchain image, the `PresentSrc` the presentation engine requires.
@@ -2091,6 +1552,860 @@ impl VulkanRenderer {
         }
 
         drop(submitting);
+    }
+}
+
+/// Everything one frame records from, in a shape a worker can hold.
+///
+/// The passes' own state, the compiled schedule, and what this frame resolved
+/// before recording opened: the jittered view, the draw orders, the descriptor
+/// sets built once and bound by several passes. All of it shared — the pass
+/// bodies record through `&self`, which is what lets a run of them go to a
+/// worker while the main thread records another.
+///
+/// Not a `&VulkanRenderer` for the reason [`PassCtx`] is not: the renderer owns
+/// the frames in flight and the overlay's futures, neither of which may cross a
+/// thread. What is here is the subset that may.
+struct FrameRecord<'a> {
+    ctx: &'a VkContext,
+    meshes: &'a [GpuMesh],
+    materials: &'a [GpuMaterial],
+    frame: &'a Frame,
+    images: &'a GraphImages,
+    swapchain_view: Arc<ImageView>,
+    shadow_resolution: u32,
+    extent: [u32; 2],
+    /// `None` when the device cannot time passes, or when profiling is off. The
+    /// pairs in `tokens` were reserved before any of this recorded.
+    timestamps: Option<&'a GpuTimestamps>,
+    /// One entry per slot in the compiled order, `None` for a pass this frame
+    /// does not time.
+    tokens: &'a [Option<timestamps::PassToken>],
+    bloom: &'a BloomPass,
+    contact_shadows: &'a ContactShadowPass,
+    dof: &'a DofPass,
+    environment: &'a EnvironmentPass,
+    exposure: &'a ExposurePass,
+    fog: &'a FogPass,
+    forward: &'a ForwardPass,
+    hdr: &'a HdrPass,
+    line: &'a LinePass,
+    motion_blur: &'a MotionBlurPass,
+    oit: &'a OitPass,
+    prepass: &'a GeometryPrepass,
+    refraction: &'a RefractionPass,
+    shadow: &'a ShadowPass,
+    ssao: &'a SsaoPass,
+    ssr: &'a SsrPass,
+    subsurface: &'a SubsurfacePass,
+    taa: &'a TaaPass,
+    view: taa::FrameView,
+    /// The environment *settings*; `environment` above is the pass that draws
+    /// them.
+    env: &'a EnvironmentSettings,
+    draws: DrawList<'a>,
+    transparent: DrawList<'a>,
+    refractive: DrawList<'a>,
+    shadows: Option<ShadowFrame<'a>>,
+    objects: instances::InstanceLists,
+    caster_sets: Option<shadow::CasterSets>,
+    forward_sets: forward::ForwardSets,
+    frame_uniforms: Option<vulkano::buffer::Subbuffer<prepass::FrameUbo>>,
+    ssao_uniforms: Option<ssao::SsaoUniforms>,
+    contact_shadow_uniforms: Option<contact_shadows::ContactShadowUniforms>,
+    prepass_object_set: Option<Arc<DescriptorSet>>,
+    prepass_material_set: Arc<DescriptorSet>,
+    prepass_texture_set: Arc<DescriptorSet>,
+    decal_block: vulkano::buffer::Subbuffer<forward::GpuDecals>,
+    scene_color: Arc<ImageView>,
+    shadow_view: Arc<ImageView>,
+    debug_lines: &'a [DebugLine],
+}
+
+/// How many command buffers one frame's recording is worth splitting into.
+///
+/// The partition has little left to give beyond this: the punctual shadow atlas
+/// alone is around 40% of what a frame costs to record, so it is the floor on
+/// the critical path however many workers there are, and every extra group
+/// costs a secondary command buffer to begin, end and execute.
+const RECORD_GROUPS: usize = 3;
+
+impl FrameRecord<'_> {
+    /// Record the whole frame into `builder`, in the order the compiler derived.
+    ///
+    /// Serially, or — where the pool has threads to spare — into one secondary
+    /// command buffer per contiguous run of passes, executed by `builder` in
+    /// that same order. The GPU is handed the same stream either way: a run
+    /// carries the barriers the plan puts in front of its own passes, and
+    /// nothing about a pass's recording depends on which buffer it lands in.
+    fn record_frame(&self, builder: &mut Recorder) {
+        let slots = self.frame.graph.order().len();
+        let groups = threads::count().min(RECORD_GROUPS);
+        if groups < 2 || slots < 2 {
+            for slot in 0..slots {
+                self.record_slot(builder, slot);
+            }
+            return;
+        }
+
+        let costs: Vec<u32> = (0..slots).map(|slot| self.cost(slot)).collect();
+        let runs = parallel::partition(&costs, groups);
+        let recorded = threads::map(&runs, |run| {
+            let mut secondary = Recorder::secondary(self.ctx);
+            for slot in run.clone() {
+                self.record_slot(&mut secondary, slot);
+            }
+            secondary.end()
+        });
+        for (commands, keep) in recorded {
+            builder.execute(commands, keep);
+        }
+    }
+
+    /// What the pass in `slot` costs to record, near enough to balance the runs
+    /// against each other: the draws it will emit.
+    ///
+    /// Everything not drawing geometry is a handful of commands whatever it
+    /// dispatches over, and scores zero — which
+    /// [`partition`](parallel::partition) floors at one, so a run of them still
+    /// spreads.
+    fn cost(&self, slot: usize) -> u32 {
+        let pass_id = self.frame.graph.order()[slot];
+        match self.frame.bodies[pass_id.index()] {
+            PassBody::ShadowCascade(cascade) => self
+                .shadows
+                .map_or(0, |shadows| shadows.casters[cascade as usize].len() as u32),
+            // Each caster is drawn once per face of its light, which is what
+            // makes this one pass the frame's most expensive to record.
+            PassBody::PunctualShadows => self.shadows.map_or(0, |shadows| {
+                shadows
+                    .atlas
+                    .casters
+                    .iter()
+                    .zip(shadows.punctual_casters)
+                    .map(|(caster, list)| list.len() as u32 * caster.face_count as u32)
+                    .sum()
+            }),
+            PassBody::GeometryPrepass | PassBody::Forward => self.draws.len() as u32,
+            PassBody::OitAccumulate => self.transparent.len() as u32,
+            PassBody::RefractionDraw => self.refractive.len() as u32,
+            _ => 0,
+        }
+    }
+
+    /// What a pass body gets of the renderer besides its own state.
+    fn pass_ctx(&self) -> PassCtx<'_> {
+        PassCtx {
+            ctx: self.ctx,
+            meshes: self.meshes,
+            materials: self.materials,
+        }
+    }
+
+    /// The view backing a graph resource, whoever owns the allocation.
+    ///
+    /// Every image in a frame is graph-owned but two: the TAA resolve's output
+    /// and the fog's scattering volume are *imported*, because a history has to
+    /// survive a frame boundary and a transient by contract does not. Anything
+    /// downstream that reads the frame's colour can be handed either, depending
+    /// on which optical stages the frame has — so it asks by `ResourceId` and
+    /// this decides, rather than each consumer re-deriving which pass ran last.
+    fn view_of(&self, id: ResourceId) -> Arc<ImageView> {
+        if let Some(fog) = self.frame.ids.fog
+            && id == fog.scatter
+        {
+            return self.fog.scatter_view();
+        }
+        match self.frame.ids.taa {
+            Some(taa) if id == taa.output => self.taa.output_view(),
+            _ => self.images.view(id),
+        }
+    }
+
+    /// Which Vulkan object one resource in the compiled plan names.
+    ///
+    /// The graph is device-free, so it tracks `ResourceId`s and leaves this to
+    /// the renderer: graph-owned images, images imported from the pass that owns
+    /// them across a frame boundary, the swapchain image, and buffers.
+    fn barrier_target(&self, id: ResourceId) -> Option<record::Target> {
+        let ids = &self.frame.ids;
+
+        if id == ids.swapchain_color {
+            return Some(record::Target::Image(self.swapchain_view.image().clone()));
+        }
+        // The imported buffers. See `record::Target::Memory` for why these do
+        // not need resolving to their `Subbuffer`s.
+        if id == ids.object_transforms
+            || id == ids.instance_index
+            || id == ids.exposure
+            || Some(id) == ids.histogram
+        {
+            return Some(record::Target::Memory);
+        }
+        // Imported images: a history has to survive a frame boundary, and a
+        // transient by contract does not, so the pass that ping-pongs it owns
+        // the allocation.
+        if let Some(fog) = ids.fog
+            && id == fog.scatter
+        {
+            return Some(record::Target::Image(
+                self.fog.scatter_view().image().clone(),
+            ));
+        }
+        if let Some(taa) = ids.taa {
+            if id == taa.output {
+                return Some(record::Target::Image(
+                    self.taa.output_view().image().clone(),
+                ));
+            }
+            if id == taa.history {
+                return Some(record::Target::Image(
+                    self.taa.history_view().image().clone(),
+                ));
+            }
+        }
+
+        self.images
+            .try_view(id)
+            .map(|view| record::Target::Image(view.image().clone()))
+    }
+
+    /// Record the pass the compiled order puts in `slot`, and the barriers the
+    /// plan puts in front of it.
+    fn record_slot(&self, builder: &mut Recorder, slot: usize) {
+        let pass_id = self.frame.graph.order()[slot];
+        let body = self.frame.bodies[pass_id.index()];
+
+        // What this pass needs finished, and the layouts it needs — derived
+        // by `gfx/graph/` from what the passes declared, rather than
+        // inferred from what the commands below happen to touch.
+        builder.barriers(self.frame.graph.barriers_before(slot), |id| {
+            self.barrier_target(id)
+        });
+
+        let kind = self.frame.graph.pass_kind(pass_id);
+        if kind == PassKind::Raw {
+            // Escape-hatch passes own their submission, so they run on the
+            // future after this command buffer rather than inside it —
+            // `raw_passes` collected them before any of this recorded.
+            // `compile` has already established that none of them precedes
+            // an inline pass.
+            return;
+        }
+
+        let timed = self.tokens[slot];
+        if let Some(timestamps) = self.timestamps {
+            timestamps.open(builder, timed);
+        }
+
+        // A dispatch is illegal inside a render pass, so a compute pass is
+        // recorded into the same command buffer with no bracket around it.
+        // That is the only thing the kind changes: ordering and barriers are
+        // derived for it exactly as for a draw.
+        if kind == PassKind::Compute {
+            match body {
+                PassBody::SsrHiz => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .ssr
+                        .expect("reflections without their images");
+                    let prepass = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled reflections with no prepass");
+                    // One self.view per level, because a storage image descriptor
+                    // takes exactly one — the sampled self.view the trace reads
+                    // spans the whole pyramid instead.
+                    let mips: Vec<_> = (0..self.images.mip_levels(ids.hiz))
+                        .map(|level| self.images.mip_view(ids.hiz, level))
+                        .collect();
+                    self.ssr.record_hiz(
+                        builder,
+                        &self.ctx,
+                        self.images.view(prepass.depth),
+                        &mips,
+                        self.extent,
+                    );
+                }
+                PassBody::SsrSource => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .ssr
+                        .expect("reflections without their images");
+                    let mips: Vec<_> = (0..self.images.mip_levels(ids.source_pyramid))
+                        .map(|level| self.images.mip_view(ids.source_pyramid, level))
+                        .collect();
+                    self.ssr
+                        .record_source(builder, &self.ctx, self.view_of(ids.source), &mips);
+                }
+                PassBody::SsrTrace => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .ssr
+                        .expect("reflections without their images");
+                    let prepass = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled reflections with no prepass");
+                    self.ssr.record_trace(
+                        builder,
+                        &self.ctx,
+                        self.images.view(ids.hiz),
+                        self.images.view(prepass.depth),
+                        self.images.view(prepass.normal),
+                        self.images.view(prepass.material),
+                        self.images.view(ids.source_pyramid),
+                        self.images.view(ids.rays),
+                    );
+                }
+                PassBody::SsrResolve => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .ssr
+                        .expect("reflections without their images");
+                    let prepass = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled reflections with no prepass");
+                    self.ssr.record_resolve(
+                        builder,
+                        &self.ctx,
+                        self.view_of(ids.source),
+                        self.images.view(ids.rays),
+                        self.images.view(prepass.depth),
+                        self.images.view(prepass.normal),
+                        self.images.view(prepass.material),
+                        self.environment.specular_view(),
+                        self.environment.sampler(),
+                        self.images.view(ids.output),
+                    );
+                }
+                PassBody::FogScatter => {
+                    self.fog
+                        .record_scatter(builder, &self.ctx, self.shadow_view.clone());
+                }
+                PassBody::FogIntegrate => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .fog
+                        .expect("fog passes without their volumes");
+                    self.fog
+                        .record_integrate(builder, &self.ctx, self.images.view(ids.volume));
+                }
+                PassBody::SubsurfaceBlurHorizontal | PassBody::SubsurfaceBlurVertical => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .subsurface
+                        .expect("subsurface diffusion without its targets");
+                    let prepass = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled the diffusion with no prepass");
+                    let vertical = matches!(body, PassBody::SubsurfaceBlurVertical);
+                    // Mirrors what `declare` said each axis reads: the target
+                    // the forward pass resolved, then the other axis's output.
+                    let (source, target) = if vertical {
+                        (ids.blurred_x, ids.blurred_y)
+                    } else {
+                        (ids.diffusible, ids.blurred_x)
+                    };
+                    self.subsurface.record_blur(
+                        builder,
+                        &self.ctx,
+                        self.images.view(source),
+                        self.images.view(prepass.depth),
+                        self.images.view(target),
+                        vertical,
+                    );
+                }
+                PassBody::SubsurfaceComposite => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .subsurface
+                        .expect("subsurface diffusion without its targets");
+                    self.subsurface.record_composite(
+                        builder,
+                        &self.ctx,
+                        self.view_of(ids.source),
+                        self.images.view(ids.blurred_y),
+                        self.images.view(ids.output),
+                    );
+                }
+                PassBody::OitComposite => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .transparency
+                        .expect("transparency without its targets");
+                    self.oit.record_composite(
+                        builder,
+                        &self.ctx,
+                        self.view_of(ids.source),
+                        self.images.view(ids.accum),
+                        self.images.view(ids.reveal),
+                        self.images.view(ids.output),
+                    );
+                }
+                PassBody::RefractionScene => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .refraction
+                        .expect("refraction without its images");
+                    let mips: Vec<_> = (0..self.images.mip_levels(ids.scene))
+                        .map(|level| self.images.mip_view(ids.scene, level))
+                        .collect();
+                    self.refraction.record_pyramid(
+                        builder,
+                        &self.ctx,
+                        self.view_of(ids.source),
+                        &mips,
+                    );
+                }
+                PassBody::RefractionComposite => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .refraction
+                        .expect("refraction without its images");
+                    self.refraction.record_composite(
+                        builder,
+                        &self.ctx,
+                        self.view_of(ids.source),
+                        self.images.view(ids.accum),
+                        self.images.view(ids.output),
+                    );
+                }
+                PassBody::TaaResolve => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled TAA with no prepass");
+                    let taa = self.frame.ids.taa.expect("TAA without its images");
+                    self.taa.record(
+                        builder,
+                        &self.ctx,
+                        &self.view,
+                        self.view_of(taa.source),
+                        self.images.view(ids.velocity),
+                        self.images.view(ids.depth),
+                    );
+                }
+                PassBody::DofPrefilter => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .dof
+                        .expect("depth of field without its images");
+                    let prepass = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled depth of field with no prepass");
+                    self.dof.record_prefilter(
+                        builder,
+                        &self.ctx,
+                        self.view_of(ids.source),
+                        self.images.view(prepass.depth),
+                        self.images.view(ids.prefiltered),
+                    );
+                }
+                PassBody::DofTileMax => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .dof
+                        .expect("depth of field without its images");
+                    self.dof.record_tile_max(
+                        builder,
+                        &self.ctx,
+                        self.images.view(ids.prefiltered),
+                        self.images.view(ids.tile),
+                    );
+                }
+                PassBody::DofGather => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .dof
+                        .expect("depth of field without its images");
+                    self.dof.record_gather(
+                        builder,
+                        &self.ctx,
+                        self.images.view(ids.prefiltered),
+                        self.images.view(ids.tile),
+                        self.images.view(ids.near),
+                        self.images.view(ids.far),
+                    );
+                }
+                PassBody::DofComposite => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .dof
+                        .expect("depth of field without its images");
+                    let prepass = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled depth of field with no prepass");
+                    self.dof.record_composite(
+                        builder,
+                        &self.ctx,
+                        self.view_of(ids.source),
+                        self.images.view(prepass.depth),
+                        self.images.view(ids.near),
+                        self.images.view(ids.far),
+                        self.images.view(ids.output),
+                    );
+                }
+                PassBody::MotionBlurTileMax => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .motion_blur
+                        .expect("motion blur without its images");
+                    let prepass = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled motion blur with no prepass");
+                    self.motion_blur.record_tile_max(
+                        builder,
+                        &self.ctx,
+                        &self.view,
+                        self.images.view(prepass.velocity),
+                        self.images.view(prepass.depth),
+                        self.images.view(ids.tile),
+                    );
+                }
+                PassBody::MotionBlurNeighbourMax => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .motion_blur
+                        .expect("motion blur without its images");
+                    self.motion_blur.record_neighbour_max(
+                        builder,
+                        &self.ctx,
+                        self.images.view(ids.tile),
+                        self.images.view(ids.neighbour),
+                    );
+                }
+                PassBody::MotionBlurGather => {
+                    let ids = self
+                        .frame
+                        .ids
+                        .motion_blur
+                        .expect("motion blur without its images");
+                    let prepass = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled motion blur with no prepass");
+                    self.motion_blur.record_gather(
+                        builder,
+                        &self.ctx,
+                        &self.view,
+                        self.view_of(ids.source),
+                        self.images.view(prepass.velocity),
+                        self.images.view(prepass.depth),
+                        self.images.view(ids.neighbour),
+                        self.images.view(ids.output),
+                    );
+                }
+                PassBody::LuminanceHistogram => self.exposure.record_histogram(
+                    builder,
+                    &self.ctx,
+                    self.extent,
+                    self.scene_color.clone(),
+                ),
+                PassBody::LuminanceAverage => {
+                    self.exposure
+                        .record_average(builder, &self.ctx, self.extent)
+                }
+                PassBody::BloomPrefilter => {
+                    let ids = self.frame.ids.bloom.expect("bloom pass without levels");
+                    self.bloom.record_prefilter(
+                        builder,
+                        &self.ctx,
+                        self.scene_color.clone(),
+                        self.images.view(ids.down(0)),
+                        self.exposure.exposure_buffer(),
+                    );
+                }
+                PassBody::BloomDownsample(level) => {
+                    let ids = self.frame.ids.bloom.expect("bloom pass without levels");
+                    let level = level as usize;
+                    self.bloom.record_downsample(
+                        builder,
+                        &self.ctx,
+                        self.images.view(ids.down(level - 1)),
+                        self.images.view(ids.down(level)),
+                    );
+                }
+                PassBody::BloomUpsample(level) => {
+                    let ids = self.frame.ids.bloom.expect("bloom pass without levels");
+                    let level = level as usize;
+                    // Mirrors what `declare` said this pass reads: an
+                    // up-chain level where there is one above, and the down
+                    // chain's last level at the top of the climb.
+                    let coarse = if level + 2 < ids.mips as usize {
+                        ids.up(level + 1)
+                    } else {
+                        ids.down(level + 1)
+                    };
+                    self.bloom.record_upsample(
+                        builder,
+                        &self.ctx,
+                        self.images.view(coarse),
+                        self.images.view(ids.down(level)),
+                        self.images.view(ids.up(level)),
+                    );
+                }
+                other => unreachable!("{other:?} is not a compute pass"),
+            }
+            if let Some(timestamps) = self.timestamps {
+                timestamps.close(builder, timed);
+            }
+            return;
+        }
+
+        // Attachments, load and store ops and clears together, decided
+        // here rather than split between a framebuffer built at allocation
+        // time and a positional clear list that had to match its order.
+        let rendering = rendering::rendering_info(
+            &self.frame.ids,
+            &self.images,
+            &self.swapchain_view,
+            body,
+            self.env.background,
+        )
+        .expect("the executor reached a graphics pass with nothing to render into");
+        builder.begin_rendering(rendering);
+
+        match body {
+            PassBody::ShadowCascade(cascade) => {
+                let shadows = self
+                    .shadows
+                    .expect("the graph scheduled a cascade with no shadows");
+                let cascade_index = cascade as usize;
+                self.shadow.record(
+                    builder,
+                    &self.pass_ctx(),
+                    shadows.casters[cascade_index],
+                    shadows.cascades.cascades[cascade_index].view_proj,
+                    self.objects.cascade_bases[cascade_index],
+                    self.shadow_resolution,
+                    self.caster_sets
+                        .as_ref()
+                        .expect("the graph scheduled a cascade with no shadows"),
+                );
+            }
+            PassBody::PunctualShadows => {
+                let shadows = self
+                    .shadows
+                    .expect("the graph scheduled the atlas with no shadow frame");
+                self.shadow.record_atlas(
+                    builder,
+                    &self.pass_ctx(),
+                    shadows.atlas,
+                    shadows.punctual_casters,
+                    &self.objects.punctual_bases,
+                    self.caster_sets
+                        .as_ref()
+                        .expect("the graph scheduled the atlas with no shadow frame"),
+                );
+            }
+            PassBody::GeometryPrepass => self.prepass.record(
+                builder,
+                &self.pass_ctx(),
+                self.draws,
+                self.extent,
+                self.frame_uniforms.clone().unwrap(),
+                self.decal_block.clone(),
+                self.prepass_object_set.clone().unwrap(),
+                self.prepass_material_set.clone(),
+                self.prepass_texture_set.clone(),
+            ),
+            // Both AO passes take their viewport from the target they draw
+            // into rather than from the frame, because that target is the
+            // one thing here that is not always the frame's size. They still
+            // sample the prepass at full res: the resolve reads depth and
+            // normals by UV, and picking one of four texels is what makes
+            // the half-res version cheaper.
+            PassBody::SsaoResolve => {
+                let prepass = self.frame.ids.prepass.unwrap();
+                let ids = self.frame.ids.ssao.unwrap();
+                self.ssao.record_ao(
+                    builder,
+                    &self.pass_ctx(),
+                    self.images.extent(ids.raw_ao),
+                    self.ssao_uniforms.as_ref().unwrap(),
+                    self.images.view(prepass.depth),
+                    self.images.view(prepass.normal),
+                );
+            }
+            PassBody::SsaoBlur => {
+                let ids = self.frame.ids.ssao.unwrap();
+                let prepass = self.frame.ids.prepass.unwrap();
+                self.ssao.record_blur(
+                    builder,
+                    &self.pass_ctx(),
+                    self.images.extent(ids.ao),
+                    self.images.view(ids.raw_ao),
+                    self.images.view(prepass.depth),
+                    self.ssao_uniforms.as_ref().unwrap(),
+                );
+            }
+            PassBody::ContactShadows => {
+                let ids = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled contact shadows with no prepass");
+                self.contact_shadows.record(
+                    builder,
+                    &self.pass_ctx(),
+                    self.extent,
+                    self.contact_shadow_uniforms
+                        .as_ref()
+                        .expect("contact shadows without their uniforms"),
+                    self.images.view(ids.depth),
+                    self.images.view(ids.normal),
+                );
+            }
+            PassBody::Forward => {
+                // One question, asked once: the graph decided which render
+                // pass this frame opens, so the pipeline every draw inside it
+                // binds follows from the same answer.
+                let subsurface = self.frame.ids.subsurface.is_some();
+                let msaa = self.frame.ids.msaa.is_some();
+                self.forward.draw(
+                    builder,
+                    &self.pass_ctx(),
+                    self.draws,
+                    &self.view,
+                    self.extent,
+                    &self.forward_sets,
+                    subsurface,
+                    msaa,
+                );
+                // Between the geometry and the lines, and it has to be:
+                // after the geometry so the depth test rejects the sky
+                // wherever something was drawn, and before the lines
+                // because the sky passes its own test at the depth clear
+                // and would otherwise paint over them.
+                self.environment.record_skybox(
+                    builder,
+                    &self.ctx,
+                    &self.view,
+                    self.extent,
+                    self.env,
+                    subsurface,
+                    msaa,
+                    self.fog.uniforms(),
+                    self.fog.volume_or_fallback(
+                        self.frame.ids.fog.map(|ids| self.images.view(ids.volume)),
+                    ),
+                    self.fog.sampler(),
+                );
+                // Debug lines share the forward subpass: depth-tested against
+                // the scene, drawn on top of it, before the pass ends.
+                self.line.record(
+                    builder,
+                    self.debug_lines,
+                    &self.view,
+                    self.extent,
+                    subsurface,
+                    msaa,
+                );
+            }
+            PassBody::OitAccumulate => self.oit.record(
+                builder,
+                &self.pass_ctx(),
+                self.transparent,
+                &self.forward_sets,
+                &self.view,
+                self.extent,
+                self.objects.transparent_base,
+            ),
+            PassBody::RefractionDraw => {
+                let ids = self
+                    .frame
+                    .ids
+                    .refraction
+                    .expect("refraction without its images");
+                self.refraction.record(
+                    builder,
+                    &self.pass_ctx(),
+                    self.refractive,
+                    &self.forward_sets,
+                    self.images.view(ids.scene),
+                    self.view_of(ids.source),
+                    &self.view,
+                    self.extent,
+                    self.objects.refractive_base,
+                );
+            }
+            PassBody::Tonemap => self.hdr.record_tonemap(
+                builder,
+                &self.ctx,
+                self.extent,
+                self.scene_color.clone(),
+                self.exposure.exposure_buffer(),
+                // With bloom off the graph has no chain, so the tonemap
+                // pass samples a 1x1 black self.view at a zero strength: "no
+                // bloom" with no second shader path.
+                match self.frame.ids.bloom {
+                    Some(ids) => self.images.view(ids.result()),
+                    None => self.bloom.black_view(),
+                },
+            ),
+            PassBody::Overlay
+            | PassBody::SsrHiz
+            | PassBody::SsrSource
+            | PassBody::SsrTrace
+            | PassBody::SsrResolve
+            | PassBody::FogScatter
+            | PassBody::FogIntegrate
+            | PassBody::SubsurfaceBlurHorizontal
+            | PassBody::SubsurfaceBlurVertical
+            | PassBody::SubsurfaceComposite
+            | PassBody::OitComposite
+            | PassBody::RefractionScene
+            | PassBody::RefractionComposite
+            | PassBody::TaaResolve
+            | PassBody::DofPrefilter
+            | PassBody::DofTileMax
+            | PassBody::DofGather
+            | PassBody::DofComposite
+            | PassBody::MotionBlurTileMax
+            | PassBody::MotionBlurNeighbourMax
+            | PassBody::MotionBlurGather
+            | PassBody::LuminanceHistogram
+            | PassBody::LuminanceAverage
+            | PassBody::BloomPrefilter
+            | PassBody::BloomDownsample(_)
+            | PassBody::BloomUpsample(_) => unreachable!("handled above"),
+        }
+
+        builder.end_rendering();
+        if let Some(timestamps) = self.timestamps {
+            timestamps.close(builder, timed);
+        }
     }
 }
 

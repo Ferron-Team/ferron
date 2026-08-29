@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use glam::Vec3;
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
@@ -41,10 +41,10 @@ use vulkano::pipeline::{
 
 use crate::scene::ContactShadowSettings;
 
-use super::VulkanRenderer;
+use super::PassCtx;
 use super::context::VkContext;
 use super::prepass::FrameUbo;
-use super::record::Recorder;
+use super::record::{Arena, Recorder};
 use super::rendering;
 use super::taa::FrameView;
 use super::texture::MipPolicy;
@@ -86,7 +86,7 @@ pub(super) struct ContactShadowUniforms {
 
 pub struct ContactShadowPass {
     pipeline: Arc<GraphicsPipeline>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
     /// Nearest, because depth and normals are fetched at exact texels: filtering
     /// either invents a surface between two that are really there, and the march
     /// would stop on it.
@@ -106,7 +106,7 @@ impl ContactShadowPass {
         let device = &ctx.device;
         let pipeline = build_pipeline(ctx);
 
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -171,10 +171,7 @@ impl ContactShadowPass {
         let fade_end = settings.fade_distance.max(1e-4);
         let fade_start = fade_end * 0.75;
 
-        let params = self
-            .uniform_allocator
-            .allocate_sized::<ContactShadowUbo>()
-            .unwrap();
+        let params = self.uniform_allocator.allocate_sized::<ContactShadowUbo>();
         *params.write().unwrap() = ContactShadowUbo {
             light_direction: [light_direction.x, light_direction.y, light_direction.z, 0.0],
             march: [
@@ -205,7 +202,7 @@ impl ContactShadowPass {
     pub(super) fn record(
         &self,
         builder: &mut Recorder,
-        renderer: &VulkanRenderer,
+        renderer: &PassCtx<'_>,
         extent: [u32; 2],
         uniforms: &ContactShadowUniforms,
         depth_view: Arc<ImageView>,

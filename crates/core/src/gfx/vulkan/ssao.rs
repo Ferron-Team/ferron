@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use super::VulkanRenderer;
+use super::PassCtx;
 use super::context::VkContext;
 use super::prepass::{FrameUbo, NORMAL_FORMAT};
-use super::record::Recorder;
+use super::record::{Arena, Recorder};
 use super::rendering;
 use super::texture::MipPolicy;
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
@@ -142,7 +142,7 @@ pub(super) struct SsaoUniforms {
 pub struct SsaoPass {
     ssao_pipeline: Arc<GraphicsPipeline>,
     blur_pipeline: Arc<GraphicsPipeline>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
     nearest_clamp: Arc<Sampler>,
     nearest_repeat: Arc<Sampler>,
     noise_view: Arc<ImageView>,
@@ -178,7 +178,7 @@ impl SsaoPass {
         let ssao_pipeline = build_fullscreen_pipeline(ctx, full_vs.clone(), ssao_fs);
         let blur_pipeline = build_fullscreen_pipeline(ctx, full_vs, blur_fs);
 
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -236,10 +236,7 @@ impl SsaoPass {
     }
 
     pub(super) fn begin_frame(&self, extent: [u32; 2], frame: Subbuffer<FrameUbo>) -> SsaoUniforms {
-        let params = self
-            .uniform_allocator
-            .allocate_sized::<SsaoParamsUbo>()
-            .unwrap();
+        let params = self.uniform_allocator.allocate_sized::<SsaoParamsUbo>();
         *params.write().unwrap() = SsaoParamsUbo {
             kernel: self.kernel,
             noise_scale: [
@@ -261,7 +258,7 @@ impl SsaoPass {
     pub(super) fn record_ao(
         &self,
         builder: &mut Recorder,
-        renderer: &VulkanRenderer,
+        renderer: &PassCtx<'_>,
         extent: [u32; 2],
         uniforms: &SsaoUniforms,
         depth_view: Arc<ImageView>,
@@ -312,7 +309,7 @@ impl SsaoPass {
     pub(super) fn record_blur(
         &self,
         builder: &mut Recorder,
-        renderer: &VulkanRenderer,
+        renderer: &PassCtx<'_>,
         extent: [u32; 2],
         raw_ao_view: Arc<ImageView>,
         depth_view: Arc<ImageView>,

@@ -14,9 +14,10 @@
 //! is writing.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::{Mat4, Vec2};
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
@@ -33,7 +34,7 @@ use crate::scene::{Camera, TaaSettings};
 
 use super::context::VkContext;
 use super::hdr::HDR_FORMAT;
-use super::record::Recorder;
+use super::record::{Arena, Recorder};
 
 /// Side of the resolve's compute workgroup.
 const TILE: u32 = 8;
@@ -87,7 +88,7 @@ pub struct TaaPass {
     /// Nearest, because velocity and depth are fetched at exact texels and
     /// interpolating either across a silhouette invents a surface.
     nearest_clamp: Arc<Sampler>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
     /// Ping-ponged: `frame & 1` is this frame's target and the other is the
     /// history. Empty until the first frame TAA is enabled for.
     history: Option<[Arc<ImageView>; 2]>,
@@ -96,7 +97,12 @@ pub struct TaaPass {
     /// Set whenever the history cannot be trusted — first frame, a resize, or
     /// TAA having been off. The resolve then passes the current frame straight
     /// through, which is one aliased frame instead of a frame of garbage.
-    reset: bool,
+    ///
+    /// Atomic because the resolve clears it, and the resolve may be recording
+    /// on a worker: the pass that trusts the history is the one that knows it
+    /// can be trusted again, and moving the clear onto the main thread would
+    /// mean tracking there whether the pass ran at all.
+    reset: AtomicBool,
     previous_view_proj: Option<Mat4>,
     settings: TaaSettings,
 }
@@ -131,7 +137,7 @@ impl TaaPass {
         )
         .unwrap();
 
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -149,7 +155,7 @@ impl TaaPass {
             history: None,
             extent: [0, 0],
             frame: 0,
-            reset: true,
+            reset: AtomicBool::new(true),
             previous_view_proj: None,
             settings: TaaSettings::default(),
         }
@@ -175,7 +181,7 @@ impl TaaPass {
             if self.history.is_none() || self.extent != extent {
                 self.history = Some(allocate_history(ctx, extent));
                 self.extent = extent;
-                self.reset = true;
+                self.reset.store(true, Ordering::Relaxed);
             }
             self.frame = self.frame.wrapping_add(1);
         } else {
@@ -183,7 +189,7 @@ impl TaaPass {
             // memory, and anything they held is stale the moment a frame renders
             // without them.
             self.history = None;
-            self.reset = true;
+            self.reset.store(true, Ordering::Relaxed);
         }
 
         let aspect = extent[0] as f32 / extent[1].max(1) as f32;
@@ -227,7 +233,7 @@ impl TaaPass {
     }
 
     pub(super) fn record(
-        &mut self,
+        &self,
         builder: &mut Recorder,
         ctx: &VkContext,
         view: &FrameView,
@@ -238,7 +244,7 @@ impl TaaPass {
         let target = self.output_view();
         let extent = target.image().extent();
 
-        let uniforms = self.uniform_allocator.allocate_sized::<TaaUbo>().unwrap();
+        let uniforms = self.uniform_allocator.allocate_sized::<TaaUbo>();
         *uniforms.write().unwrap() = TaaUbo {
             inv_view_proj: view.unjittered_view_proj.inverse().to_cols_array_2d(),
             prev_view_proj: view.prev_view_proj.to_cols_array_2d(),
@@ -246,7 +252,7 @@ impl TaaPass {
                 1.0 / extent[0] as f32,
                 1.0 / extent[1] as f32,
                 self.settings.feedback.clamp(0.0, 0.99),
-                self.reset as u32 as f32,
+                self.reset.load(Ordering::Relaxed) as u32 as f32,
             ],
         };
 
@@ -287,7 +293,7 @@ impl TaaPass {
 
         // The frame that just resolved is the history the next one reads, so
         // whatever made it untrustworthy is over.
-        self.reset = false;
+        self.reset.store(false, Ordering::Relaxed);
     }
 }
 

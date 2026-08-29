@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::CopyBufferInfo;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
@@ -39,12 +39,12 @@ use crate::scene::{Camera, EnvironmentSettings};
 use super::context::VkContext;
 use super::fog::GpuFog;
 use super::instances::GpuObject;
-use super::record::Recorder;
+use super::record::{Arena, Recorder};
 use super::rendering;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
-use super::{MSAA_SAMPLES, ShadowFrame, VulkanRenderer};
+use super::{MSAA_SAMPLES, PassCtx, ShadowFrame, VulkanRenderer};
 use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
 
 pub struct GpuMesh {
@@ -651,16 +651,16 @@ pub struct ForwardPass {
     /// five descriptor sets bind to any of them.
     multisampled: ForwardPipelines,
     single: ForwardPipelines,
-    uniform_buffer_allocator: SubbufferAllocator,
+    uniform_buffer_allocator: Arena,
     /// Per-frame storage for the atlas face table. A storage buffer rather than
     /// more of the lighting uniform: forty-eight matrices is three kilobytes,
     /// and the guaranteed uniform-buffer range is sixteen.
-    shadow_face_allocator: SubbufferAllocator,
+    shadow_face_allocator: Arena,
     /// Per-frame storage for the decal block. Owned here rather than by a decal
     /// module because there is no decal *pass* to own it — the block is frame
     /// data that two existing passes read, which is exactly what the shadow face
     /// table above is.
-    decal_allocator: SubbufferAllocator,
+    decal_allocator: Arena,
     sampler: Arc<Sampler>,
     ao_sampler: Arc<Sampler>,
 }
@@ -749,7 +749,7 @@ impl ForwardPass {
             ),
         };
 
-        let uniform_buffer_allocator = SubbufferAllocator::new(
+        let uniform_buffer_allocator = Arena::new(
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -759,7 +759,7 @@ impl ForwardPass {
             },
         );
 
-        let shadow_face_allocator = SubbufferAllocator::new(
+        let shadow_face_allocator = Arena::new(
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::STORAGE_BUFFER,
@@ -769,7 +769,7 @@ impl ForwardPass {
             },
         );
 
-        let decal_allocator = SubbufferAllocator::new(
+        let decal_allocator = Arena::new(
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::STORAGE_BUFFER,
@@ -910,7 +910,7 @@ impl ForwardPass {
     /// path through both passes, which is more state to get wrong than the
     /// write costs.
     pub(super) fn upload_decals(&self, decals: &[DecalInstance]) -> Subbuffer<GpuDecals> {
-        let buffer = self.decal_allocator.allocate_sized::<GpuDecals>().unwrap();
+        let buffer = self.decal_allocator.allocate_sized::<GpuDecals>();
         {
             let mut block = buffer.write().unwrap();
             let count = decals.len().min(MAX_DECALS);
@@ -999,8 +999,7 @@ impl ForwardPass {
     ) -> ForwardSets {
         let lighting_buffer = self
             .uniform_buffer_allocator
-            .allocate_sized::<GpuLighting>()
-            .unwrap();
+            .allocate_sized::<GpuLighting>();
         // Both halves fall back to the scene's flat ambient when nothing is
         // loaded — the diffuse as a band-0-only series, the specular as a tint
         // on a white cube. Two descriptions of the same uniform environment,
@@ -1026,8 +1025,7 @@ impl ForwardPass {
         let face_count = atlas.faces.len().min(MAX_ATLAS_FACES).max(1);
         let shadow_faces = self
             .shadow_face_allocator
-            .allocate_slice::<GpuShadowFace>(face_count as u64)
-            .unwrap();
+            .allocate_slice::<GpuShadowFace>(face_count as u64);
         {
             let mut rows = shadow_faces.write().unwrap();
             rows.fill(GpuShadowFace::ZERO);
@@ -1108,7 +1106,7 @@ impl ForwardPass {
     pub(super) fn draw(
         &self,
         builder: &mut Recorder,
-        renderer: &VulkanRenderer,
+        renderer: &PassCtx<'_>,
         draws: DrawList<'_>,
         view: &FrameView,
         extent: [u32; 2],

@@ -22,9 +22,10 @@
 //! pass never reads the volume it is writing.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::{Mat4, Vec3};
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
@@ -44,7 +45,7 @@ use crate::scene::FogSettings;
 use super::ShadowFrame;
 use super::context::VkContext;
 use super::forward::GpuCascades;
-use super::record::Recorder;
+use super::record::{Arena, Recorder};
 use super::taa::FrameView;
 
 /// How far the froxel grid is reduced from the frame in each screen axis.
@@ -131,7 +132,7 @@ pub struct FogPass {
     /// integrating, and a bilinear tap would smear a neighbouring column's
     /// extinction into a transmittance about to be multiplied along a whole ray.
     nearest_clamp: Arc<Sampler>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
     /// Ping-ponged: `frame & 1` is this frame's scatter target and the other is
     /// the history. Empty until the first frame the effect is enabled for.
     history: Option<[Arc<ImageView>; 2]>,
@@ -145,7 +146,10 @@ pub struct FogPass {
     /// the effect having been off. The scatter pass then keeps its own
     /// measurement, which is one jittered frame instead of a frame of somewhere
     /// else's air.
-    reset: bool,
+    ///
+    /// Atomic for the reason `TaaPass::reset` is: the scatter clears it, and
+    /// the scatter may be recording on a worker.
+    reset: AtomicBool,
     previous_view_proj: Option<Mat4>,
     previous_camera: Vec3,
     /// This frame's block, resolved once in `begin_frame`. Both dispatches and
@@ -194,7 +198,7 @@ impl FogPass {
         )
         .unwrap();
 
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -214,7 +218,7 @@ impl FogPass {
             fallback: allocate_fallback(ctx),
             extent: [0; 3],
             frame: 0,
-            reset: true,
+            reset: AtomicBool::new(true),
             previous_view_proj: None,
             previous_camera: Vec3::ZERO,
             uniforms: None,
@@ -257,14 +261,14 @@ impl FogPass {
             if self.history.is_none() || self.extent != froxels {
                 self.history = Some(allocate_history(ctx, froxels));
                 self.extent = froxels;
-                self.reset = true;
+                self.reset.store(true, Ordering::Relaxed);
             }
             self.frame = self.frame.wrapping_add(1);
         } else {
             // Freed rather than kept: two volumes is real memory, and what they
             // hold is stale the moment a frame renders without them.
             self.history = None;
-            self.reset = true;
+            self.reset.store(true, Ordering::Relaxed);
         }
 
         // The shader wants the direction *toward* the sun, matching the lighting
@@ -272,7 +276,7 @@ impl FogPass {
         let to_sun = (-lighting.sun.direction).normalize_or_zero();
         let previous_view_proj = self.previous_view_proj.unwrap_or(view.unjittered_view_proj);
 
-        let uniforms = self.uniform_allocator.allocate_sized::<GpuFog>().unwrap();
+        let uniforms = self.uniform_allocator.allocate_sized::<GpuFog>();
         *uniforms.write().unwrap() = GpuFog {
             // Unjittered, both of them: the volume is reprojected against its own
             // history rather than resolved by TAA, so the raster's subpixel
@@ -314,7 +318,7 @@ impl FogPass {
             temporal: [
                 settings.feedback.clamp(0.0, 0.98),
                 jitter(self.frame),
-                self.reset as u32 as f32,
+                self.reset.load(Ordering::Relaxed) as u32 as f32,
                 0.0,
             ],
             // The same expression `to_gpu_lighting` fills its own copy from, so
@@ -370,7 +374,7 @@ impl FogPass {
     }
 
     pub(super) fn record_scatter(
-        &mut self,
+        &self,
         builder: &mut Recorder,
         ctx: &VkContext,
         shadow_maps: Arc<ImageView>,
@@ -419,7 +423,7 @@ impl FogPass {
 
         // The volume that just scattered is the history the next frame reads, so
         // whatever made it untrustworthy is over.
-        self.reset = false;
+        self.reset.store(false, Ordering::Relaxed);
     }
 
     pub(super) fn record_integrate(
