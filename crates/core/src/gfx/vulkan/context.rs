@@ -24,6 +24,20 @@ use super::vendor::GpuProfile;
 pub struct VkContext {
     pub device: Arc<Device>,
     pub queue: Arc<Queue>,
+    /// A queue from a compute-only family, when the device has one.
+    ///
+    /// What #64 item 8 is submitted to: the frame's compute tail goes here so
+    /// that the graphics queue is free to start the *next* frame's head while
+    /// it runs. `None` on a device whose only family does everything —
+    /// lavapipe, and the software rasteriser CI would use — and there the frame
+    /// is planned and submitted exactly as it was before this existed, which is
+    /// what makes the two-driver capture comparison still an oracle.
+    ///
+    /// Compute-*only* rather than any second queue: a second graphics queue on
+    /// AMD is the same hardware ring, so it would serialise against the first
+    /// and buy nothing. Family 1 on RDNA is the asynchronous compute engine,
+    /// which is a different one.
+    pub compute_queue: Option<Arc<Queue>>,
     pub memory_allocator: Arc<StandardMemoryAllocator>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
@@ -113,6 +127,7 @@ impl VkContext {
 
         let (physical_device, queue_family_index) =
             select_physical_device(instance, surface, &device_extensions);
+        let compute_family = select_compute_family(&physical_device);
 
         let profile = GpuProfile::detect(&physical_device);
         println!(
@@ -197,13 +212,21 @@ impl VkContext {
             device_extensions.khr_dynamic_rendering = true;
         }
 
+        // The compute-only family second, so `queues` yields the graphics queue
+        // first whether or not there is one.
+        let queue_create_infos = [Some(queue_family_index), compute_family]
+            .into_iter()
+            .flatten()
+            .map(|queue_family_index| QueueCreateInfo {
+                queue_family_index,
+                ..Default::default()
+            })
+            .collect();
+
         let (device, mut queues) = Device::new(
             physical_device,
             DeviceCreateInfo {
-                queue_create_infos: vec![QueueCreateInfo {
-                    queue_family_index,
-                    ..Default::default()
-                }],
+                queue_create_infos,
                 enabled_extensions: device_extensions,
                 enabled_features: DeviceFeatures {
                     image_view_format_swizzle: swizzle,
@@ -220,6 +243,18 @@ impl VkContext {
         .expect("failed to create device");
 
         let queue = queues.next().unwrap();
+        let compute_queue = compute_family.map(|_| {
+            queues
+                .next()
+                .expect("a compute queue was requested but not created")
+        });
+        if let Some(compute) = &compute_queue {
+            println!(
+                "  async compute: queue family {} beside graphics family {}",
+                compute.queue_family_index(),
+                queue.queue_family_index(),
+            );
+        }
         assert_packed_color_is_storable(&device);
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
@@ -242,12 +277,36 @@ impl VkContext {
         Self {
             device,
             queue,
+            compute_queue,
             memory_allocator,
             command_buffer_allocator,
             descriptor_set_allocator,
             profile,
             pipelines,
             partially_bound,
+        }
+    }
+
+    /// The queue families a resource both queues touch has to name, or empty
+    /// when there is only one queue and nothing to share between.
+    ///
+    /// Concurrent sharing rather than a derived ownership transfer, for the
+    /// reason `gfx/graph/schedule.rs` gives: ownership wraps across the frame
+    /// boundary, and a release/acquire pair that falls out of balance corrupts
+    /// contents rather than failing a validation check. What concurrent costs
+    /// instead is colour compression, on the images the compiler names and no
+    /// others.
+    ///
+    /// Handed back as a `Vec` for the caller to collect into whatever `Sharing`
+    /// wants, so this module does not name vulkano's `SmallVec` and the crate
+    /// does not take a dependency on it to say two numbers.
+    pub fn shared_queue_families(&self) -> Vec<u32> {
+        match &self.compute_queue {
+            Some(compute) => vec![
+                self.queue.queue_family_index(),
+                compute.queue_family_index(),
+            ],
+            None => Vec::new(),
         }
     }
 
@@ -305,6 +364,33 @@ impl VkContext {
         let used = device_local.iter().map(|&i| budget.heap_usage[i]).sum();
         (Some(used), total)
     }
+}
+
+/// A queue family that computes but does not draw, or `None` under
+/// `ORRIN_ASYNC_COMPUTE=0`.
+///
+/// The asynchronous compute engine on AMD and the compute queues on NVIDIA sit
+/// in exactly such a family; a family that also has `GRAPHICS` is the same
+/// hardware ring as the graphics queue on the drivers that matter, so taking one
+/// would add submissions without adding concurrency. `None` when the device has
+/// no such family, and the whole feature switches off with it.
+fn select_compute_family(physical_device: &Arc<PhysicalDevice>) -> Option<u32> {
+    // The control every A/B of the split is measured with, and the switch that
+    // puts a machine back on the single-queue path without a rebuild if a driver
+    // turns out to schedule the two badly. `ORRIN_THREADS=1` is the same idea
+    // one layer up.
+    if std::env::var("ORRIN_ASYNC_COMPUTE").is_ok_and(|value| value.trim() == "0") {
+        return None;
+    }
+    physical_device
+        .queue_family_properties()
+        .iter()
+        .position(|family| {
+            family.queue_flags.contains(QueueFlags::COMPUTE)
+                && !family.queue_flags.intersects(QueueFlags::GRAPHICS)
+                && family.queue_count > 0
+        })
+        .map(|index| index as u32)
 }
 
 fn select_physical_device(

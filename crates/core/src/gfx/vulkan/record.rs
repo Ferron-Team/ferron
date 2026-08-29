@@ -382,7 +382,16 @@ pub(super) struct Recorder {
 
 impl Recorder {
     pub(super) fn new(ctx: &VkContext) -> Self {
-        Self::begin(ctx, CommandBufferLevel::Primary, None)
+        Self::for_family(ctx, ctx.queue.queue_family_index())
+    }
+
+    /// A primary recording for a chosen queue family.
+    ///
+    /// A command buffer may only be submitted to the family it was allocated
+    /// from, so a segment bound for the compute queue has to be recorded from
+    /// that family's pool. See `gfx/graph/schedule.rs`.
+    pub(super) fn for_family(ctx: &VkContext, queue_family_index: u32) -> Self {
+        Self::begin(ctx, queue_family_index, CommandBufferLevel::Primary, None)
     }
 
     /// A recording surface for one group of passes, to be executed by the
@@ -395,6 +404,7 @@ impl Recorder {
     pub(super) fn secondary(ctx: &VkContext) -> Self {
         Self::begin(
             ctx,
+            ctx.queue.queue_family_index(),
             CommandBufferLevel::Secondary,
             Some(CommandBufferInheritanceInfo::default()),
         )
@@ -402,12 +412,13 @@ impl Recorder {
 
     fn begin(
         ctx: &VkContext,
+        queue_family_index: u32,
         level: CommandBufferLevel,
         inheritance_info: Option<CommandBufferInheritanceInfo>,
     ) -> Self {
         let inner = RecordingCommandBuffer::new(
             ctx.command_buffer_allocator.clone(),
-            ctx.queue.queue_family_index(),
+            queue_family_index,
             level,
             CommandBufferBeginInfo {
                 usage: CommandBufferUsage::OneTimeSubmit,
@@ -715,15 +726,30 @@ impl Recorder {
 // hands back, so the lint is silenced here rather than worked around.
 #[allow(dead_code)]
 pub(super) struct InFlight {
-    fence: Fence,
-    keep: KeepAlive,
-    /// The buffer the queue is executing. Held for the same reason everything
+    /// One per submission. A split frame is three — its graphics head, its
+    /// compute tail, and the previous frame's trailing segment — made in one
+    /// `render` call and bounded as one, so the run-ahead stays a count of
+    /// frames rather than becoming a count of submissions.
+    fences: Vec<Fence>,
+    keep: Vec<KeepAlive>,
+    /// The buffers the queues are executing. Held for the same reason everything
     /// else here is — the allocator recycles a command buffer as soon as it is
-    /// dropped, and the GPU is still reading this one.
-    command_buffer: CommandBuffer,
-    /// A semaphore the queue is still waiting on or signalling must not be
+    /// dropped, and the GPU is still reading these.
+    command_buffers: Vec<CommandBuffer>,
+    /// A semaphore a queue is still waiting on or signalling must not be
     /// destroyed either.
     semaphores: Vec<Arc<Semaphore>>,
+}
+
+impl InFlight {
+    /// Fold another submission from the same `render` call into this one.
+    pub(super) fn and(mut self, other: InFlight) -> Self {
+        self.fences.extend(other.fences);
+        self.keep.extend(other.keep);
+        self.command_buffers.extend(other.command_buffers);
+        self.semaphores.extend(other.semaphores);
+        self
+    }
 }
 
 /// Work the CPU has handed the queue and cannot yet prove is finished.
@@ -744,14 +770,18 @@ pub(super) trait Pending {
 }
 
 impl Pending for InFlight {
+    /// Every submission finished, not the last one: they went to different
+    /// queues and do not complete in the order they were made.
     fn is_complete(&self) -> bool {
-        self.fence.is_signaled().unwrap_or(true)
+        self.fences
+            .iter()
+            .all(|fence| fence.is_signaled().unwrap_or(true))
     }
 
     fn retire(self) {
-        self.fence
-            .wait(None)
-            .expect("failed to wait on the frame fence");
+        for fence in &self.fences {
+            fence.wait(None).expect("failed to wait on the frame fence");
+        }
     }
 }
 
@@ -833,12 +863,16 @@ impl<T: Pending> RunAhead<T> {
     }
 }
 
-/// Submit one recorded frame.
+/// Submit one recorded segment of a frame.
+///
+/// `queue` because a split frame's segments do not all go to the same one — the
+/// compute tail is the whole point of [`VkContext::compute_queue`].
 ///
 /// `signals` needs one semaphore per waiter: a binary semaphore's signal may be
 /// waited exactly once. Through `ash` for the reason the module docs give.
 pub(super) fn submit_frame(
     ctx: &VkContext,
+    queue: &Arc<Queue>,
     command_buffer: CommandBuffer,
     keep: KeepAlive,
     waits: &[(Arc<Semaphore>, vk::PipelineStageFlags)],
@@ -862,20 +896,20 @@ pub(super) fn submit_frame(
         submit = submit.signal_semaphores(&signal_handles);
     }
 
-    ctx.queue.clone().with(|_guard| {
+    queue.clone().with(|_guard| {
         let fns = ctx.device.fns();
         // SAFETY: one submission of one command buffer that finished recording,
         // on the queue whose family it was allocated from, under the queue's
         // lock, with a fresh unsignalled fence and semaphores this frame owns.
-        unsafe { (fns.v1_0.queue_submit)(ctx.queue.handle(), 1, &submit, fence.handle()) }
+        unsafe { (fns.v1_0.queue_submit)(queue.handle(), 1, &submit, fence.handle()) }
             .result()
             .expect("failed to submit the frame");
     });
 
     InFlight {
-        fence,
-        keep,
-        command_buffer,
+        fences: vec![fence],
+        keep: vec![keep],
+        command_buffers: vec![command_buffer],
         semaphores: waits
             .iter()
             .map(|(s, _)| s.clone())

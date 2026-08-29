@@ -401,6 +401,7 @@ mod tests {
             shadow_cascades: MAX_CASCADES as u8,
             shadow_resolution: 2048,
             shadow_atlas: 4096,
+            async_compute: false,
         };
         let frame = declare(config).expect("the busiest frame must compile");
 

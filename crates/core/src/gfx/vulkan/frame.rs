@@ -150,6 +150,16 @@ pub struct FrameConfig {
     /// One number and one pass however many lights cast — the tile count varies
     /// frame to frame *inside* the pass, which is exactly why it is not here.
     pub shadow_atlas: u32,
+    /// Whether the frame's compute tail may be submitted to a second queue, so
+    /// that the *next* frame's graphics head can start before this frame's post
+    /// chain has finished.
+    ///
+    /// Structural, and the reason it is a config field rather than a runtime
+    /// check: it changes how many submissions a frame is, which resources have
+    /// to be reachable from both queues, and therefore how they are allocated.
+    /// The renderer sets it from what the device turned out to have — a device
+    /// with no compute-only queue family plans exactly the frame it always did.
+    pub async_compute: bool,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -522,6 +532,9 @@ pub struct Frame {
 
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let mut builder = GraphBuilder::new();
+    if config.async_compute {
+        builder.request_async_compute();
+    }
     let mut bodies = Vec::new();
     let record = |id: PassId, body: PassBody, bodies: &mut Vec<PassBody>| {
         debug_assert_eq!(id.index(), bodies.len());

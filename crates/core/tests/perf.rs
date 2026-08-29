@@ -37,6 +37,15 @@
 //!   (see [`orrin_core::threads`]), which is the baseline every parallel change
 //!   is judged against — so a threaded change is measured by running this twice,
 //!   back to back in one session, not against a number from last week.
+//! - `ORRIN_ASYNC_COMPUTE=0` keeps the frame on one queue, which is the control
+//!   every measurement of the split is read against. Like `ORRIN_THREADS=1`, it
+//!   is one binary and one variable, so the two sides of an A/B need no rebuild
+//!   between them.
+//! - `ORRIN_PERF_POST=1` switches on every optical stage that ships off by
+//!   default — screen-space reflections, depth of field, motion blur,
+//!   subsurface scattering and volumetric fog. The frame the async-compute
+//!   question is actually about: with them off, the whole compute half of the
+//!   graph is a fifth of a millisecond.
 //! - `ORRIN_PERF_MSAA=1` rasterises the forward pass at four samples. The other
 //!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
 //!   pass writes and resolves its own targets and cannot depth-test `EQUAL`
@@ -150,8 +159,33 @@ fn frame_cost() {
         ..SsaoSettings::default()
     });
     world.insert_resource(ContactShadowSettings::default());
-    world.insert_resource(SsrSettings::default());
-    world.insert_resource(SubsurfaceSettings::default());
+    // Every stage that ships disabled, switched on together: each one is a
+    // handful of compute nodes, and the frame they make between them is the one
+    // a scheduling change has anything to work with.
+    let post = env_usize("ORRIN_PERF_POST", 0) != 0;
+    world.insert_resource(SsrSettings {
+        enabled: post,
+        ..SsrSettings::default()
+    });
+    world.insert_resource(SubsurfaceSettings {
+        enabled: post,
+        ..SubsurfaceSettings::default()
+    });
+    world.insert_resource(DofSettings {
+        enabled: post,
+        ..DofSettings::default()
+    });
+    world.insert_resource(MotionBlurSettings {
+        enabled: post,
+        ..MotionBlurSettings::default()
+    });
+    // The one that is not a boolean: fog is volumetric already and costs
+    // nothing at zero density, so this is what puts the froxel grid in the
+    // frame.
+    world.insert_resource(FogSettings {
+        density: if post { 0.02 } else { 0.0 },
+        ..FogSettings::default()
+    });
     world.insert_resource(DecalSettings::default());
     world.insert_resource(TransparencySettings::default());
     world.insert_resource(RefractionSettings::default());

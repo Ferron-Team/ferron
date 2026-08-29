@@ -5,8 +5,8 @@ use vulkano::image::{ImageLayout, ImageUsage};
 use vulkano::sync::{AccessFlags, PipelineStages};
 
 use super::{
-    Access, Barrier, GraphBuilder, GraphError, ImageDesc, PassDecl, PassId, PassKind, ResourceDecl,
-    ResourceId, ResourceKind,
+    Access, Barrier, GraphBuilder, GraphError, ImageDesc, PassDecl, PassId, PassKind, Queue,
+    ResourceDecl, ResourceId, ResourceKind, Segment, schedule,
 };
 
 /// A graph-owned image, sized and flagged by the compiler. `usage` is the union
@@ -21,6 +21,9 @@ pub struct TransientImage {
     /// no DRAM at all — the property the MSAA color and depth targets rely on
     /// for the 4x HDR buffer to be affordable on Apple hardware.
     pub memoryless: bool,
+    /// Reachable from both queues, because both touch it. See
+    /// [`FrameGraph::concurrent`].
+    pub concurrent: bool,
 }
 
 /// A compiled frame: passes in execution order, the barriers between them, and
@@ -38,6 +41,12 @@ pub struct FrameGraph {
     culled: Vec<PassId>,
     /// Indexed by `ResourceId`; `None` for imports and buffers.
     images: Vec<Option<TransientImage>>,
+    /// Contiguous runs of `order`, one per submission. One segment covering the
+    /// whole frame unless it was split — see `schedule.rs`.
+    segments: Vec<Segment>,
+    /// Resources reached from more than one queue, which therefore cannot be
+    /// created in `SharingMode::Exclusive`. Indexed by `ResourceId`.
+    concurrent: Vec<bool>,
 }
 
 impl FrameGraph {
@@ -55,6 +64,33 @@ impl FrameGraph {
 
     pub fn culled(&self) -> &[PassId] {
         &self.culled
+    }
+
+    pub fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+
+    /// Which queue the pass in `slot` is submitted to.
+    pub fn slot_queue(&self, slot: usize) -> Queue {
+        self.segments
+            .iter()
+            .find(|segment| segment.passes.contains(&slot))
+            .map_or(Queue::Graphics, |segment| segment.queue)
+    }
+
+    /// The resources more than one queue touches.
+    ///
+    /// An image in `SharingMode::Exclusive` belongs to one queue family at a
+    /// time and reading it from another is undefined without an ownership
+    /// transfer; these are the ones the executor has to create reachable from
+    /// both instead. Empty for an unsplit frame, which is every frame on a
+    /// device with one queue.
+    pub fn concurrent(&self) -> impl Iterator<Item = ResourceId> + '_ {
+        self.concurrent
+            .iter()
+            .enumerate()
+            .filter(|(_, shared)| **shared)
+            .map(|(index, _)| ResourceId(index as u32))
     }
 
     pub fn pass_count(&self) -> usize {
@@ -93,7 +129,11 @@ impl FrameGraph {
 /// Order the passes, derive the barriers between them, and size the images.
 pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
     builder.validate_names()?;
-    let GraphBuilder { resources, passes } = builder;
+    let GraphBuilder {
+        resources,
+        passes,
+        async_compute,
+    } = builder;
 
     for pass in &passes {
         check_single_access_per_resource(pass, &resources)?;
@@ -103,8 +143,18 @@ pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
     let order = topological_order(&passes)?;
     let (order, culled) = cull(order, &passes, &resources);
     check_raw_passes_last(&order, &passes)?;
-    let (barriers, final_barriers) = derive_barriers(&order, &passes, &resources)?;
-    let images = derive_images(&order, &passes, &resources);
+    // Before the barriers, because which stages one may name depends on the
+    // queue its pass is recorded on.
+    let segments = schedule::segments(&order, &passes, async_compute);
+    let queues = schedule::slot_queues(&segments, order.len());
+    let (barriers, final_barriers) = derive_barriers(&order, &passes, &resources, &queues)?;
+    let mut images = derive_images(&order, &passes, &resources);
+    let concurrent = derive_concurrent(&order, &passes, &resources, &segments);
+    for (index, image) in images.iter_mut().enumerate() {
+        if let Some(image) = image {
+            image.concurrent = concurrent[index];
+        }
+    }
 
     Ok(FrameGraph {
         resources,
@@ -114,7 +164,37 @@ pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
         final_barriers,
         culled,
         images,
+        segments,
+        concurrent,
     })
+}
+
+/// Which resources more than one segment's queue touches.
+///
+/// Per resource rather than per boundary: a scratch image written and read
+/// entirely inside the compute tail never leaves that queue however many
+/// segments the frame has, and paying for it would be paying for the split
+/// rather than for what crossed it.
+fn derive_concurrent(
+    order: &[PassId],
+    passes: &[PassDecl],
+    resources: &[ResourceDecl],
+    segments: &[Segment],
+) -> Vec<bool> {
+    let mut touched: Vec<Option<Queue>> = vec![None; resources.len()];
+    let mut concurrent = vec![false; resources.len()];
+    for segment in segments {
+        for slot in segment.passes.clone() {
+            for &(resource, _) in &passes[order[slot].index()].accesses {
+                match touched[resource.index()] {
+                    Some(queue) if queue != segment.queue => concurrent[resource.index()] = true,
+                    Some(_) => {}
+                    None => touched[resource.index()] = Some(segment.queue),
+                }
+            }
+        }
+    }
+    concurrent
 }
 
 /// A pass is a single point in the schedule, so two accesses to one resource
@@ -338,6 +418,14 @@ struct State {
     /// the same layout that needs no more than this needs no barrier.
     visible_stages: PipelineStages,
     visible_access: AccessFlags,
+    /// The queue every access currently contributing to a barrier's *source*
+    /// half ran on, or `None` when they did not all run on one.
+    ///
+    /// What tells a dependency between two dispatches in the compute tail —
+    /// which nothing but its barrier expresses — from one on the segment before
+    /// it, which the semaphore between them already carries. See
+    /// [`schedule::narrow`].
+    src_queue: Option<Queue>,
 }
 
 impl State {
@@ -350,6 +438,7 @@ impl State {
             read_stages: PipelineStages::empty(),
             visible_stages: PipelineStages::empty(),
             visible_access: AccessFlags::empty(),
+            src_queue: None,
         }
     }
 }
@@ -358,12 +447,14 @@ fn derive_barriers(
     order: &[PassId],
     passes: &[PassDecl],
     resources: &[ResourceDecl],
+    queues: &[Queue],
 ) -> Result<(Vec<Vec<Barrier>>, Vec<Barrier>), GraphError> {
     let mut states: Vec<State> = resources.iter().map(State::new).collect();
     let mut barriers = Vec::with_capacity(order.len());
 
-    for &pass_id in order {
+    for (slot, &pass_id) in order.iter().enumerate() {
         let pass = &passes[pass_id.index()];
+        let queue = queues[slot];
         let mut pass_barriers = Vec::new();
         for &(resource, access) in &pass.accesses {
             let decl = &resources[resource.index()];
@@ -376,7 +467,15 @@ fn derive_barriers(
                 });
             }
 
-            if let Some(barrier) = step(state, decl.is_image(), resource, access) {
+            // Whether anything the barrier's source half describes ran on the
+            // other queue, which is what decides whether the semaphore between
+            // the segments has already covered it. Read before `step` advances
+            // the state past it.
+            let crossed = state.src_queue.is_some_and(|src| src != queue);
+            if let Some(mut barrier) = step(state, decl.is_image(), resource, access, queue) {
+                if queue == Queue::AsyncCompute {
+                    schedule::narrow(&mut barrier, crossed);
+                }
                 pass_barriers.push(barrier);
             }
         }
@@ -415,6 +514,7 @@ fn step(
     is_image: bool,
     resource: ResourceId,
     access: Access,
+    queue: Queue,
 ) -> Option<Barrier> {
     let layout = if is_image {
         access.layout()
@@ -475,6 +575,8 @@ fn step(
         state.read_stages = PipelineStages::empty();
         state.visible_stages = PipelineStages::empty();
         state.visible_access = AccessFlags::empty();
+        // A write resets the source half, so it also resets whose it is.
+        state.src_queue = Some(queue);
     } else {
         state.read_stages |= access.stages();
         // A layout transition is itself a write, so what earlier readers were
@@ -485,6 +587,13 @@ fn step(
         } else {
             state.visible_stages |= access.stages();
             state.visible_access |= access.flags();
+        }
+        // A read joins the source half rather than replacing it — a later
+        // transition sources the readers it moves the layout out from under as
+        // well as the write — so one reader from the other queue is enough to
+        // make the whole of it the semaphore's business.
+        if state.src_queue != Some(queue) {
+            state.src_queue = None;
         }
     }
     barrier
@@ -531,6 +640,10 @@ fn derive_images(
             desc,
             usage,
             memoryless,
+            // Filled in by `compile` once the frame has been cut into segments;
+            // `derive_images` is about what a pass declared, and this is about
+            // where the compiler put it.
+            concurrent: false,
         });
     }
     images

@@ -3,7 +3,7 @@ use std::fmt;
 use vulkano::image::ImageLayout;
 use vulkano::sync::{AccessFlags, PipelineStages};
 
-use super::{FrameGraph, ResourceId};
+use super::{FrameGraph, Queue, ResourceId};
 
 /// One derived dependency: what must finish, what may then start, and the layout
 /// the image changes to on the way.
@@ -38,7 +38,28 @@ impl Barrier {
 /// that guards synchronisation.
 impl fmt::Display for FrameGraph {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The queue split, printed only when there is one. An unsplit frame is
+        // every frame this file recorded before the split existed, and its plan
+        // has to keep reading exactly as it did — a baseline that moved for
+        // every configuration would say the split changed all of them.
+        let split = self.segments().len() > 1;
         for (slot, &pass_id) in self.order().iter().enumerate() {
+            if split
+                && let Some(segment) = self
+                    .segments()
+                    .iter()
+                    .find(|segment| segment.passes.start == slot)
+            {
+                writeln!(
+                    f,
+                    "-- {} queue, {} pass(es)",
+                    match segment.queue {
+                        Queue::Graphics => "graphics",
+                        Queue::AsyncCompute => "async compute",
+                    },
+                    segment.passes.len(),
+                )?;
+            }
             let pass = self.pass(pass_id);
             writeln!(f, "{slot:02} pass {} [{:?}]", pass.name, pass.kind)?;
             for barrier in self.barriers_before(slot) {
@@ -56,6 +77,12 @@ impl fmt::Display for FrameGraph {
         }
         for &pass_id in self.culled() {
             writeln!(f, "-- culled pass {}", self.pass(pass_id).name)?;
+        }
+        // What the split costs, in the one place a reviewer will look for it:
+        // an image both queues touch cannot be exclusive to either, and on a
+        // colour attachment that is compression given up.
+        for resource in self.concurrent() {
+            writeln!(f, "-- concurrent {}", self.resource_name(resource))?;
         }
         Ok(())
     }

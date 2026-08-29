@@ -18,6 +18,7 @@ use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{Image, ImageCreateInfo, ImageSubresourceRange, ImageType, ImageUsage};
 use vulkano::memory::MemoryPropertyFlags;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::sync::Sharing;
 
 use crate::gfx::graph::{FrameGraph, ResourceId};
 
@@ -32,6 +33,15 @@ use crate::gfx::graph::{FrameGraph, ResourceId};
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ImageKey {
     name: String,
+    /// Which frame-in-flight's copy this is. In the key because the copies are
+    /// separate allocations by definition — that is the whole point of them —
+    /// and a cache that keyed without it would hand every frame the same image
+    /// and undo the split. Always zero when the frame is not pipelined.
+    slot: usize,
+    /// Whether the image was created reachable from both queue families. In the
+    /// key because it is baked into the allocation: a graph recompiled with the
+    /// split on cannot reuse an image created exclusive.
+    concurrent: bool,
     format: vulkano::format::Format,
     extent: [u32; 3],
     usage: ImageUsage,
@@ -43,7 +53,19 @@ struct ImageKey {
 
 /// Graph-owned images, indexed by [`ResourceId`].
 pub(super) struct GraphImages {
-    views: Vec<Option<Arc<ImageView>>>,
+    /// One set of views per frame in flight, indexed `[slot][resource]`.
+    ///
+    /// One slot unless the frame was split across two queues. With the split,
+    /// this frame's compute tail runs while the *next* frame's graphics head
+    /// records into the same declarations — which is the overlap the whole
+    /// feature is for, and is a race on a single set. Duplicating every
+    /// transient rather than only the ones that provably cross is deliberate:
+    /// the ones that do are most of them, and "which transients does frame
+    /// `n + 1` share with frame `n`" is a derivation whose failure mode is
+    /// corruption rather than a compile error.
+    views: Vec<Vec<Option<Arc<ImageView>>>>,
+    /// Which set the frame now recording uses.
+    slot: usize,
     /// Every image allocated at the current extent, for any graph, keyed by what
     /// makes it that image.
     ///
@@ -71,16 +93,32 @@ pub(super) struct GraphImages {
 impl GraphImages {
     pub fn allocate(
         memory: &Arc<StandardMemoryAllocator>,
+        ctx: &super::context::VkContext,
         graph: &FrameGraph,
         extent: [u32; 2],
+        slots: usize,
     ) -> Self {
         let mut images = Self {
             views: Vec::new(),
+            slot: 0,
             cache: HashMap::new(),
             extent,
         };
-        images.rebuild(memory, graph, extent);
+        images.rebuild(memory, ctx, graph, extent, slots);
         images
+    }
+
+    /// Point the accessors at the set frame `frame` records into.
+    ///
+    /// Taken modulo however many sets there are, so a frame that is not
+    /// pipelined always lands on the only one.
+    pub fn set_slot(&mut self, frame: u64) {
+        self.slot = (frame % self.views.len().max(1) as u64) as usize;
+    }
+
+    /// How many frames' worth of images this holds.
+    pub fn slots(&self) -> usize {
+        self.views.len()
     }
 
     /// Point `views` at the images this graph declares, allocating only the ones
@@ -88,8 +126,10 @@ impl GraphImages {
     pub fn rebuild(
         &mut self,
         memory: &Arc<StandardMemoryAllocator>,
+        ctx: &super::context::VkContext,
         graph: &FrameGraph,
         extent: [u32; 2],
+        slots: usize,
     ) {
         // A target that is only ever an attachment never leaves the render pass
         // that wrote it, so ask for lazily-allocated memory: on MoltenVK it
@@ -118,101 +158,117 @@ impl GraphImages {
             self.extent = extent;
         }
 
-        let mut views = vec![None; graph.resource_count()];
+        let shared_families = ctx.shared_queue_families();
+        let mut sets = Vec::with_capacity(slots);
         // Within one graph a key must be claimed at most once, or two resources
         // would be handed the same allocation — see [`ImageKey`] for why that is
         // a correctness bug and not just a surprise. Names are unique per graph,
         // so this only fires on a declaration mistake.
         let mut claimed: std::collections::HashSet<ImageKey> = HashSet::new();
-        for (id, image) in graph.transient_images() {
-            let extent = image.desc.extent.resolve(extent);
-            let mip_levels = image.desc.mip_levels.min(max_mip_levels(extent));
-            // Vulkan has no arrayed 3D image, so the two are a declaration
-            // mistake together rather than a shape to resolve a winner for.
-            assert!(
-                image.desc.depth.is_none() || image.desc.array_layers.is_none(),
-                "render graph: `{}` asked to be both a 3D image and a 2D array",
-                graph.resource_name(id),
-            );
-            let key = ImageKey {
-                name: graph.resource_name(id).to_string(),
-                format: image.desc.format,
-                extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
-                usage: image.usage,
-                samples: image.desc.samples,
-                array_layers: image.desc.array_layers.unwrap_or(1),
-                mip_levels,
-                memoryless: image.memoryless,
-            };
-            assert!(
-                claimed.insert(key.clone()),
-                "render graph: two resources named `{}` describe the same image",
-                key.name,
-            );
-            if let Some(view) = self.cache.get(&key) {
-                views[id.index()] = Some(view.clone());
-                continue;
-            }
-
-            let allocated = Image::new(
-                memory.clone(),
-                ImageCreateInfo {
-                    image_type: match image.desc.depth {
-                        Some(_) => ImageType::Dim3d,
-                        None => ImageType::Dim2d,
-                    },
+        for slot in 0..slots {
+            let mut views = vec![None; graph.resource_count()];
+            for (id, image) in graph.transient_images() {
+                let extent = image.desc.extent.resolve(extent);
+                let mip_levels = image.desc.mip_levels.min(max_mip_levels(extent));
+                // Vulkan has no arrayed 3D image, so the two are a declaration
+                // mistake together rather than a shape to resolve a winner for.
+                assert!(
+                    image.desc.depth.is_none() || image.desc.array_layers.is_none(),
+                    "render graph: `{}` asked to be both a 3D image and a 2D array",
+                    graph.resource_name(id),
+                );
+                let key = ImageKey {
+                    name: graph.resource_name(id).to_string(),
+                    slot,
+                    // Only where the compiler said both queues reach it, and only
+                    // where there is a second family to name — so a single-queue
+                    // device creates exactly the images it always did.
+                    concurrent: image.concurrent && !shared_families.is_empty(),
                     format: image.desc.format,
                     extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
                     usage: image.usage,
                     samples: image.desc.samples,
                     array_layers: image.desc.array_layers.unwrap_or(1),
                     mip_levels,
-                    ..Default::default()
-                },
-                if image.memoryless {
-                    lazy.clone()
-                } else {
-                    AllocationCreateInfo::default()
-                },
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "render graph: could not allocate `{}` ({:?}, {:?}): {error}",
-                    graph.resource_name(id),
-                    image.desc.format,
-                    image.usage,
-                )
-            });
+                    memoryless: image.memoryless,
+                };
+                assert!(
+                    claimed.insert(key.clone()),
+                    "render graph: two resources named `{}` describe the same image",
+                    key.name,
+                );
+                if let Some(view) = self.cache.get(&key) {
+                    views[id.index()] = Some(view.clone());
+                    continue;
+                }
 
-            // The view type comes from the declaration, not from the layer
-            // count: an array image of one layer must still be viewed as an
-            // array, because the sampler type is compiled into the pipeline and
-            // cannot depend on how many cascades the settings happen to ask for.
-            let view = ImageView::new(
-                allocated.clone(),
-                ImageViewCreateInfo {
-                    view_type: match (image.desc.depth, image.desc.array_layers) {
-                        (Some(_), _) => ImageViewType::Dim3d,
-                        (None, Some(_)) => ImageViewType::Dim2dArray,
-                        (None, None) => ImageViewType::Dim2d,
+                let allocated = Image::new(
+                    memory.clone(),
+                    ImageCreateInfo {
+                        image_type: match image.desc.depth {
+                            Some(_) => ImageType::Dim3d,
+                            None => ImageType::Dim2d,
+                        },
+                        format: image.desc.format,
+                        extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
+                        usage: image.usage,
+                        samples: image.desc.samples,
+                        array_layers: image.desc.array_layers.unwrap_or(1),
+                        mip_levels,
+                        sharing: if key.concurrent {
+                            Sharing::Concurrent(shared_families.iter().copied().collect())
+                        } else {
+                            Sharing::Exclusive
+                        },
+                        ..Default::default()
                     },
-                    // A storage image descriptor takes exactly one level, so a
-                    // view spanning the whole pyramid cannot claim that usage —
-                    // it is the one a shader samples with `textureLod`, and the
-                    // per-level storage views come from `mip_view`.
-                    usage: if mip_levels > 1 {
-                        image.usage - ImageUsage::STORAGE
+                    if image.memoryless {
+                        lazy.clone()
                     } else {
-                        image.usage
+                        AllocationCreateInfo::default()
                     },
-                    ..ImageViewCreateInfo::from_image(&allocated)
-                },
-            )
-            .unwrap();
-            self.cache.insert(key, view.clone());
-            views[id.index()] = Some(view);
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "render graph: could not allocate `{}` ({:?}, {:?}): {error}",
+                        graph.resource_name(id),
+                        image.desc.format,
+                        image.usage,
+                    )
+                });
+
+                // The view type comes from the declaration, not from the layer
+                // count: an array image of one layer must still be viewed as an
+                // array, because the sampler type is compiled into the pipeline and
+                // cannot depend on how many cascades the settings happen to ask for.
+                let view = ImageView::new(
+                    allocated.clone(),
+                    ImageViewCreateInfo {
+                        view_type: match (image.desc.depth, image.desc.array_layers) {
+                            (Some(_), _) => ImageViewType::Dim3d,
+                            (None, Some(_)) => ImageViewType::Dim2dArray,
+                            (None, None) => ImageViewType::Dim2d,
+                        },
+                        // A storage image descriptor takes exactly one level, so a
+                        // view spanning the whole pyramid cannot claim that usage —
+                        // it is the one a shader samples with `textureLod`, and the
+                        // per-level storage views come from `mip_view`.
+                        usage: if mip_levels > 1 {
+                            image.usage - ImageUsage::STORAGE
+                        } else {
+                            image.usage
+                        },
+                        ..ImageViewCreateInfo::from_image(&allocated)
+                    },
+                )
+                .unwrap();
+                self.cache.insert(key, view.clone());
+                views[id.index()] = Some(view);
+            }
+            sets.push(views);
         }
-        self.views = views;
+        self.views = sets;
+        self.slot = self.slot.min(slots.saturating_sub(1));
     }
 
     pub fn is_stale(&self, extent: [u32; 2]) -> bool {
@@ -230,11 +286,11 @@ impl GraphImages {
     /// things from a miss: a pass binding a resource it declared has hit a bug,
     /// while the barrier resolver is *asking* which kind of resource this is.
     pub fn try_view(&self, id: ResourceId) -> Option<Arc<ImageView>> {
-        self.views[id.index()].clone()
+        self.views[self.slot][id.index()].clone()
     }
 
     pub fn view(&self, id: ResourceId) -> Arc<ImageView> {
-        self.views[id.index()]
+        self.views[self.slot][id.index()]
             .clone()
             .expect("render graph resource is not a graph-owned image")
     }

@@ -73,6 +73,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // MSAA with the diffusion on, which is the five-attachment forward pass:
@@ -102,6 +103,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         (
@@ -126,6 +128,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // Four cascades write four layers of one image, which the graph tracks
@@ -156,6 +159,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // SSAO off is a different graph, not a flag read at record time: the
@@ -185,6 +189,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // The shape that proves the prepass belongs to the frame rather than to
@@ -212,6 +217,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // Metering off is the other shape that ships. Worth baselining for one
@@ -241,6 +247,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // A window too small for a real chain still gets one level, and that
@@ -269,6 +276,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // The froxel fog, with the cascades it exists to read. Worth baselining
@@ -301,6 +309,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // The whole optical chain at once: lens, then shutter, then sensor.
@@ -330,6 +339,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // The other shape that proves the prepass belongs to the frame rather
@@ -359,6 +369,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // Reflections are the first thing to sit *between* shading and the
@@ -388,6 +399,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // And the same without a resolve behind it, which is the shape where
@@ -415,6 +427,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // What actually ships in the editor: the march sits between the prepass
@@ -444,6 +457,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // And the march on its own, which is the shape that proves it keeps the
@@ -471,6 +485,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // The punctual atlas: one pass however many lights cast, because a tile
@@ -499,6 +514,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 4096,
+                async_compute: false,
             },
         ),
         // And the atlas with no cascades, which is an ordinary scene: an indoor
@@ -527,6 +543,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 2048,
+                async_compute: false,
             },
         ),
         // What ships: transparency accumulates after the reflections and before
@@ -557,6 +574,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // And transparency on its own, which is the shape that proves it keeps
@@ -585,6 +603,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // Both non-opaque queues at once, which is the shape that pins the
@@ -614,6 +633,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // And refraction on its own, which proves it keeps the geometry prepass
@@ -641,6 +661,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // Subsurface scattering is the first thing to change the *forward pass's
@@ -673,6 +694,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         // And on its own, which is the shape that proves the diffusion keeps the
@@ -701,6 +723,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
             },
         ),
         (
@@ -725,6 +748,67 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_cascades: 2,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
+                async_compute: false,
+            },
+        ),
+        // The split, on the frame the editor actually runs. Every configuration
+        // above is here with one queue, so the pair is what says what the split
+        // changed: the pass order, the barriers and the layouts are the same
+        // text, and what is added is the three segment headers and the list of
+        // resources that had to stop being exclusive to one queue family.
+        (
+            "editor frame, async compute",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                msaa: false,
+                ssao: true,
+                ssao_half_res: true,
+                contact_shadows: true,
+                ssr: false,
+                subsurface: false,
+                transparency: true,
+                refraction: true,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
+                volumetric_fog: false,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 4,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 0,
+                async_compute: true,
+            },
+        ),
+        // And the frame the split is *for*: every optical stage on, which is
+        // where two thirds of the GPU time is dispatches. The interleaved ones —
+        // the depth pyramid, the fog grid, the transparency and refraction
+        // composites — must stay on the graphics queue here, because each has a
+        // draw after it; only the run from the last draw to the tonemap moves.
+        (
+            "editor frame, async compute with every optical stage",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                msaa: false,
+                ssao: true,
+                ssao_half_res: true,
+                contact_shadows: true,
+                ssr: true,
+                subsurface: true,
+                transparency: true,
+                refraction: true,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: true,
+                dof: true,
+                volumetric_fog: true,
+                bloom_mips: BLOOM_MIPS,
+                overlay: false,
+                shadow_cascades: 4,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 2048,
+                async_compute: true,
             },
         ),
     ]
@@ -830,6 +914,7 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             shadow_cascades: count,
             shadow_resolution: SHADOW_RESOLUTION,
             shadow_atlas: 0,
+            async_compute: false,
         })
         .unwrap();
 
@@ -878,6 +963,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
+        async_compute: false,
     })
     .unwrap();
 
@@ -932,6 +1018,7 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
+        async_compute: false,
     })
     .unwrap();
 
@@ -982,6 +1069,7 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
+        async_compute: false,
     })
     .unwrap();
 
@@ -1041,6 +1129,7 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
+        async_compute: false,
     })
     .unwrap();
 
@@ -1097,6 +1186,7 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
+        async_compute: false,
     })
     .unwrap();
 
@@ -1155,6 +1245,7 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
+        async_compute: false,
     };
 
     let plan = format!("{}", declare(base).unwrap().graph);
@@ -1251,6 +1342,7 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
+        async_compute: false,
     })
     .unwrap();
 
@@ -1310,6 +1402,7 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
+        async_compute: false,
     })
     .unwrap();
 
@@ -1360,6 +1453,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
+        async_compute: false,
     })
     .unwrap();
 
@@ -1432,6 +1526,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
+        async_compute: false,
     };
 
     let consumers: [(&str, fn(&mut FrameConfig)); 10] = [

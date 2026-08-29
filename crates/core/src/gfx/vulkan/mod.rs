@@ -29,6 +29,7 @@ mod texture;
 mod timestamps;
 mod vendor;
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
@@ -65,7 +66,7 @@ use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
 use self::instances::InstanceStore;
 use self::oit::OitPass;
 use self::refraction::RefractionPass;
-use crate::gfx::graph::{PassKind, ResourceId};
+use crate::gfx::graph::{PassKind, Queue as GraphQueue, ResourceId};
 
 use self::bloom::BloomPass;
 use self::dof::DofPass;
@@ -77,6 +78,7 @@ use self::line::LinePass;
 use self::motion_blur::MotionBlurPass;
 use self::prepass::GeometryPrepass;
 use self::record::{InFlight, Recorder, RunAhead};
+use vulkano::command_buffer::CommandBuffer;
 
 /// How far the CPU may record ahead of the GPU.
 ///
@@ -262,7 +264,26 @@ pub struct VulkanRenderer {
     /// What runs ahead is the recording, not the execution.
     in_flight: RunAhead<InFlight>,
     /// Signalled when the last submitted frame finishes, and waited by the next.
+    ///
+    /// Only on the unsplit path. A split frame's ordering comes from the
+    /// per-segment semaphores in [`PendingTail`] instead, because "the whole of
+    /// the last frame" is exactly the dependency the split exists to remove.
     frame_chain: Option<Arc<Semaphore>>,
+    /// Which frame this is, counted from the first. Picks the frame's set of
+    /// graph images, and nothing else.
+    frame_index: u64,
+    /// The previous frame's trailing graphics segment, recorded and waiting to
+    /// be submitted behind *this* frame's head. See [`PendingTail`].
+    pending: Option<PendingTail>,
+    /// Signalled by the trailing segment submitted last call, waited by the head
+    /// submitted next call.
+    ///
+    /// That segment belongs to the frame two back, which is the frame that last
+    /// wrote the set of graph images the next one will — so this is the only
+    /// thing a head has to wait for, and the alternative is trusting a queue to
+    /// execute submissions in the order they were made, which Vulkan does not
+    /// promise.
+    head_gate: Option<Arc<Semaphore>>,
     /// The overlay's submissions and presents, when one ran. Nothing waits on
     /// them, but they are bounded like the frames are and for a sharper reason:
     /// `FenceSignalFuture`'s destructor waits on its fence, so holding one slot
@@ -390,9 +411,12 @@ impl VulkanRenderer {
             shadow_cascades: 0,
             shadow_resolution: 1,
             shadow_atlas: 0,
+            async_compute: ctx.compute_queue.is_some(),
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
-        let images = GraphImages::allocate(&ctx.memory_allocator, &frame.graph, extent);
+        let slots = image_slots(&frame.graph);
+        let images =
+            GraphImages::allocate(&ctx.memory_allocator, &ctx, &frame.graph, extent, slots);
 
         Self {
             instances: InstanceStore::new(&ctx),
@@ -428,6 +452,9 @@ impl VulkanRenderer {
             shadow_texture_set: None,
             in_flight: RunAhead::new(FRAMES_IN_FLIGHT),
             frame_chain: None,
+            frame_index: 0,
+            pending: None,
+            head_gate: None,
             overlay_present: RunAhead::new(FRAMES_IN_FLIGHT),
             recreate_swapchain: false,
             pending_extent: extent,
@@ -465,6 +492,10 @@ impl VulkanRenderer {
     pub fn capture(&mut self) -> Option<(Vec<u8>, [u32; 2])> {
         let image = self.swapchain.readback.first()?.clone();
 
+        // A split frame holds its last segment back a frame on purpose, so
+        // without this the readback copies the frame *before* the one the caller
+        // just rendered. See [`PendingTail`].
+        self.flush_pending_tail();
         self.in_flight.drain();
         // The overlay is the last thing to write the target when there is one,
         // so a readback that skipped it would copy the frame underneath it.
@@ -494,8 +525,165 @@ impl VulkanRenderer {
         Some((pixels, extent))
     }
 
+    /// Draw the overlay over a finished frame and present it.
+    ///
+    /// Shared by both submission paths, which differ only in *when* they reach
+    /// it: unsplit, the frame just submitted; split, the frame before it, whose
+    /// trailing segment this call has finally sent.
+    fn finish_frame(
+        &mut self,
+        overlay_ready: Option<Arc<Semaphore>>,
+        render_finished: Option<Arc<Semaphore>>,
+        image_index: u32,
+        raw_passes: &[PassBody],
+        overlay: Option<Overlay<'_>>,
+    ) {
+        if let Some(ready) = overlay_ready {
+            let mut future = record::SemaphoreWait::new(
+                self.ctx.queue.clone(),
+                ready,
+                self.swapchain
+                    .swapchain
+                    .clone()
+                    .map(|swapchain| (swapchain, image_index)),
+            )
+            .boxed();
+            let mut overlay = overlay;
+            for body in raw_passes {
+                match body {
+                    PassBody::Overlay => {
+                        profile_scope!("overlay");
+                        let draw = overlay
+                            .take()
+                            .expect("the graph scheduled an overlay pass but none was supplied");
+                        future = draw(
+                            future,
+                            self.swapchain.image_views[image_index as usize].clone(),
+                        );
+                    }
+                    other => unreachable!("{other:?} is not a raw pass"),
+                }
+            }
+            // Presented through the overlay's own future rather than by the raw
+            // path below: it is the last writer, so it owns the transition to
+            // `PresentSrc` that the frame's `final_barriers` deliberately left
+            // out. Not waited on — the next frame's acquire is what bounds it,
+            // exactly as it did before the renderer recorded raw.
+            let presented = match self.swapchain.swapchain.clone() {
+                Some(swapchain) => future
+                    .then_swapchain_present(
+                        self.ctx.queue.clone(),
+                        SwapchainPresentInfo::swapchain_image_index(swapchain, image_index),
+                    )
+                    .boxed()
+                    .then_signal_fence_and_flush(),
+                None => future.then_signal_fence_and_flush(),
+            };
+            match presented.map_err(Validated::unwrap) {
+                Ok(future) => self.overlay_present.push(future),
+                Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
+                Err(e) => eprintln!("failed to flush the overlay: {e}"),
+            }
+            return;
+        }
+
+        debug_assert!(raw_passes.is_empty());
+        let Some(swapchain) = self.swapchain.swapchain.clone() else {
+            return;
+        };
+        // Raw, like the submit — but for the opposite reason: this one is
+        // simply what vulkano exposes for a present that waits on a semaphore
+        // the caller owns.
+        let wait_semaphores = render_finished
+            .iter()
+            .map(|semaphore| SemaphorePresentInfo::new(semaphore.clone()))
+            .collect();
+        let present_info = PresentInfo {
+            wait_semaphores,
+            swapchain_infos: vec![SwapchainPresentInfo::swapchain_image_index(
+                swapchain,
+                image_index,
+            )],
+            ..Default::default()
+        };
+        let result = self.ctx.queue.clone().with(|mut queue| {
+            // SAFETY: the image was acquired from this swapchain and has not
+            // been presented since; the wait semaphore is the one the
+            // submission signals, or none, in which case the overlay path has
+            // already waited on the CPU.
+            unsafe { queue.present(&present_info) }
+                .map(|results| results.into_iter().collect::<Vec<_>>())
+        });
+        match result.map_err(Validated::unwrap) {
+            Ok(results) => {
+                for result in results {
+                    match result {
+                        Ok(suboptimal) => self.recreate_swapchain |= suboptimal,
+                        Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
+                        Err(e) => eprintln!("failed to present: {e}"),
+                    }
+                }
+            }
+            Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
+            Err(e) => eprintln!("failed to present: {e}"),
+        }
+    }
+
+    /// Submit the trailing segment held back from the last frame, so that the
+    /// GPU has the whole of it.
+    ///
+    /// The readback path's, and the shutdown path's: everywhere else the
+    /// segment is submitted behind the next frame's head, which is the entire
+    /// reason it waits. Presents nothing — a caller that wanted the image on
+    /// screen would have rendered another frame.
+    fn flush_pending_tail(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let mut waits = vec![(
+            pending.compute_done,
+            ash::vk::PipelineStageFlags::ALL_COMMANDS,
+        )];
+        if let Some(acquired) = pending.acquire {
+            waits.push((
+                acquired,
+                ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            ));
+        }
+        let in_flight = record::submit_frame(
+            &self.ctx,
+            &self.ctx.queue.clone(),
+            pending.command_buffer,
+            pending.keep,
+            &waits,
+            &[],
+        );
+        self.in_flight.push(in_flight);
+    }
+
     fn new_command_buffer(&self) -> Recorder {
         Recorder::new(&self.ctx)
+    }
+
+    /// The queue a segment is submitted to.
+    ///
+    /// The compiler plans against roles, not families; this is where a role
+    /// meets the device. `AsyncCompute` can only be scheduled when there is a
+    /// queue for it — `FrameConfig::async_compute` says so — so the fallback
+    /// here is unreachable rather than a silent downgrade.
+    fn queue_of(&self, queue: GraphQueue) -> &Arc<vulkano::device::Queue> {
+        match queue {
+            GraphQueue::Graphics => &self.ctx.queue,
+            GraphQueue::AsyncCompute => self
+                .ctx
+                .compute_queue
+                .as_ref()
+                .expect("the graph scheduled an async segment with no queue to put it on"),
+        }
+    }
+
+    fn queue_family(&self, queue: GraphQueue) -> u32 {
+        self.queue_of(queue).queue_family_index()
     }
 
     /// The view backing a graph resource, whoever owns the allocation.
@@ -574,8 +762,10 @@ impl VulkanRenderer {
         // instead of recreating every image in the frame. See `GraphImages`.
         self.images.rebuild(
             &self.ctx.memory_allocator,
+            &self.ctx,
             &self.frame.graph,
             self.swapchain.extent,
+            image_slots(&self.frame.graph),
         );
     }
 }
@@ -866,6 +1056,14 @@ impl VulkanRenderer {
         }
 
         if self.recreate_swapchain {
+            // Whatever is held back is held back against the *old* swapchain: it
+            // writes an image acquired from it, and the index it was acquired at
+            // means nothing in the replacement. Submitted and waited for here so
+            // the images it names are finished with, and then dropped
+            // unpresented — which is what a resize does to a frame anyway.
+            self.flush_pending_tail();
+            self.in_flight.drain();
+            self.overlay_present.drain();
             if self.swapchain.recreate(self.pending_extent, self.present) {
                 self.recreate_swapchain = false;
             } else {
@@ -928,6 +1126,11 @@ impl VulkanRenderer {
                     s.atlas.resolution
                 }
             }),
+            // What the device turned out to have, not a preference. Whether the
+            // frame is actually split is then the compiler's call — a
+            // configuration with no compute tail to move gets the plan it always
+            // had, on a device with two queues as much as on one.
+            async_compute: self.ctx.compute_queue.is_some(),
         });
 
         // Release what the GPU has already finished and block only if the CPU
@@ -981,6 +1184,12 @@ impl VulkanRenderer {
         if suboptimal {
             self.recreate_swapchain = true;
         }
+
+        // Which set of the graph's images this frame writes. One set unless the
+        // frame was split, in which case the previous frame's compute tail is
+        // still reading the other.
+        self.images.set_slot(self.frame_index);
+        self.frame_index = self.frame_index.wrapping_add(1);
 
         // Taken out of `self` for the duration of recording: the pass brackets
         // below interleave with calls that borrow `self` immutably, and a field
@@ -1331,7 +1540,7 @@ impl VulkanRenderer {
             None => vec![None; self.frame.graph.order().len()],
         };
 
-        FrameRecord {
+        let record = FrameRecord {
             ctx: &self.ctx,
             meshes: &self.meshes,
             materials: &self.materials,
@@ -1379,11 +1588,39 @@ impl VulkanRenderer {
             scene_color,
             shadow_view,
             debug_lines,
+        };
+
+        // One command buffer per compiled segment, each bound for the queue the
+        // schedule put it on. One segment — the whole frame on the graphics
+        // queue — is what a device with a single queue always gets, and is
+        // recorded and submitted exactly as it was before the split existed.
+        let ranges: Vec<(GraphQueue, Range<usize>)> = self
+            .frame
+            .graph
+            .segments()
+            .iter()
+            .map(|segment| (segment.queue, segment.passes.clone()))
+            .collect();
+        let overlay_pass = raw_passes.iter().any(|body| *body == PassBody::Overlay);
+
+        let mut recorded: Vec<(GraphQueue, CommandBuffer, record::KeepAlive)> =
+            Vec::with_capacity(ranges.len());
+        for (index, (queue, range)) in ranges.iter().enumerate() {
+            if index > 0 {
+                let (commands, keep) = builder.end();
+                recorded.push((ranges[index - 1].0, commands, keep));
+                builder = Recorder::for_family(&self.ctx, self.queue_family(*queue));
+            }
+            // Only the graphics head is worth spreading over the pool: the
+            // compute tail is a handful of commands per dispatch, and a
+            // secondary would have to come from the other family's pool to say
+            // so. See `FrameRecord::cost`, which scores every dispatch zero.
+            record.record_segment(&mut builder, range.clone(), *queue == GraphQueue::Graphics);
         }
-        .record_frame(&mut builder);
 
         // Leave every import in the layout its owner expects — for the
         // swapchain image, the `PresentSrc` the presentation engine requires.
+        // In the last segment, because that is where the frame ends.
         //
         // Emitted even when an overlay follows in its own command buffer:
         // vulkano gives a swapchain image a fixed layout requirement of
@@ -1392,7 +1629,6 @@ impl VulkanRenderer {
         // in `ColorAttachmentOptimal` makes that barrier's `oldLayout` a lie,
         // and the contents undefined. Transitioning here presents nothing — the
         // present happens later, on the overlay's own future.
-        let overlay_pass = raw_passes.iter().any(|body| *body == PassBody::Overlay);
         builder.barriers(self.frame.graph.final_barriers(), |id| {
             self.barrier_target(id, &swapchain_view)
         });
@@ -1404,152 +1640,216 @@ impl VulkanRenderer {
             self.timestamps = timestamps;
         }
 
-        let (command_buffer, keep) = builder.end();
+        let (commands, keep) = builder.end();
+        recorded.push((
+            ranges
+                .last()
+                .expect("a compiled frame has at least one segment")
+                .0,
+            commands,
+            keep,
+        ));
         drop(recording);
 
         let submitting = crate::profile::scope("submit");
 
-        // The one thing this command buffer does not contain:
+        // The one thing a frame's command buffers do not contain:
         // `Gui::draw_on_image` builds and submits its own, chained onto a
-        // [`SemaphoreWait`] on this frame's completion, so the dependency stays
+        // [`SemaphoreWait`] on the frame's completion, so the dependency stays
         // on the GPU.
-        let semaphore = || {
+        // Cloned out of `self` because the submission below takes `&mut self`
+        // to present, and a closure holding a field borrow across that would
+        // not compile.
+        let device = self.ctx.device.clone();
+        let semaphore = move || {
             Arc::new(
-                Semaphore::from_pool(self.ctx.device.clone())
-                    .expect("failed to create a frame semaphore"),
+                Semaphore::from_pool(device.clone()).expect("failed to create a frame semaphore"),
             )
         };
 
-        // One signal per waiter: a binary semaphore's signal may be waited
-        // exactly once, so the present and the next frame cannot share one.
-        // With an overlay, the present is the overlay's to make, so the frame
-        // signals a semaphore for *it* to wait on instead.
-        let render_finished =
-            (self.swapchain.swapchain.is_some() && !overlay_pass).then(&semaphore);
-        let overlay_ready = overlay_pass.then(&semaphore);
-        let chain = semaphore();
+        let mut recorded = recorded;
+        if recorded.len() == 1 {
+            // One queue, one submission, and the frame presented before this
+            // call returns — what every device without a compute-only family
+            // does, and what every device did before there was a split.
+            let (_, command_buffer, keep) = recorded.pop().expect("checked non-empty");
 
-        let mut waits = Vec::new();
-        if let Some(acquired) = acquire_semaphore {
-            // The acquired image is only written by the passes that render into
-            // it, and the earliest of those is the tonemap's colour write.
-            // Waiting at colour-attachment output rather than top-of-pipe lets
-            // every shadow, prepass, lighting and post dispatch in the frame run
-            // while the presentation engine still owns the image.
-            waits.push((
-                acquired,
-                ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            ));
-        }
-        if let Some(previous) = self.frame_chain.take() {
-            // What the old `GpuFuture` chain did, and for the same reason: one
-            // set of graph images means this frame writes what the last one is
-            // still reading. The dependency is on the GPU, so the CPU does not
-            // wait for it.
-            waits.push((previous, ash::vk::PipelineStageFlags::ALL_COMMANDS));
-        }
+            // One signal per waiter: a binary semaphore's signal may be waited
+            // exactly once, so the present and the next frame cannot share one.
+            // With an overlay, the present is the overlay's to make, so the
+            // frame signals a semaphore for *it* to wait on instead.
+            let render_finished =
+                (self.swapchain.swapchain.is_some() && !overlay_pass).then(&semaphore);
+            let overlay_ready = overlay_pass.then(&semaphore);
+            let chain = semaphore();
 
-        let signals: Vec<_> = render_finished
-            .clone()
-            .into_iter()
-            .chain(overlay_ready.clone())
-            .chain(Some(chain.clone()))
-            .collect();
-
-        let in_flight = record::submit_frame(&self.ctx, command_buffer, keep, &waits, &signals);
-        self.frame_chain = Some(chain);
-
-        if overlay_pass {
-            self.in_flight.push(in_flight);
-            let ready = overlay_ready.expect("an overlay frame signals its own semaphore");
-            let mut future = record::SemaphoreWait::new(
-                self.ctx.queue.clone(),
-                ready,
-                self.swapchain
-                    .swapchain
-                    .clone()
-                    .map(|swapchain| (swapchain, image_index)),
-            )
-            .boxed();
-            let mut overlay = overlay;
-            for body in raw_passes {
-                match body {
-                    PassBody::Overlay => {
-                        profile_scope!("overlay");
-                        let draw = overlay
-                            .take()
-                            .expect("the graph scheduled an overlay pass but none was supplied");
-                        future = draw(
-                            future,
-                            self.swapchain.image_views[image_index as usize].clone(),
-                        );
-                    }
-                    other => unreachable!("{other:?} is not a raw pass"),
-                }
+            let mut waits = Vec::new();
+            if let Some(acquired) = acquire_semaphore {
+                // The acquired image is only written by the passes that render
+                // into it, and the earliest of those is the tonemap's colour
+                // write. Waiting at colour-attachment output rather than
+                // top-of-pipe lets every shadow, prepass, lighting and post
+                // dispatch in the frame run while the presentation engine still
+                // owns the image.
+                waits.push((
+                    acquired,
+                    ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                ));
             }
-            // Presented through the overlay's own future rather than by the raw
-            // path below: it is the last writer, so it owns the transition to
-            // `PresentSrc` that this frame's `final_barriers` deliberately left
-            // out. Not waited on — the next frame's acquire is what bounds it,
-            // exactly as it did before the renderer recorded raw.
-            let presented = match self.swapchain.swapchain.clone() {
-                Some(swapchain) => future
-                    .then_swapchain_present(
-                        self.ctx.queue.clone(),
-                        SwapchainPresentInfo::swapchain_image_index(swapchain, image_index),
-                    )
-                    .boxed()
-                    .then_signal_fence_and_flush(),
-                None => future.then_signal_fence_and_flush(),
-            };
-            match presented.map_err(Validated::unwrap) {
-                Ok(future) => self.overlay_present.push(future),
-                Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
-                Err(e) => eprintln!("failed to flush the overlay: {e}"),
+            if let Some(previous) = self.frame_chain.take() {
+                // What the old `GpuFuture` chain did, and for the same reason:
+                // one set of graph images means this frame writes what the last
+                // one is still reading. The dependency is on the GPU, so the CPU
+                // does not wait for it.
+                waits.push((previous, ash::vk::PipelineStageFlags::ALL_COMMANDS));
             }
-        } else {
-            debug_assert!(raw_passes.is_empty());
-            self.in_flight.push(in_flight);
-        }
 
-        if let Some(swapchain) = self.swapchain.swapchain.clone().filter(|_| !overlay_pass) {
-            // Raw, like the submit — but for the opposite reason: this one is
-            // simply what vulkano exposes for a present that waits on a
-            // semaphore the caller owns.
-            let wait_semaphores = render_finished
-                .iter()
-                .map(|semaphore| SemaphorePresentInfo::new(semaphore.clone()))
+            let signals: Vec<_> = render_finished
+                .clone()
+                .into_iter()
+                .chain(overlay_ready.clone())
+                .chain(Some(chain.clone()))
                 .collect();
-            let present_info = PresentInfo {
-                wait_semaphores,
-                swapchain_infos: vec![SwapchainPresentInfo::swapchain_image_index(
-                    swapchain,
-                    image_index,
-                )],
-                ..Default::default()
-            };
-            let result = self.ctx.queue.clone().with(|mut queue| {
-                // SAFETY: the image was acquired from this swapchain above and
-                // has not been presented since; the wait semaphore is the one
-                // the submission above signals, or none, in which case the
-                // overlay path has already waited on the CPU.
-                unsafe { queue.present(&present_info) }
-                    .map(|results| results.into_iter().collect::<Vec<_>>())
-            });
-            match result.map_err(Validated::unwrap) {
-                Ok(results) => {
-                    for result in results {
-                        match result {
-                            Ok(suboptimal) => self.recreate_swapchain |= suboptimal,
-                            Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
-                            Err(e) => eprintln!("failed to present: {e}"),
-                        }
-                    }
-                }
-                Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
-                Err(e) => eprintln!("failed to present: {e}"),
-            }
+
+            let in_flight = record::submit_frame(
+                &self.ctx,
+                &self.ctx.queue.clone(),
+                command_buffer,
+                keep,
+                &waits,
+                &signals,
+            );
+            self.frame_chain = Some(chain);
+            self.in_flight.push(in_flight);
+            self.finish_frame(
+                overlay_ready,
+                render_finished,
+                image_index,
+                &raw_passes,
+                overlay,
+            );
+            drop(submitting);
+            return;
         }
+
+        // Split. Three submissions, in the one order that lets the compute tail
+        // overlap anything: this frame's head first, so it is ahead of the
+        // *previous* frame's trailing segment on the graphics queue and does not
+        // inherit its wait; that trailing segment second; and this frame's
+        // compute tail last, which is now free to run beside whatever the
+        // graphics queue does next.
+        let tail = recorded.pop().expect("a split frame has three segments");
+        let compute = recorded.pop().expect("a split frame has three segments");
+        let (_, head_commands, head_keep) =
+            recorded.pop().expect("a split frame has three segments");
+
+        // 1. The graphics head. It waits only for the frame that last used this
+        //    frame's set of graph images to have finished with them — two frames
+        //    back, whose trailing segment signalled this. Named explicitly
+        //    rather than left to the queue's submission order, which Vulkan does
+        //    not guarantee is execution order.
+        let head_done = semaphore();
+        let mut head_waits = Vec::new();
+        if let Some(gate) = self.head_gate.take() {
+            head_waits.push((gate, ash::vk::PipelineStageFlags::ALL_COMMANDS));
+        }
+        let mut in_flight = record::submit_frame(
+            &self.ctx,
+            &self.ctx.queue.clone(),
+            head_commands,
+            head_keep,
+            &head_waits,
+            &[head_done.clone()],
+        );
+
+        // 2. The previous frame's trailing segment, behind this frame's head.
+        //    Its compute tail has had a whole frame to run.
+        let (previous_tail_done, next_head_gate) = match self.pending.take() {
+            Some(pending) => {
+                let render_finished =
+                    (self.swapchain.swapchain.is_some() && !pending.overlay).then(&semaphore);
+                let overlay_ready = pending.overlay.then(&semaphore);
+                // Two, not one: a binary semaphore's signal may be waited
+                // exactly once, and this segment has two waiters — this frame's
+                // compute tail, and the head of the frame after it.
+                let done = semaphore();
+                let gate = semaphore();
+                let mut waits = vec![(
+                    pending.compute_done,
+                    ash::vk::PipelineStageFlags::ALL_COMMANDS,
+                )];
+                if let Some(acquired) = pending.acquire {
+                    waits.push((
+                        acquired,
+                        ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    ));
+                }
+                let signals: Vec<_> = render_finished
+                    .clone()
+                    .into_iter()
+                    .chain(overlay_ready.clone())
+                    .chain([done.clone(), gate.clone()])
+                    .collect();
+                in_flight = in_flight.and(record::submit_frame(
+                    &self.ctx,
+                    &self.ctx.queue.clone(),
+                    pending.command_buffer,
+                    pending.keep,
+                    &waits,
+                    &signals,
+                ));
+                // The overlay drawn over it is the one *this* call supplied, so
+                // the editor's UI leads the scene under it by a frame. The cost
+                // of holding the segment back, and the reason `PendingTail` says
+                // so.
+                self.finish_frame(
+                    overlay_ready,
+                    render_finished,
+                    pending.image_index,
+                    &raw_passes,
+                    overlay,
+                );
+                (Some(done), Some(gate))
+            }
+            None => (None, None),
+        };
+
+        // 3. The compute tail. Behind this frame's head, and behind the previous
+        //    frame's trailing segment — which is not the graphics queue leaking
+        //    back in, but the one resource the two really do share: the exposure
+        //    the metering dispatch overwrites is the exposure the previous
+        //    frame's tonemap reads. It costs nothing, because that segment runs
+        //    immediately after the compute work this one already follows.
+        let compute_done = semaphore();
+        let mut compute_waits = vec![(head_done, ash::vk::PipelineStageFlags::ALL_COMMANDS)];
+        if let Some(previous) = previous_tail_done {
+            compute_waits.push((previous, ash::vk::PipelineStageFlags::ALL_COMMANDS));
+        }
+        let (_, compute_commands, compute_keep) = compute;
+        in_flight = in_flight.and(record::submit_frame(
+            &self.ctx,
+            &self.queue_of(GraphQueue::AsyncCompute).clone(),
+            compute_commands,
+            compute_keep,
+            &compute_waits,
+            &[compute_done.clone()],
+        ));
+        self.in_flight.push(in_flight);
+
+        // What the *next* frame's head waits on: this call submitted the frame
+        // two back's last work, so its completion is when this frame's images
+        // become the next-but-one frame's to write.
+        self.head_gate = next_head_gate;
+
+        let (_, tail_commands, tail_keep) = tail;
+        self.pending = Some(PendingTail {
+            command_buffer: tail_commands,
+            keep: tail_keep,
+            compute_done,
+            acquire: acquire_semaphore,
+            image_index,
+            overlay: overlay_pass,
+        });
 
         drop(submitting);
     }
@@ -1622,6 +1922,44 @@ struct FrameRecord<'a> {
     debug_lines: &'a [DebugLine],
 }
 
+/// A frame's trailing graphics segment, held back a frame on purpose.
+///
+/// The tonemap is a draw, so it belongs on the graphics queue, and it is the
+/// last thing the frame does. A queue is consumed in order, so submitting it in
+/// its own frame would put a wait for the compute tail *in front of* the next
+/// frame's head — and that head is the work the split exists to run early. Held
+/// here instead and submitted at the start of the next frame, behind that head,
+/// which is the one order in which both can be true.
+///
+/// What it costs is a frame of latency, and one consequence worth knowing: the
+/// overlay drawn over this image is the one the *next* `render` call supplied,
+/// so the editor's UI leads the scene under it by a frame.
+struct PendingTail {
+    command_buffer: vulkano::command_buffer::CommandBuffer,
+    keep: record::KeepAlive,
+    /// Signalled by the compute segment this waits on.
+    compute_done: Arc<Semaphore>,
+    /// The acquire for the image the tonemap writes, waited at colour-attachment
+    /// output for the reason the unsplit path waits it there.
+    acquire: Option<Arc<Semaphore>>,
+    image_index: u32,
+    /// Whether a raw pass draws over the result before it is presented.
+    overlay: bool,
+}
+
+/// How many sets of the graph's transient images the compiled frame needs.
+///
+/// One, unless the frame was split — with the split, this frame's compute tail
+/// is still running when the next frame's graphics head starts recording into
+/// the same declarations, which is the whole overlap and a race on one set.
+fn image_slots(graph: &crate::gfx::graph::FrameGraph) -> usize {
+    if graph.segments().len() > 1 {
+        FRAMES_IN_FLIGHT
+    } else {
+        1
+    }
+}
+
 /// How many command buffers one frame's recording is worth splitting into.
 ///
 /// The partition has little left to give beyond this: the punctual shadow atlas
@@ -1631,29 +1969,36 @@ struct FrameRecord<'a> {
 const RECORD_GROUPS: usize = 3;
 
 impl FrameRecord<'_> {
-    /// Record the whole frame into `builder`, in the order the compiler derived.
+    /// Record one of the compiled frame's segments into `builder`, in the order
+    /// the compiler derived.
     ///
     /// Serially, or — where the pool has threads to spare — into one secondary
     /// command buffer per contiguous run of passes, executed by `builder` in
     /// that same order. The GPU is handed the same stream either way: a run
     /// carries the barriers the plan puts in front of its own passes, and
     /// nothing about a pass's recording depends on which buffer it lands in.
-    fn record_frame(&self, builder: &mut Recorder) {
-        let slots = self.frame.graph.order().len();
+    ///
+    /// A segment rather than the whole frame because a split frame is several
+    /// command buffers submitted to different queues — see
+    /// `gfx/graph/schedule.rs`. The partition is per segment for the same
+    /// reason it is contiguous: the runs are executed in order by one primary,
+    /// and there is one primary per segment.
+    fn record_segment(&self, builder: &mut Recorder, segment: Range<usize>, parallel: bool) {
+        let slots = segment.len();
         let groups = threads::count().min(RECORD_GROUPS);
-        if groups < 2 || slots < 2 {
-            for slot in 0..slots {
+        if !parallel || groups < 2 || slots < 2 {
+            for slot in segment {
                 self.record_slot(builder, slot);
             }
             return;
         }
 
-        let costs: Vec<u32> = (0..slots).map(|slot| self.cost(slot)).collect();
+        let costs: Vec<u32> = segment.clone().map(|slot| self.cost(slot)).collect();
         let runs = parallel::partition(&costs, groups);
         let recorded = threads::map(&runs, |run| {
             let mut secondary = Recorder::secondary(self.ctx);
-            for slot in run.clone() {
-                self.record_slot(&mut secondary, slot);
+            for offset in run.clone() {
+                self.record_slot(&mut secondary, segment.start + offset);
             }
             secondary.end()
         });
