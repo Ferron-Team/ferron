@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use glam::Mat4;
@@ -26,6 +27,7 @@ use vulkano::pipeline::{
     PipelineShaderStageCreateInfo,
 };
 
+use crate::geom::Frustum;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::{DrawList, PositionVertex};
 
@@ -216,7 +218,22 @@ impl ShadowPass {
         // the rest.
         builder.set_depth_bias(self.constant_bias, 0.0, self.slope_bias);
 
-        self.draw(builder, renderer, casters, view_proj, object_base, sets);
+        // A cascade is one view into a map it owns outright, so its guard starts
+        // and ends here.
+        self.draw(
+            builder,
+            renderer,
+            casters,
+            view_proj,
+            object_base,
+            sets,
+            // Already culled, and against a wider test than this one: a caster
+            // outside the cascade's box can still shadow into it, which is what
+            // `casts_into` extends the box along the sun to catch. Re-testing
+            // here with the plain frustum would undo that and drop shadows.
+            None,
+            &mut Bound::default(),
+        );
     }
 
     /// Record every face of every punctual caster into one atlas.
@@ -272,6 +289,12 @@ impl ShadowPass {
 
         builder.set_depth_bias(self.punctual_constant_bias, 0.0, self.punctual_slope_bias);
 
+        // One guard for every light and every face rather than one per call into
+        // `draw`. The two pipelines and the three descriptor sets are the same
+        // for the whole atlas, so past the first run nothing below rebinds
+        // either — where a guard scoped to one face rebound both on every one of
+        // the nineteen tiles a demo frame assigns.
+        let mut bound = Bound::default();
         for (index, caster) in atlas.casters.iter().enumerate() {
             let (Some(list), Some(&base)) = (casters.get(index), bases.get(index)) else {
                 continue;
@@ -281,7 +304,28 @@ impl ShadowPass {
             }
             for face in &atlas.faces[caster.first_face..caster.first_face + caster.face_count] {
                 self.set_tile(builder, face.tile.offset, face.tile.size);
-                self.draw(builder, renderer, *list, face.view_proj, base, sets);
+                // Culled per face, where the caster lists were culled per
+                // *light*. A point light's six frustums partition the space its
+                // sphere covers, so most of what the light reaches is behind
+                // five of them: on the demo frame this is what takes the atlas
+                // from 254 draws to 122.
+                //
+                // Sound here in a way it is not for a cascade. These frustums
+                // have their apex at the light, so anything that can occlude
+                // light travelling into a face is inside that face's frustum —
+                // there is no equivalent of the caster standing outside a
+                // cascade's box and shadowing into it.
+                let frustum = Frustum::from_view_projection(face.view_proj);
+                self.draw(
+                    builder,
+                    renderer,
+                    *list,
+                    face.view_proj,
+                    base,
+                    sets,
+                    Some(&frustum),
+                    &mut bound,
+                );
             }
         }
     }
@@ -314,12 +358,19 @@ impl ShadowPass {
     /// The draw loop both callers share: one instanced draw per (mesh, material)
     /// run, with the light's matrix pushed per run.
     ///
-    /// Nothing is bound on entry — not the pipeline and not the object set —
-    /// because a run's material decides both. Every tile of the atlas and every
-    /// cascade re-enters here, so the first run of each rebinds; that is one
-    /// bind per tile against a loop whose body is a draw call, and it is what
-    /// lets the pipeline change *inside* a tile when the caster list mixes
-    /// foliage with everything else.
+    /// A run's material decides both the pipeline and the sets bound with it, so
+    /// the loop still switches between them mid-tile when a caster list mixes
+    /// foliage with everything else. What it no longer does is rebind on entry:
+    /// `bound` belongs to the caller and spans the whole render pass instance.
+    ///
+    /// Faces stay the outer loop, drawn one at a time. Inverting that — one run
+    /// drawn into all six faces of a point light — records the same draws off
+    /// one mesh binding instead of six, and was measured and rejected: it
+    /// scatters consecutive draws across nineteen tiles, and the depth
+    /// attachment lost more to the locality than the CPU saved in commands
+    /// (+0.027 ms GPU against -0.028 ms CPU), which is a straight loss on any
+    /// frame that is GPU-bound.
+    #[allow(clippy::too_many_arguments)]
     fn draw(
         &self,
         builder: &mut Recorder,
@@ -328,9 +379,15 @@ impl ShadowPass {
         view_proj: Mat4,
         object_base: u32,
         sets: &CasterSets,
+        cull: Option<&Frustum>,
+        bound: &mut Bound,
     ) {
-        let mut bound: Option<bool> = None;
         for run in casters.runs() {
+            if let Some(frustum) = cull
+                && !run_intersects(&casters, &run, frustum)
+            {
+                continue;
+            }
             let item = casters.item(run.start);
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
@@ -348,16 +405,15 @@ impl ShadowPass {
             } else {
                 &self.pipeline
             };
-            if bound != Some(wants_masked) {
+            if bound.needs_pipeline(wants_masked) {
                 builder
-                    .bind_pipeline_graphics(&pipeline)
+                    .bind_pipeline_graphics(pipeline)
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
                         pipeline.layout(),
                         0,
                         &sets.for_pipeline(wants_masked),
                     );
-                bound = Some(wants_masked);
             }
 
             let object_base = object_base + run.start as u32;
@@ -390,6 +446,38 @@ impl ShadowPass {
                 .bind_index_buffer(mesh.index_buffer.clone());
             builder.draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0);
         }
+    }
+}
+
+/// Whether any instance in `run` reaches into `frustum`.
+///
+/// Per item with an early exit, not against the run's union bounds: runs are
+/// grouped by mesh and material and never by position, so a run's union reaches
+/// into faces no instance of it occupies, and the union would keep draws this
+/// keeps out. The scan ends on the first instance that is in, which for a run
+/// being drawn is usually the first one tested.
+fn run_intersects(casters: &DrawList<'_>, run: &Range<usize>, frustum: &Frustum) -> bool {
+    run.clone()
+        .any(|index| frustum.intersects(&casters.item(index).bounds))
+}
+
+/// Which pipeline the rasteriser already has, so the draw loop binds one only
+/// when the run's material actually changes it.
+///
+/// Held by the caller rather than by [`ShadowPass::draw`], and that is the whole
+/// point: the atlas calls into that loop once per face, and a guard scoped to
+/// the call rebound a pipeline and three descriptor sets on every tile. Spans
+/// one render pass instance and never more — each `record` and `record_atlas`
+/// starts a fresh one, so nothing here assumes what a render pass boundary
+/// preserves.
+#[derive(Default)]
+struct Bound(Option<bool>);
+
+impl Bound {
+    /// Whether the pipeline `masked` selects has to be bound, recording that it
+    /// now is.
+    fn needs_pipeline(&mut self, masked: bool) -> bool {
+        self.0.replace(masked) != Some(masked)
     }
 }
 
@@ -615,5 +703,114 @@ mod fs_masked {
         ty: "fragment",
         path: "shaders/shadow.frag",
         define: [("ORRIN_MASKED", "1")],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::Aabb;
+    use crate::gfx::RenderItem;
+    use crate::scene::{MaterialHandle, MeshHandle};
+    use glam::{Mat3, Vec3A};
+
+    fn item(x: f32) -> RenderItem {
+        RenderItem {
+            model: Mat4::IDENTITY,
+            prev_model: Mat4::IDENTITY,
+            normal_matrix: Mat3::IDENTITY,
+            bounds: Aabb {
+                min: Vec3A::new(x - 0.1, -0.1, 0.4),
+                max: Vec3A::new(x + 0.1, 0.1, 0.6),
+            },
+            mesh: MeshHandle(0),
+            material: MaterialHandle(0),
+            instance: 0,
+        }
+    }
+
+    /// Identity clip volume: `x, y` in `[-1, 1]` and `z` in `[0, 1]`, so an item
+    /// at `x = 0` is inside and one at `x = 50` is well outside.
+    fn unit_frustum() -> Frustum {
+        Frustum::from_view_projection(Mat4::IDENTITY)
+    }
+
+    /// A run no instance of which reaches the face is not drawn into it. This is
+    /// the saving: half of a demo frame's atlas draws are a light's caster list
+    /// redrawn into a face that cannot see any of it.
+    #[test]
+    fn a_run_entirely_outside_the_face_is_skipped() {
+        let items = [item(50.0), item(60.0), item(70.0)];
+        let order = [0u32, 1, 2];
+        let list = DrawList::new(&items, &order);
+        assert!(!run_intersects(&list, &(0..3), &unit_frustum()));
+    }
+
+    /// And one instance inside is enough to draw the run — the draw is instanced
+    /// over the whole run, so the question is whether *any* of it is visible.
+    #[test]
+    fn a_run_with_one_instance_inside_is_drawn() {
+        let items = [item(0.0)];
+        let order = [0u32];
+        let list = DrawList::new(&items, &order);
+        assert!(run_intersects(&list, &(0..1), &unit_frustum()));
+    }
+
+    /// The instance inside need not be the first. Testing only the item the run
+    /// starts at is the mistake this guards: runs are grouped by mesh and
+    /// material, never by position, so a run is scattered through the scene.
+    #[test]
+    fn an_instance_inside_is_found_wherever_it_sits_in_the_run() {
+        let items = [item(50.0), item(60.0), item(0.0)];
+        let order = [0u32, 1, 2];
+        let list = DrawList::new(&items, &order);
+        assert!(run_intersects(&list, &(0..3), &unit_frustum()));
+    }
+
+    /// Bounds nothing could measure are drawn rather than culled, which
+    /// [`Frustum::intersects`] promises and this relies on: a caster that
+    /// vanished would be a missing shadow, and a caster drawn needlessly is a
+    /// draw.
+    #[test]
+    fn unmeasurable_bounds_are_drawn_not_culled() {
+        let mut only = item(50.0);
+        only.bounds = Aabb::EMPTY;
+        let items = [only];
+        let order = [0u32];
+        let list = DrawList::new(&items, &order);
+        assert!(run_intersects(&list, &(0..1), &unit_frustum()));
+    }
+
+    /// The saving this guard exists for. The atlas enters the draw loop once per
+    /// face — nineteen times on a demo frame — and every one of those used to
+    /// rebind a pipeline and three descriptor sets that were already bound,
+    /// because the guard was scoped to the call rather than to the pass.
+    #[test]
+    fn a_pipeline_already_bound_is_not_bound_again() {
+        let mut bound = Bound::default();
+        assert!(bound.needs_pipeline(false));
+        assert!(!bound.needs_pipeline(false));
+        assert!(!bound.needs_pipeline(false));
+    }
+
+    /// And what it must not cost: a caster list that mixes foliage with
+    /// everything else still switches pipelines mid-tile, so the guard has to
+    /// notice a change in both directions rather than latch on the first bind.
+    #[test]
+    fn a_changed_pipeline_is_bound_again() {
+        let mut bound = Bound::default();
+        assert!(bound.needs_pipeline(false));
+        assert!(bound.needs_pipeline(true));
+        assert!(bound.needs_pipeline(false));
+        assert!(!bound.needs_pipeline(false));
+    }
+
+    /// A fresh pass binds its first pipeline, whichever it is. Each render pass
+    /// instance starts one of these rather than inheriting it, which is what
+    /// makes the unset default the correct one.
+    #[test]
+    fn a_fresh_pass_binds_its_first_pipeline() {
+        assert!(Bound::default().needs_pipeline(false));
+        assert!(Bound::default().needs_pipeline(true));
     }
 }
