@@ -37,11 +37,12 @@ use vulkano::pipeline::{
     PipelineShaderStageCreateInfo,
 };
 
-use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
+use crate::gfx::{PositionVertex, SurfaceVertex};
 
 use super::PassCtx;
 use super::context::VkContext;
-use super::instances::GpuObject;
+use super::cull::Draws;
+use super::instances::{GpuObject, InstanceEntry};
 use super::record::{Arena, Recorder};
 use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
@@ -97,16 +98,6 @@ pub(super) struct FrameUbo {
     /// this pass wrote — so a difference in the last bit is a surface that
     /// vanishes. See the `invariant gl_Position` in both shaders.
     view_proj: [[f32; 4]; 4],
-}
-
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct PrepassPush {
-    /// First object row of this instanced run; the shader adds `gl_InstanceIndex`.
-    object_base: u32,
-    /// Row of the set-2 material table this run draws with, as the forward pass
-    /// pushes it. A run is one (mesh, material) pair, so one index covers it.
-    material_index: u32,
 }
 
 pub struct GeometryPrepass {
@@ -195,7 +186,7 @@ impl GeometryPrepass {
         &self,
         ctx: &VkContext,
         rows: &Subbuffer<[GpuObject]>,
-        indices: &Subbuffer<[u32]>,
+        indices: &Subbuffer<[InstanceEntry]>,
     ) -> Arc<DescriptorSet> {
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
@@ -260,7 +251,7 @@ impl GeometryPrepass {
         &self,
         builder: &mut Recorder,
         renderer: &PassCtx<'_>,
-        draws: DrawList<'_>,
+        draws: Draws<'_>,
         extent: [u32; 2],
         frame: Subbuffer<FrameUbo>,
         decals: Subbuffer<super::forward::GpuDecals>,
@@ -293,14 +284,19 @@ impl GeometryPrepass {
         );
 
         let sets = vec![frame_set, object_set, material_set, texture_set];
+
+        // Bound once for the pass: a mesh is a span into the arena, so nothing
+        // between draws changes them. See `mesh`.
+        renderer.arena.bind(builder);
+
         let mut bound: Option<bool> = None;
 
-        // One instanced draw per (mesh, material) run, matching the forward pass.
-        // The model and normal matrices come from the shared object buffer, so
-        // this pass no longer recomputes an inverse-transpose per item.
-        for run in draws.runs() {
-            let item = draws.item(run.start);
-            let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
+        // One instanced draw per (mesh, material) unit, matching the forward
+        // pass. The model and normal matrices come from the shared object
+        // buffer, so this pass no longer recomputes an inverse-transpose per
+        // item.
+        for unit in draws.units() {
+            let Some(mesh) = renderer.meshes.get(unit.mesh as usize) else {
                 continue;
             };
             // The same question the forward pass asks of the same flag word, so
@@ -308,7 +304,7 @@ impl GeometryPrepass {
             // `GpuMaterial::is_masked`.
             let wants_masked = renderer
                 .materials
-                .get(item.material.0 as usize)
+                .get(unit.material as usize)
                 .is_some_and(super::forward::GpuMaterial::is_masked);
             let pipeline = if wants_masked {
                 &self.masked_pipeline
@@ -326,18 +322,32 @@ impl GeometryPrepass {
                     );
                 bound = Some(wants_masked);
             }
-            let push = PrepassPush {
-                object_base: run.start as u32,
-                material_index: item.material.0,
+            builder.draw_indexed(
+                mesh.span.index_count,
+                unit.instances,
+                mesh.span.first_index,
+                mesh.span.vertex_offset,
+                unit.object_base,
+            );
+        }
+
+        // The compute path draws the same geometry as two multi-draws, one per
+        // pipeline variant. Empty on the CPU path, and vice versa.
+        for region in draws.regions() {
+            let pipeline = if region.masked {
+                &self.masked_pipeline
+            } else {
+                &self.pipeline
             };
             builder
-                .push_constants(pipeline.layout(), 0, &push)
-                .bind_vertex_buffers(
+                .bind_pipeline_graphics(pipeline)
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipeline.layout(),
                     0,
-                    (mesh.position_buffer.clone(), mesh.surface_buffer.clone()),
+                    &sets.clone(),
                 )
-                .bind_index_buffer(mesh.index_buffer.clone());
-            builder.draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0);
+                .draw_indexed_indirect(region.commands);
         }
     }
 }

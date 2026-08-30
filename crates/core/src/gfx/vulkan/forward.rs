@@ -2,15 +2,14 @@ use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::CopyBufferInfo;
+use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::CompareOp;
@@ -31,14 +30,16 @@ use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
 use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
 use crate::gfx::{
-    BlendMode, DecalInstance, DrawList, MAX_DECALS, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, Material,
-    PositionVertex, SceneLighting, SurfaceVertex, Vertex,
+    BlendMode, DecalInstance, MAX_DECALS, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, Material,
+    PositionVertex, SceneLighting, SurfaceVertex,
 };
 use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
+use super::cull::Draws;
 use super::fog::GpuFog;
-use super::instances::GpuObject;
+use super::instances::{GpuObject, InstanceEntry};
+use super::mesh::MeshSpan;
 use super::record::{Arena, Recorder};
 use super::rendering;
 use super::subsurface::SUBSURFACE_FORMAT;
@@ -48,23 +49,20 @@ use super::{MSAA_SAMPLES, PassCtx, ShadowFrame, VulkanRenderer};
 use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
 
 pub struct GpuMesh {
-    /// Position and texture coordinate, bound at binding 0 by every pass that
-    /// draws this mesh — including the shadow passes, which bind nothing else.
-    pub position_buffer: Subbuffer<[PositionVertex]>,
-    /// Everything a shading pass needs on top of the above, bound at binding 1
-    /// by the four passes that rasterise the surface rather than its depth.
-    pub surface_buffer: Subbuffer<[SurfaceVertex]>,
-    pub index_buffer: Subbuffer<[u32]>,
-    pub index_count: u32,
-    /// Object-space bounds, derived here because upload is the last place the
+    /// Where this mesh's indices and vertices sit in the shared buffers every
+    /// pass binds once. See [`mesh`](super::mesh).
+    pub span: MeshSpan,
+    /// Object-space bounds, derived at upload because that is the last place the
     /// vertex data exists on the CPU. Culling reads them through
     /// [`RenderBackend::mesh_bounds`](crate::gfx::RenderBackend::mesh_bounds).
     pub bounds: Aabb,
 }
 
-/// Per-run push constants. Only the small, per-run-varying values live here; the
-/// fat per-object matrices are in the set-4 storage buffer so this range stays
-/// under the 128-byte guaranteed `maxPushConstantsSize` (it was 196).
+/// The one value a geometry draw still pushes. The fat per-object matrices are
+/// in the set-4 storage buffer, and what used to sit beside `view_proj` here —
+/// the run's material and its first object row — moved into the instance list
+/// and into `firstInstance`, because a multi-draw has no per-draw push. See
+/// [`instances`](super::instances) and [`cull`](super::cull).
 ///
 /// `view_proj` replaced a pre-multiplied `mvp` when draws became instanced: a
 /// run covers many models, so the model half has to be applied in the shader.
@@ -72,19 +70,14 @@ pub struct GpuMesh {
 #[repr(C)]
 pub(super) struct PushConstants {
     view_proj: [[f32; 4]; 4],
-    material_index: u32,
-    /// First set-4 object row of this run; the shader adds `gl_InstanceIndex`.
-    object_base: u32,
 }
 
 impl PushConstants {
     /// Also what the transparency pass pushes: it draws the same geometry
     /// through the same pipeline layout, so it pushes the same range.
-    pub(super) fn new(view_proj: Mat4, material_index: u32, object_base: u32) -> Self {
+    pub(super) fn new(view_proj: Mat4) -> Self {
         Self {
             view_proj: view_proj.to_cols_array_2d(),
-            material_index,
-            object_base,
         }
     }
 }
@@ -112,7 +105,8 @@ const FLAT_NORMAL_TEXTURE: u32 = 1;
 
 /// Feature bits in [`GpuMaterial::flags`], mirrored by `shading.glsl`.
 ///
-/// The whole point of the word: `push.material_index` is dynamically uniform, so
+/// The whole point of the word: a draw is one batch and a batch is one
+/// (mesh, material) pair, so every invocation of a draw reads the same flags —
 /// a draw either takes a lobe's branch or does not, and the cost of a feature a
 /// material never asked for is one coherent test. Set from whether the block was
 /// actually authored rather than from a separate toggle, so a material cannot
@@ -555,6 +549,19 @@ impl ForwardSets {
     pub(super) fn as_vec(&self) -> Vec<Arc<DescriptorSet>> {
         self.sets.clone()
     }
+
+    /// The same five with the object set swapped, for a pass that indexes
+    /// through a different instance buffer.
+    ///
+    /// Under GPU culling the opaque queue reads what the dispatch compacted and
+    /// the blended queues read what the host wrote, and the two are different
+    /// allocations. Rebuilding the other four sets to say so would be four
+    /// descriptor writes a frame for a difference in one of them.
+    pub(super) fn with_object_set(&self, object_set: Arc<DescriptorSet>) -> ForwardSets {
+        let mut sets = self.sets.clone();
+        *sets.last_mut().expect("the object set is the last of five") = object_set;
+        ForwardSets { sets }
+    }
 }
 
 /// The four opaque pipelines one forward render pass needs.
@@ -844,7 +851,7 @@ impl ForwardPass {
         &self,
         ctx: &VkContext,
         rows: &Subbuffer<[GpuObject]>,
-        indices: &Subbuffer<[u32]>,
+        indices: &Subbuffer<[InstanceEntry]>,
     ) -> Arc<DescriptorSet> {
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
@@ -1107,7 +1114,7 @@ impl ForwardPass {
         &self,
         builder: &mut Recorder,
         renderer: &PassCtx<'_>,
-        draws: DrawList<'_>,
+        draws: Draws<'_>,
         view: &FrameView,
         extent: [u32; 2],
         sets: &ForwardSets,
@@ -1132,28 +1139,32 @@ impl ForwardPass {
             }],
         );
 
+        // Every draw below names its geometry through `firstIndex` and
+        // `vertexOffset` into the arena, so the three buffers are bound once
+        // for the pass rather than once per mesh. See `mesh`.
+        renderer.arena.bind(builder);
+
         // Nothing is bound yet, so the first run always binds. `None` rather
         // than "the plain one" so that a frame of nothing but foliage does not
         // begin by binding a pipeline it never draws with.
         let mut bound: Option<bool> = None;
 
-        // `extract_geometry` groups the order by (mesh, material), so each run
-        // is one instanced draw: the recording cost stops scaling with entity
-        // count and starts scaling with distinct mesh/material pairs.
-        for run in draws.runs() {
-            let item = draws.item(run.start);
-            let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
+        // A unit is one (mesh, material) pair, so each is one instanced draw:
+        // the recording cost stops scaling with entity count and starts scaling
+        // with distinct mesh/material pairs. Empty on the compute path, where
+        // the regions below are what this pass records instead.
+        for unit in draws.units() {
+            let Some(mesh) = renderer.meshes.get(unit.mesh as usize) else {
                 continue;
             };
-            // A run is one material, so this is one lookup per run rather than
-            // per item. The opaque order is left grouped by (mesh, material) and
-            // sorted front to back, which means cutouts are not a contiguous
-            // tail and this can flip more than once — a pipeline bind per run in
-            // the worst case, against a list whose length is distinct
-            // mesh/material pairs.
+            // A unit is one material, so this is one lookup per draw rather than
+            // per item. The opaque order is grouped by (mesh, material), which
+            // means cutouts are not a contiguous tail and this can flip more
+            // than once — a pipeline bind per draw in the worst case, against a
+            // list whose length is distinct mesh/material pairs.
             let wants_masked = renderer
                 .materials
-                .get(item.material.0 as usize)
+                .get(unit.material as usize)
                 .is_some_and(GpuMaterial::is_masked);
             let pipeline = if wants_masked { masked } else { plain };
             if bound != Some(wants_masked) {
@@ -1169,19 +1180,34 @@ impl ForwardPass {
                         pipeline.layout(),
                         0,
                         &sets.as_vec(),
-                    );
+                    )
+                    .push_constants(pipeline.layout(), 0, &PushConstants::new(view_proj));
                 bound = Some(wants_masked);
             }
-            let push = PushConstants::new(view_proj, item.material.0, run.start as u32);
+            builder.draw_indexed(
+                mesh.span.index_count,
+                unit.instances,
+                mesh.span.first_index,
+                mesh.span.vertex_offset,
+                unit.object_base,
+            );
+        }
 
+        // The compute path's answer to the same question: one multi-draw per
+        // pipeline variant, over commands a dispatch wrote. Empty on the CPU
+        // path.
+        for region in draws.regions() {
+            let pipeline = if region.masked { masked } else { plain };
             builder
-                .push_constants(pipeline.layout(), 0, &push)
-                .bind_vertex_buffers(
+                .bind_pipeline_graphics(&pipeline)
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipeline.layout(),
                     0,
-                    (mesh.position_buffer.clone(), mesh.surface_buffer.clone()),
+                    &sets.as_vec(),
                 )
-                .bind_index_buffer(mesh.index_buffer.clone());
-            builder.draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0);
+                .push_constants(pipeline.layout(), 0, &PushConstants::new(view_proj))
+                .draw_indexed_indirect(region.commands);
         }
     }
 }
@@ -1209,161 +1235,6 @@ pub(super) fn material_buffer(
         materials.iter().copied(),
     )
     .expect("failed to allocate material buffer")
-}
-
-/// Put a mesh where the GPU can read it many times per frame.
-///
-/// Static geometry is the one resource in the renderer that is written once and
-/// then *re-read* by every pass in the frame — the prepass, the forward pass,
-/// each shadow cascade, the atlas — which is what makes where it lives worth a
-/// branch. The two vendor guides say the same thing about it from opposite
-/// directions: AMD's, that device-local host-visible memory is for data "each
-/// byte of which is accessed once by the GPU", and NVIDIA's, to look explicitly
-/// for `DEVICE_LOCAL` when picking a memory type. Vertices are neither
-/// write-once nor incidentally device-local.
-///
-/// The reason a branch beats picking one path is that both are right on some
-/// machine:
-///
-/// - **Wide BAR** (Resizable BAR on, or a unified-memory part). The CPU writes
-///   straight into video memory. The buffer is device-local *and* the upload is
-///   one `memcpy` with no staging copy, no command buffer and no fence. Staging
-///   here would be strictly worse: same destination, extra work.
-/// - **Narrow BAR.** `PREFER_DEVICE | HOST_SEQUENTIAL_WRITE` reads as *required*
-///   host-visible and only *preferred* device-local, so it resolves to the
-///   legacy 256 MiB aperture — and when that fills, vulkano falls back to the
-///   next type satisfying the requirement, which is ordinary system RAM. The
-///   failure is silent and it is the bad one: every cascade then re-reads the
-///   scene's geometry across PCIe, every frame, for as long as the scene is
-///   open. Staging costs one copy at load and buys VRAM residency.
-///
-/// This is the change in this file that a machine with Resizable BAR *cannot*
-/// show you. On such a machine the first branch is taken and nothing here has
-/// changed at all; the second exists for the configuration that is still common
-/// on NVIDIA desktops and on anything with the option switched off in firmware.
-pub fn upload_mesh(ctx: &VkContext, vertices: &[Vertex], indices: &[u32]) -> GpuMesh {
-    let bounds = Aabb::from_points(vertices.iter().map(|v| Vec3::from(v.position)));
-
-    // De-interleaved here because upload is the last place a vertex exists as
-    // the one authored struct, and the only place that has to know the two GPU
-    // streams are halves of it.
-    let (positions, surfaces): (Vec<_>, Vec<_>) = vertices.iter().map(Vertex::split).unzip();
-
-    let (position_buffer, surface_buffer, index_buffer) = if ctx.profile.wide_bar() {
-        let vertices = BufferUsage::VERTEX_BUFFER;
-        (
-            write_directly(&ctx.memory_allocator, vertices, &positions),
-            write_directly(&ctx.memory_allocator, vertices, &surfaces),
-            write_directly(&ctx.memory_allocator, BufferUsage::INDEX_BUFFER, indices),
-        )
-    } else {
-        stage(ctx, &positions, &surfaces, indices)
-    };
-
-    GpuMesh {
-        position_buffer,
-        surface_buffer,
-        index_buffer,
-        index_count: indices.len() as u32,
-        bounds,
-    }
-}
-
-/// One `memcpy` into memory the GPU owns and the CPU can see — the wide-BAR path.
-fn write_directly<T: BufferContents + Copy>(
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    usage: BufferUsage,
-    data: &[T],
-) -> Subbuffer<[T]> {
-    Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        data.iter().copied(),
-    )
-    .expect("failed to allocate mesh buffer")
-}
-
-/// All three buffers through host memory into device-local memory the CPU cannot
-/// reach — the narrow-BAR path.
-///
-/// One command buffer and one fence for the set, because the cost worth avoiding
-/// here is the round trip, not the copy. Blocking at all matches how
-/// [`texture`](super::texture) uploads: `load_mesh` is called while building a
-/// scene, not while drawing one, and the buffers have to exist before the handle
-/// it returns can be drawn with.
-fn stage(
-    ctx: &VkContext,
-    positions: &[PositionVertex],
-    surfaces: &[SurfaceVertex],
-    indices: &[u32],
-) -> (
-    Subbuffer<[PositionVertex]>,
-    Subbuffer<[SurfaceVertex]>,
-    Subbuffer<[u32]>,
-) {
-    let position = staged_pair(ctx, BufferUsage::VERTEX_BUFFER, positions);
-    let surface = staged_pair(ctx, BufferUsage::VERTEX_BUFFER, surfaces);
-    let index = staged_pair(ctx, BufferUsage::INDEX_BUFFER, indices);
-
-    let mut builder = Recorder::new(ctx);
-    builder
-        .copy_buffer(CopyBufferInfo::buffers(position.0, position.1.clone()))
-        .copy_buffer(CopyBufferInfo::buffers(surface.0, surface.1.clone()))
-        .copy_buffer(CopyBufferInfo::buffers(index.0, index.1.clone()));
-    builder.submit_and_wait(ctx);
-
-    (position.1, surface.1, index.1)
-}
-
-/// A host-visible buffer holding `data`, and the empty device-local one it is
-/// about to be copied into.
-fn staged_pair<T: BufferContents + Copy>(
-    ctx: &VkContext,
-    usage: BufferUsage,
-    data: &[T],
-) -> (Subbuffer<[T]>, Subbuffer<[T]>) {
-    let staging = Buffer::from_iter(
-        ctx.memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_SRC,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        data.iter().copied(),
-    )
-    .expect("failed to allocate mesh staging buffer");
-
-    // No host-access filter, which is the entire point: it leaves the plain
-    // `DEVICE_LOCAL` type — the one the aperture does not cover — as the best
-    // match, and Vulkan orders memory types so that the type with only that flag
-    // comes before the one that adds `HOST_VISIBLE`.
-    let device_local = Buffer::new_slice::<T>(
-        ctx.memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: usage | BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-        data.len() as u64,
-    )
-    .expect("failed to allocate mesh buffer");
-
-    (staging, device_local)
 }
 
 pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {

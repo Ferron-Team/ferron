@@ -21,8 +21,8 @@
 // The texture indices are read out of `decals[i]` at a loop counter bounded by a
 // frame-uniform count, so every invocation that reaches a given fetch reaches it
 // with the same index. That is what makes plain indexing legal here without
-// `nonuniformEXT` — the same argument `sample_tex` makes about
-// `push.material_index`, one level further out.
+// `nonuniformEXT` — the same argument `sample_tex` makes about the material's
+// own texture indices, one level further out.
 
 // Keep in sync with MAX_DECALS in gfx/mod.rs.
 const int MAX_DECALS = 16;

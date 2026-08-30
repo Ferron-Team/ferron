@@ -181,26 +181,44 @@ impl<'a> DrawList<'a> {
     /// Correct only because extraction groups on the same key: an ungrouped
     /// order still yields valid runs, just short ones, so a missed grouping
     /// costs performance rather than producing wrong pixels.
-    pub fn runs(&self) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
-        let list = *self;
-        let mut start = 0usize;
-        std::iter::from_fn(move || {
-            if start >= list.len() {
-                return None;
-            }
-            let first = list.item(start);
-            let key = (first.mesh.0, first.material.0);
-            let mut end = start + 1;
-            while end < list.len() && {
-                let item = list.item(end);
-                (item.mesh.0, item.material.0) == key
-            } {
-                end += 1;
-            }
-            let run = start..end;
-            start = end;
-            Some(run)
-        })
+    pub fn runs(&self) -> Runs<'a> {
+        Runs {
+            list: *self,
+            start: 0,
+        }
+    }
+}
+
+/// [`DrawList::runs`], as a type a caller can hold.
+///
+/// Named rather than `impl Iterator` because the passes wrap it in an iterator
+/// of their own — one that yields either these runs or the batches a compute
+/// dispatch culled — and a wrapper cannot store what it cannot name. Collecting
+/// instead would be an allocation per pass per frame.
+pub struct Runs<'a> {
+    list: DrawList<'a>,
+    start: usize,
+}
+
+impl Iterator for Runs<'_> {
+    type Item = std::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start >= self.list.len() {
+            return None;
+        }
+        let first = self.list.item(self.start);
+        let key = (first.mesh.0, first.material.0);
+        let mut end = self.start + 1;
+        while end < self.list.len() && {
+            let item = self.list.item(end);
+            (item.mesh.0, item.material.0) == key
+        } {
+            end += 1;
+        }
+        let run = self.start..end;
+        self.start = end;
+        Some(run)
     }
 }
 
@@ -710,6 +728,16 @@ impl Default for SceneLighting {
 // The seam between the engine and a concrete graphics API: implement for other
 // backends (wgpu, D3D12) without touching scene/app code.
 pub trait RenderBackend {
+    /// Whether this backend decides each opaque view's visible set itself.
+    ///
+    /// Asked by [`extract_geometry`](crate::systems::extract_geometry), which
+    /// otherwise does that work per entity for every view. False for a backend
+    /// that has no compute of its own — the headless one — so the sweep answers
+    /// the question the way it always did.
+    fn gpu_culling(&self) -> bool {
+        false
+    }
+
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle;
     /// Object-space bounds derived at upload; `None` for a handle this backend
     /// never issued. Mirrored into [`MeshBounds`](crate::scene::MeshBounds) at
@@ -766,7 +794,7 @@ pub trait RenderBackend {
 mod draw_list_tests {
     use super::{DrawList, MaterialHandle, MeshHandle, RenderItem};
     use crate::geom::Aabb;
-    use glam::{Mat3, Mat4, Vec3, Vec3A};
+    use glam::{Mat3, Mat4, Vec3A};
 
     fn item(mesh: u32, material: u32) -> RenderItem {
         RenderItem {

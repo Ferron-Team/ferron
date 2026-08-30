@@ -1,6 +1,7 @@
 mod bloom;
 mod contact_shadows;
 mod context;
+mod cull;
 mod dof;
 mod environment;
 mod exposure;
@@ -10,6 +11,7 @@ pub mod frame;
 mod hdr;
 mod instances;
 mod line;
+mod mesh;
 mod motion_blur;
 mod oit;
 mod parallel;
@@ -48,7 +50,7 @@ use vulkano::sync::future::FenceSignalFuture;
 use vulkano::sync::semaphore::Semaphore;
 use vulkano::{Validated, VulkanError};
 
-use crate::geom::Aabb;
+use crate::geom::{Aabb, Frustum};
 use crate::gfx::DecalInstance;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::shadows::CascadeSet;
@@ -61,9 +63,11 @@ use crate::scene::{
 
 use self::contact_shadows::ContactShadowPass;
 use self::context::VkContext;
+use self::cull::{CullPass, CullView, Draws};
 use self::environment::EnvironmentPass;
 use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
 use self::instances::InstanceStore;
+use self::mesh::MeshArena;
 use self::oit::OitPass;
 use self::refraction::RefractionPass;
 use crate::gfx::graph::{PassKind, Queue as GraphQueue, ResourceId};
@@ -173,6 +177,8 @@ pub struct ShadowFrame<'a> {
 pub(super) struct PassCtx<'a> {
     pub(crate) ctx: &'a VkContext,
     pub(crate) meshes: &'a [GpuMesh],
+    /// The shared geometry a pass binds once, before its first draw.
+    pub(crate) arena: &'a MeshArena,
     pub(crate) materials: &'a [GpuMaterial],
 }
 
@@ -185,6 +191,15 @@ pub struct VulkanRenderer {
     /// the forward pass because every geometry pass in the frame reads the same
     /// rows, and no one of them is the owner. See `instances`.
     instances: InstanceStore,
+    /// The two dispatches that decide what each opaque view draws, and the
+    /// buffers they write. Built whether or not `FrameConfig::gpu_culling` is
+    /// set — the pipelines cost a compile at startup and nothing per frame, and
+    /// the flag is meant to be switched without a rebuild.
+    cull: CullPass,
+    /// Read once. The graph is compiled against it, so a mid-run change would
+    /// leave the passes and the plan disagreeing about who writes
+    /// `instance_index`.
+    gpu_culling: bool,
     hdr: HdrPass,
     /// Owns the histogram and exposure buffers the graph imports, and records
     /// the two dispatches that fill them.
@@ -233,6 +248,10 @@ pub struct VulkanRenderer {
     /// the forward pass, for the reason its module documents.
     environment: EnvironmentPass,
     pub(crate) meshes: Vec<GpuMesh>,
+    /// The geometry every [`GpuMesh`] is a span into. One allocation per stream
+    /// rather than three per mesh, which is what lets a pass bind geometry once
+    /// and draw every batch from one command buffer. See `mesh`.
+    arena: MeshArena,
     pub(crate) materials: Vec<GpuMaterial>,
     /// Texture views indexed by `TextureHandle`. Index 0 is a 1x1 white texture
     /// and index 1 a flat normal map; materials without a given map point here.
@@ -350,6 +369,7 @@ impl VulkanRenderer {
         make_target: impl FnOnce(&VkContext, Format, [u32; 2]) -> SwapchainState,
     ) -> Self {
         let forward = ForwardPass::new(&ctx, hdr::HDR_FORMAT, hdr::HDR_WIDE_FORMAT);
+        let arena = MeshArena::new(&ctx);
         let hdr = HdrPass::new(&ctx, format);
         let exposure = ExposurePass::new(&ctx);
         let bloom = BloomPass::new(&ctx);
@@ -391,6 +411,7 @@ impl VulkanRenderer {
 
         // Compiled for the editor's frame, which is what all but the headless
         // path uses; anything else recompiles on its first render.
+        let gpu_culling = read_gpu_culling(&ctx);
         let config = FrameConfig {
             color_format: format,
             msaa: false,
@@ -412,6 +433,7 @@ impl VulkanRenderer {
             shadow_resolution: 1,
             shadow_atlas: 0,
             async_compute: ctx.compute_queue.is_some(),
+            gpu_culling,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -420,6 +442,8 @@ impl VulkanRenderer {
 
         Self {
             instances: InstanceStore::new(&ctx),
+            cull: CullPass::new(&ctx),
+            gpu_culling,
             ctx,
             swapchain,
             forward,
@@ -441,6 +465,7 @@ impl VulkanRenderer {
             line,
             environment,
             meshes: Vec::new(),
+            arena,
             materials: vec![forward::to_gpu_material(&Material::default())],
             textures,
             material_buffer: None,
@@ -771,10 +796,14 @@ impl VulkanRenderer {
 }
 
 impl RenderBackend for VulkanRenderer {
+    fn gpu_culling(&self) -> bool {
+        self.gpu_culling
+    }
+
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle {
-        let gpu = forward::upload_mesh(&self.ctx, &mesh.vertices, &mesh.indices);
+        let (span, bounds) = self.arena.upload(&self.ctx, &mesh.vertices, &mesh.indices);
         let handle = MeshHandle(self.meshes.len() as u32);
-        self.meshes.push(gpu);
+        self.meshes.push(GpuMesh { span, bounds });
         handle
     }
 
@@ -1131,6 +1160,7 @@ impl VulkanRenderer {
             // configuration with no compute tail to move gets the plan it always
             // had, on a device with two queues as much as on one.
             async_compute: self.ctx.compute_queue.is_some(),
+            gpu_culling: self.gpu_culling,
         });
 
         // Release what the GPU has already finished and block only if the CPU
@@ -1371,6 +1401,55 @@ impl VulkanRenderer {
         );
         let object_rows = self.instances.rows().clone();
 
+        // The views the compute path culls against, in the numbering `cull.rs`
+        // documents: the camera, then each cascade, then each punctual face.
+        // Faces individually rather than one view per light, which is the same
+        // narrowing `ShadowPass::record_atlas` does on the CPU path and for the
+        // same reason — a face frustum has its apex at the light, so nothing
+        // outside one can occlude light entering it.
+        let cull_views: Vec<CullView> =
+            if self.gpu_culling {
+                let mut views = vec![CullView::Frustum(Frustum::from_view_projection(
+                    view.unjittered_view_proj,
+                ))];
+                if let Some(shadows) = shadows {
+                    views.extend(
+                        shadows.cascades.cascades[..shadows.cascades.count]
+                            .iter()
+                            .map(|cascade| CullView::Cascade {
+                                light_view: cascade.light_view,
+                                half_extent: cascade.half_extent,
+                                depth_range: cascade.depth_range,
+                            }),
+                    );
+                    views.extend(shadows.atlas.faces.iter().map(|face| {
+                        CullView::Frustum(Frustum::from_view_projection(face.view_proj))
+                    }));
+                }
+                views
+            } else {
+                Vec::new()
+            };
+        let cull_frame = self.gpu_culling.then(|| {
+            let meshes = &self.meshes;
+            let materials = &self.materials;
+            self.cull.prepare(
+                &self.ctx,
+                draws,
+                |mesh| {
+                    meshes
+                        .get(mesh as usize)
+                        .map(|mesh| (mesh.span, mesh.bounds))
+                },
+                |material| {
+                    materials
+                        .get(material as usize)
+                        .is_some_and(GpuMaterial::is_masked)
+                },
+                cull_views.len() as u32,
+            )
+        });
+
         // One set per pipeline layout per frame, rather than one per pass. The
         // buffer is a fresh subbuffer each frame so none of these can be cached
         // across frames, but every cascade binds the same buffer through the
@@ -1378,22 +1457,30 @@ impl VulkanRenderer {
         // cascade, which is where the duplication actually was. They are kept
         // separate rather than shared because set compatibility is a property of
         // the layout each pipeline declares, not of the buffer written into it.
+        // Which buffer the *opaque* passes index through. Under GPU culling it
+        // is the one the dispatch wrote; the blended and refractive queues are
+        // still CPU-culled and keep the host-written one, which is why the
+        // graph names the two apart. See `blended_index` in `frame::declare`.
+        let opaque_indices = match &cull_frame {
+            Some(_) => self.cull.indices().clone(),
+            None => objects.indices.clone(),
+        };
         let forward_object_set =
             self.forward
-                .build_object_set(&self.ctx, &object_rows, &objects.indices);
+                .build_object_set(&self.ctx, &object_rows, &opaque_indices);
         // One block for the whole frame, bound by the forward pass's set 0 and
         // the prepass's alike. See `ForwardPass::upload_decals`.
         let decal_block = self.forward.upload_decals(decals);
         let caster_sets = shadows.is_some().then(|| shadow::CasterSets {
             objects: self
                 .shadow
-                .build_object_set(&self.ctx, &object_rows, &objects.indices),
+                .build_object_set(&self.ctx, &object_rows, &opaque_indices),
             materials: self.shadow_material_set.clone().unwrap(),
             textures: self.shadow_texture_set.clone().unwrap(),
         });
         let prepass_object_set = self.frame.ids.prepass.map(|_| {
             self.prepass
-                .build_object_set(&self.ctx, &object_rows, &objects.indices)
+                .build_object_set(&self.ctx, &object_rows, &opaque_indices)
         });
 
         // Uploaded once even though the prepass and the SSAO resolve both read
@@ -1540,9 +1627,20 @@ impl VulkanRenderer {
             None => vec![None; self.frame.graph.order().len()],
         };
 
+        // The blended queues index through the host-written list whichever path
+        // the opaque ones took, which is the same buffer on the CPU path and a
+        // different one under GPU culling.
+        let blended_sets = forward_sets.with_object_set(match &cull_frame {
+            Some(_) => self
+                .forward
+                .build_object_set(&self.ctx, &object_rows, &objects.indices),
+            None => forward_object_set.clone(),
+        });
+
         let record = FrameRecord {
             ctx: &self.ctx,
             meshes: &self.meshes,
+            arena: &self.arena,
             materials: &self.materials,
             frame: &self.frame,
             images: &self.images,
@@ -1576,7 +1674,12 @@ impl VulkanRenderer {
             refractive,
             shadows,
             objects,
+            cull: &self.cull,
+            object_rows: object_rows.clone(),
+            cull_frame,
+            cull_views: &cull_views,
             caster_sets,
+            blended_sets,
             forward_sets,
             frame_uniforms,
             ssao_uniforms,
@@ -1869,6 +1972,7 @@ impl VulkanRenderer {
 struct FrameRecord<'a> {
     ctx: &'a VkContext,
     meshes: &'a [GpuMesh],
+    arena: &'a MeshArena,
     materials: &'a [GpuMaterial],
     frame: &'a Frame,
     images: &'a GraphImages,
@@ -1908,8 +2012,20 @@ struct FrameRecord<'a> {
     refractive: DrawList<'a>,
     shadows: Option<ShadowFrame<'a>>,
     objects: instances::InstanceLists,
+    cull: &'a CullPass,
+    /// The persistent object rows, which the cull dispatch reads for the model
+    /// matrix that turns a batch's object-space box into a world one.
+    object_rows: vulkano::buffer::Subbuffer<[instances::GpuObject]>,
+    /// The batch table this frame was prepared with, and `None` on the CPU path.
+    /// Every opaque geometry pass reads it to decide whether it draws runs or
+    /// indirect commands, so the two cannot half-switch.
+    cull_frame: Option<cull::CullFrame>,
+    cull_views: &'a [CullView],
     caster_sets: Option<shadow::CasterSets>,
     forward_sets: forward::ForwardSets,
+    /// The same sets with the blended queues' own instance buffer bound. Equal
+    /// to `forward_sets` on the CPU path, where there is only one such buffer.
+    blended_sets: forward::ForwardSets,
     frame_uniforms: Option<vulkano::buffer::Subbuffer<prepass::FrameUbo>>,
     ssao_uniforms: Option<ssao::SsaoUniforms>,
     contact_shadow_uniforms: Option<contact_shadows::ContactShadowUniforms>,
@@ -1945,6 +2061,27 @@ struct PendingTail {
     image_index: u32,
     /// Whether a raw pass draws over the result before it is presented.
     overlay: bool,
+}
+
+/// Whether the frame decides its visible set on the GPU.
+///
+/// Off unless asked for, which is the opposite of how `ORRIN_ASYNC_COMPUTE`
+/// reads and deliberately so: the CPU sweep is still the path every scene has
+/// been looked at through, and this is the one being measured against it.
+///
+/// A device that cannot multi-draw keeps the sweep whatever the variable says,
+/// and says so rather than drawing one batch per view and calling it the same
+/// thing: the path exists to be measured, and a silently different one is not a
+/// measurement. See [`VkContext::multi_draw`].
+fn read_gpu_culling(ctx: &VkContext) -> bool {
+    let asked = std::env::var("ORRIN_GPU_CULL").is_ok_and(|value| value.trim() == "1");
+    if asked && !ctx.multi_draw {
+        println!(
+            "  GPU culling: unavailable — this device has no multi-draw indirect \
+             with a per-draw first instance; keeping the CPU sweep"
+        );
+    }
+    asked && ctx.multi_draw
 }
 
 /// How many sets of the graph's transient images the compiled frame needs.
@@ -2039,10 +2176,36 @@ impl FrameRecord<'_> {
     }
 
     /// What a pass body gets of the renderer besides its own state.
+    /// What an opaque geometry pass draws for `view`: the batches the dispatch
+    /// culled, or the ordered list the sweep handed it.
+    ///
+    /// The view numbering is `cull.rs`'s and is stated once here — the camera,
+    /// then each cascade, then each punctual face — because the dispatch wrote
+    /// its blocks in that order and a pass reading the wrong one draws another
+    /// view's visible set without anything failing.
+    fn opaque_draws<'b>(&'b self, view: u32, list: DrawList<'b>, base: u32) -> Draws<'b> {
+        match &self.cull_frame {
+            Some(frame) => Draws::Gpu {
+                frame,
+                view,
+                commands: self.cull.commands(),
+            },
+            None => Draws::Cpu { list, base },
+        }
+    }
+
+    /// Where the punctual faces begin in that numbering.
+    fn first_face_view(&self) -> u32 {
+        1 + self
+            .shadows
+            .map_or(0, |shadows| shadows.cascades.count as u32)
+    }
+
     fn pass_ctx(&self) -> PassCtx<'_> {
         PassCtx {
             ctx: self.ctx,
             meshes: self.meshes,
+            arena: self.arena,
             materials: self.materials,
         }
     }
@@ -2471,6 +2634,26 @@ impl FrameRecord<'_> {
                         self.images.view(ids.output),
                     );
                 }
+                PassBody::CullReset => {
+                    let frame = self
+                        .cull_frame
+                        .as_ref()
+                        .expect("the graph scheduled the cull with no batch table");
+                    self.cull.record_reset(builder, self.ctx, frame);
+                }
+                PassBody::Cull => {
+                    let frame = self
+                        .cull_frame
+                        .as_ref()
+                        .expect("the graph scheduled the cull with no batch table");
+                    self.cull.record_cull(
+                        builder,
+                        self.ctx,
+                        &self.object_rows,
+                        frame,
+                        self.cull_views,
+                    );
+                }
                 PassBody::LuminanceHistogram => self.exposure.record_histogram(
                     builder,
                     &self.ctx,
@@ -2550,9 +2733,12 @@ impl FrameRecord<'_> {
                 self.shadow.record(
                     builder,
                     &self.pass_ctx(),
-                    shadows.casters[cascade_index],
+                    self.opaque_draws(
+                        1 + cascade,
+                        shadows.casters[cascade_index],
+                        self.objects.cascade_bases[cascade_index],
+                    ),
                     shadows.cascades.cascades[cascade_index].view_proj,
-                    self.objects.cascade_bases[cascade_index],
                     self.shadow_resolution,
                     self.caster_sets
                         .as_ref()
@@ -2563,12 +2749,17 @@ impl FrameRecord<'_> {
                 let shadows = self
                     .shadows
                     .expect("the graph scheduled the atlas with no shadow frame");
+                let gpu = self
+                    .cull_frame
+                    .as_ref()
+                    .map(|frame| (frame, self.cull.commands(), self.first_face_view()));
                 self.shadow.record_atlas(
                     builder,
                     &self.pass_ctx(),
                     shadows.atlas,
                     shadows.punctual_casters,
                     &self.objects.punctual_bases,
+                    gpu,
                     self.caster_sets
                         .as_ref()
                         .expect("the graph scheduled the atlas with no shadow frame"),
@@ -2577,7 +2768,7 @@ impl FrameRecord<'_> {
             PassBody::GeometryPrepass => self.prepass.record(
                 builder,
                 &self.pass_ctx(),
-                self.draws,
+                self.opaque_draws(0, self.draws, 0),
                 self.extent,
                 self.frame_uniforms.clone().unwrap(),
                 self.decal_block.clone(),
@@ -2641,7 +2832,7 @@ impl FrameRecord<'_> {
                 self.forward.draw(
                     builder,
                     &self.pass_ctx(),
-                    self.draws,
+                    self.opaque_draws(0, self.draws, 0),
                     &self.view,
                     self.extent,
                     &self.forward_sets,
@@ -2682,7 +2873,7 @@ impl FrameRecord<'_> {
                 builder,
                 &self.pass_ctx(),
                 self.transparent,
-                &self.forward_sets,
+                &self.blended_sets,
                 &self.view,
                 self.extent,
                 self.objects.transparent_base,
@@ -2697,7 +2888,7 @@ impl FrameRecord<'_> {
                     builder,
                     &self.pass_ctx(),
                     self.refractive,
-                    &self.forward_sets,
+                    &self.blended_sets,
                     self.images.view(ids.scene),
                     self.view_of(ids.source),
                     &self.view,
@@ -2744,7 +2935,9 @@ impl FrameRecord<'_> {
             | PassBody::LuminanceAverage
             | PassBody::BloomPrefilter
             | PassBody::BloomDownsample(_)
-            | PassBody::BloomUpsample(_) => unreachable!("handled above"),
+            | PassBody::BloomUpsample(_)
+            | PassBody::CullReset
+            | PassBody::Cull => unreachable!("handled above"),
         }
 
         builder.end_rendering();

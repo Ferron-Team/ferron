@@ -9,15 +9,12 @@ layout(location = 5) in vec4 v_clip;
 layout(location = 6) in vec4 v_previous_clip;
 layout(location = 7) in vec3 v_view_pos;
 layout(location = 8) in vec3 v_world_pos;
+// The material row this instance is drawn with. See `prepass.vert`.
+layout(location = 9) flat in uint v_material;
 
 layout(location = 0) out vec4 f_normal;
 layout(location = 1) out vec2 f_velocity;
 layout(location = 2) out vec4 f_material;
-
-layout(push_constant) uniform Push {
-    uint object_base;
-    uint material_index;
-} push;
 
 // Mirrors GpuMaterial in forward.rs, field for field: the two passes read the
 // same buffer through their own layouts, so a change here is a change there.
@@ -99,7 +96,7 @@ layout(set = 0, binding = 0) uniform Frame {
 } frame;
 
 void main() {
-    GpuMaterial m = materials[push.material_index];
+    GpuMaterial m = materials[v_material];
 
     mat3 TBN = mat3(normalize(v_view_tangent), normalize(v_view_bitangent), normalize(v_view_normal));
 

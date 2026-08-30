@@ -85,6 +85,21 @@ struct Resident {
     prev_model: Mat4,
 }
 
+/// One entry of a draw order: which object row to draw, and which material to
+/// draw it with.
+///
+/// The material rides here rather than in a push constant because a multi-draw
+/// has no per-draw push — every batch of a pipeline variant is one command, and
+/// the only thing that varies between them that a shader can read is what the
+/// instance points at. The CPU path writes the same pairs so that one vertex
+/// shader serves both. See [`cull`](super::cull).
+#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[repr(C)]
+pub(super) struct InstanceEntry {
+    pub row: u32,
+    pub material: u32,
+}
+
 /// This frame's draw-order lists, as row numbers into [`InstanceStore`], and
 /// where each list's block begins.
 ///
@@ -92,7 +107,7 @@ struct Resident {
 /// `instance_index` says in the graph. The opaque camera list indexes from zero
 /// and needs no base.
 pub(super) struct InstanceLists {
-    pub indices: Subbuffer<[u32]>,
+    pub indices: Subbuffer<[InstanceEntry]>,
     /// Where the blended items' indices start.
     pub transparent_base: u32,
     /// Where the refractive items' indices start.
@@ -282,7 +297,7 @@ impl InstanceStore {
         // buffer, so round up to one (unwritten, unread) slot.
         let indices = self
             .index_allocator
-            .allocate_slice::<u32>(total.max(1) as u64)
+            .allocate_slice::<InstanceEntry>(total.max(1) as u64)
             .unwrap();
 
         let transparent_base;
@@ -294,7 +309,11 @@ impl InstanceStore {
             let mut next = 0usize;
             let mut write = |list: &crate::gfx::DrawList<'_>, next: &mut usize| {
                 for i in 0..list.len() {
-                    rows[*next] = list.item(i).instance;
+                    let item = list.item(i);
+                    rows[*next] = InstanceEntry {
+                        row: item.instance,
+                        material: item.material.0,
+                    };
                     *next += 1;
                 }
             };

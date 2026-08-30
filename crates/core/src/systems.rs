@@ -153,6 +153,7 @@ pub fn extract_geometry(
     aspect: f32,
     cascades: &CascadeSet,
     atlas: &ShadowAtlas,
+    gpu_culling: bool,
     out: &mut FrameGeometry,
 ) {
     out.items.clear();
@@ -207,10 +208,21 @@ pub fn extract_geometry(
                 .map_or(BlendMode::Opaque, |table| table.get(material));
             let blended = !mode.is_opaque();
 
-            let visible = !cull
+            let in_frustum = !cull
                 || frustum
                     .as_ref()
                     .is_none_or(|frustum| frustum.intersects(&world_bounds));
+            // Under GPU culling every *opaque* renderable is offered to the
+            // dispatch and the frustum decides there, per view — this is the
+            // test the whole feature exists to move. The blended and refractive
+            // queues are culled here either way: they are drawn from the order
+            // this list is in, and a refractive surface has to be drawn back to
+            // front, which is a correctness requirement no atomic append meets.
+            let visible = if gpu_culling && !blended {
+                true
+            } else {
+                in_frustum
+            };
             // The cascades share a rotation, so a box's half-extent in light
             // space is a property of the box and the light — not of which
             // cascade is asking. Derived once here; each cascade then costs one
@@ -222,7 +234,7 @@ pub fn extract_geometry(
             // failing every compare. Stated rather than inferred, so the answer
             // does not rest on how infinities compare.
             let casts: [bool; MAX_CASCADES] =
-                if blended || active.is_empty() || !world_bounds.is_valid() {
+                if gpu_culling || blended || active.is_empty() || !world_bounds.is_valid() {
                     [false; MAX_CASCADES]
                 } else {
                     let center = world_bounds.center();
@@ -238,7 +250,8 @@ pub fn extract_geometry(
             // its centre, or a long wall through a light's volume would be
             // culled out of the shadow it plainly casts.
             let lights: [bool; MAX_SHADOW_LIGHTS] = std::array::from_fn(|i| {
-                !blended
+                !gpu_culling
+                    && !blended
                     && punctual.get(i).is_some_and(|caster| {
                         world_bounds.distance_squared_to(caster.center)
                             <= caster.radius * caster.radius
@@ -301,7 +314,13 @@ pub fn extract_geometry(
         let item = &items[*index as usize];
         (item.mesh.0, item.material.0)
     };
-    out.visible.sort_unstable_by_key(|i| key(&out.items, i));
+    // Under GPU culling the opaque list is not a draw order at all — it is the
+    // set the dispatch is offered, and `cull::CullPass::prepare` groups it by a
+    // hash rather than by a sort. Sorting it would be an O(n log n) walk over
+    // every renderable to produce an ordering nothing reads.
+    if !gpu_culling {
+        out.visible.sort_unstable_by_key(|i| key(&out.items, i));
+    }
     // Grouped, and then deliberately left alone. Weighted-blended
     // transparency's whole claim is that the composite is commutative, so this
     // list has no back-to-front pass to go with it — and the popping a sort
@@ -324,7 +343,12 @@ pub fn extract_geometry(
     // still one instanced draw.
     let ordering = crate::profile::scope("order runs");
     if let Some(camera) = camera.as_ref() {
-        order_runs_front_to_back(&out.items, &mut out.visible, camera.position);
+        // Not under GPU culling, for the reason the sort above is skipped: the
+        // opaque list is a set there, and the order the batches are drawn in is
+        // the order `cull::CullPass::prepare` assigned their numbers.
+        if !gpu_culling {
+            order_runs_front_to_back(&out.items, &mut out.visible, camera.position);
+        }
         // The opposite order, and for the opposite reason. Front to back above
         // is an optimisation over geometry the depth test already resolves; back
         // to front here is *correctness*, because a refractive surface samples
@@ -339,10 +363,12 @@ pub fn extract_geometry(
     out.motion.end();
 
     if let Some(mut culling) = world.get_resource_mut::<Culling>() {
-        culling.record(
-            out.visible.len() + out.transparent.len() + out.refractive.len(),
-            total,
-        );
+        // Unknown under GPU culling: `out.visible` there is what the dispatch
+        // was *offered*, not what it kept, and the counts it wrote are still on
+        // the device when this runs.
+        let visible = (!gpu_culling)
+            .then(|| out.visible.len() + out.transparent.len() + out.refractive.len());
+        culling.record(visible, total);
     }
 }
 
@@ -758,6 +784,7 @@ mod tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let visible = geometry.visible();
@@ -930,6 +957,7 @@ mod tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let before = *geometry.visible().item(0);
@@ -943,6 +971,7 @@ mod tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let after = *geometry.visible().item(0);
@@ -967,6 +996,7 @@ mod tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let first = *geometry.visible().item(0);
@@ -983,6 +1013,7 @@ mod tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let second = *geometry.visible().item(0);
@@ -1004,7 +1035,7 @@ mod tests {
         let culling = world.resource::<Culling>();
         assert_eq!(
             (culling.visible(), culling.total(), culling.culled()),
-            (1, 2, 1)
+            (Some(1), 2, Some(1))
         );
     }
 
@@ -1360,7 +1391,7 @@ mod geometry_tests {
         Camera, CpuMesh, Culling, LocalTransform, MaterialHandle, MeshBounds, MeshHandle,
         Transform, WorldTransform,
     };
-    use glam::{Vec3, Vec3A};
+    use glam::Vec3;
     use orrin_ecs::World;
 
     const ASPECT: f32 = 16.0 / 9.0;
@@ -1412,7 +1443,14 @@ mod geometry_tests {
         let set = sun_cascades(&camera);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &set, &ShadowAtlas::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &set,
+            &ShadowAtlas::default(),
+            false,
+            &mut geometry,
+        );
 
         assert_eq!(geometry.visible().len(), 0, "it should not be visible");
         assert!(
@@ -1431,7 +1469,14 @@ mod geometry_tests {
         let set = sun_cascades(&camera);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &set, &ShadowAtlas::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &set,
+            &ShadowAtlas::default(),
+            false,
+            &mut geometry,
+        );
 
         assert_eq!(geometry.visible().len(), 0);
         for i in 0..set.count {
@@ -1453,7 +1498,14 @@ mod geometry_tests {
         let set = sun_cascades(&camera);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &set, &ShadowAtlas::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &set,
+            &ShadowAtlas::default(),
+            false,
+            &mut geometry,
+        );
 
         assert_eq!(geometry.items.len(), 1);
         assert_eq!(geometry.visible.len(), 1);
@@ -1466,7 +1518,6 @@ mod geometry_tests {
     /// draws instances against the wrong transforms.
     #[test]
     fn front_to_back_ordering_keeps_every_run_whole() {
-        let camera = Camera::default();
         // Two meshes interleaved in depth, so ordering has something to do and
         // the grouping has something to hold together.
         let world = world_with(&[
@@ -1482,6 +1533,7 @@ mod geometry_tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let visible = geometry.visible();
@@ -1517,6 +1569,7 @@ mod geometry_tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let visible = geometry.visible();

@@ -632,6 +632,7 @@ impl ApplicationHandler for App {
                         aspect,
                         &self.cascades,
                         &self.atlas,
+                        active.renderer.gpu_culling(),
                         &mut self.geometry,
                     );
                     // Copy this frame's debug lines out (they're Copy) so the render

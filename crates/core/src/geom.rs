@@ -142,6 +142,13 @@ impl Frustum {
         }
     }
 
+    /// The six planes, for a consumer that has to do this test somewhere this
+    /// one cannot reach — the GPU culling dispatch, which is handed them as a
+    /// buffer. Same order and same sign convention as [`Self::intersects`].
+    pub fn planes(&self) -> &[Vec4; 6] {
+        &self.planes
+    }
+
     /// Conservative: true means "may be visible". A box straddling two planes
     /// near a corner can pass every plane individually while lying outside the
     /// volume, which costs a draw, never a missing object.

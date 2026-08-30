@@ -14,8 +14,8 @@ use vulkano::format::Format;
 use vulkano::image::ImageLayout;
 
 use crate::gfx::graph::{
-    Access, Extent, FrameGraph, GraphBuilder, GraphError, ImageDesc, PassId, PassKind, ResourceId,
-    compile,
+    Access, Extent, FrameGraph, GraphBuilder, GraphError, ImageDesc, PassBuilder, PassId, PassKind,
+    ResourceId, compile,
 };
 use crate::gfx::shadows::MAX_CASCADES;
 
@@ -160,6 +160,16 @@ pub struct FrameConfig {
     /// The renderer sets it from what the device turned out to have — a device
     /// with no compute-only queue family plans exactly the frame it always did.
     pub async_compute: bool,
+    /// Whether the visible set for each opaque view is decided by a compute
+    /// dispatch rather than by the CPU sweep in `systems::extract_geometry`.
+    ///
+    /// Structural: it registers two passes, it makes `instance_index` something
+    /// the frame *writes* rather than something it is handed, and it changes
+    /// every opaque geometry pass from one draw per run to one indirect draw
+    /// per batch. Kept as a flag rather than taken as the only path so that the
+    /// two can be measured against each other on one binary — the CPU sweep is
+    /// the control, and `ORRIN_GPU_CULL=0` selects it.
+    pub gpu_culling: bool,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -169,6 +179,12 @@ pub struct FrameConfig {
 /// is exhaustive by the compiler's own reckoning rather than by convention.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PassBody {
+    /// Stamps every draw command with the geometry its batch draws and an
+    /// instance count of zero, which is the value the cull increments from.
+    CullReset,
+    /// Tests every live instance against every view and appends the ones that
+    /// survive to their batch's slice of that view's instance list.
+    Cull,
     GeometryPrepass,
     SsaoResolve,
     SsaoBlur,
@@ -530,6 +546,21 @@ pub struct Frame {
     pub bodies: Vec<PassBody>,
 }
 
+/// Declares the draw commands on a pass that issues its draws indirectly, and
+/// nothing at all while the frame still culls on the CPU — which is what
+/// `commands` being `None` means.
+///
+/// One function rather than the declaration written out at each of the four
+/// sites, so that converting a pass to indirect draws cannot half-land: the
+/// pass either goes through here and is ordered after the cull, or it does not
+/// draw indirectly.
+fn indirect<'a>(pass: PassBuilder<'a>, commands: Option<ResourceId>) -> PassBuilder<'a> {
+    match commands {
+        Some(commands) => pass.access(commands, Access::IndirectRead),
+        None => pass,
+    }
+}
+
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let mut builder = GraphBuilder::new();
     if config.async_compute {
@@ -551,6 +582,63 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // first because they have different lifetimes, and the graph's whole claim
     // is to know each resource's exact one. See `vulkan::instances`.
     let instance_index = builder.import_buffer("instance_index");
+    // Culling is two dispatches because a count can only be atomically
+    // incremented from a known value. The reset stamps each command with the
+    // geometry its batch draws and an instance count of zero; the cull tests
+    // every live instance against every view and increments the counts it
+    // survives, appending its row to that batch's slice.
+    //
+    // Two graph nodes rather than one dispatch with a barrier in the middle,
+    // because a pass may not write its own barrier — the point of the compiler
+    // is that the write-after-write between these two is derived rather than
+    // remembered.
+    // The blended and refractive queues stay CPU-culled — a refractive surface
+    // has to be drawn back to front, which is a correctness requirement no
+    // atomic append can meet — so under GPU culling their orders are still
+    // written by the host, into a buffer of their own. A second resource rather
+    // than a share of the first because it really is a second allocation, and
+    // one name over two buffers is precisely the declaration this compiler
+    // exists to catch.
+    let blended_index = if config.gpu_culling {
+        builder.import_buffer("blended_instance_index")
+    } else {
+        instance_index
+    };
+
+    let draw_commands = config.gpu_culling.then(|| {
+        // Which rows the dispatch is offered, and which batch each belongs to.
+        // Written afresh every frame, like the draw orders under CPU culling
+        // and unlike the rows themselves — the batch a row belongs to is
+        // cached, but the list of rows is not. See `vulkan::cull`.
+        let instance_table = builder.import_buffer("instance_table");
+        // One entry per (mesh, material) batch: the geometry its draw command
+        // names and where its slice of a view's `instance_index` block begins.
+        let batch_table = builder.import_buffer("batch_table");
+        // One `VkDrawIndexedIndirectCommand` per batch per view. Imported
+        // rather than transient because it is the same allocation frame after
+        // frame and only its contents change, which is the argument
+        // `object_transforms` makes one comment above.
+        let draw_commands = builder.import_buffer("draw_commands");
+
+        let id = builder
+            .pass("cull_reset", PassKind::Compute)
+            .access(batch_table, Access::StorageRead)
+            .access(draw_commands, Access::StorageWrite)
+            .build();
+        record(id, PassBody::CullReset, &mut bodies);
+
+        let id = builder
+            .pass("cull", PassKind::Compute)
+            .access(object_transforms, Access::StorageRead)
+            .access(instance_table, Access::StorageRead)
+            .access(batch_table, Access::StorageRead)
+            .access(draw_commands, Access::StorageWrite)
+            .access(instance_index, Access::StorageWrite)
+            .build();
+        record(id, PassBody::Cull, &mut bodies);
+
+        draw_commands
+    });
 
     let swapchain_color = builder.import_image(
         "swapchain_color",
@@ -603,12 +691,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
     if let Some(shadows) = shadows {
         for cascade in 0..config.shadow_cascades as u32 {
-            let id = builder
-                .pass(CASCADE_PASS_NAMES[cascade as usize], PassKind::Inline)
-                .access(object_transforms, Access::StorageRead)
-                .access(instance_index, Access::StorageRead)
-                .access(shadows, Access::DepthAttachment)
-                .build();
+            let id = indirect(
+                builder
+                    .pass(CASCADE_PASS_NAMES[cascade as usize], PassKind::Inline)
+                    .access(object_transforms, Access::StorageRead)
+                    .access(instance_index, Access::StorageRead),
+                draw_commands,
+            )
+            .access(shadows, Access::DepthAttachment)
+            .build();
             record(id, PassBody::ShadowCascade(cascade), &mut bodies);
         }
     }
@@ -624,12 +715,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             ImageDesc::new(DEPTH_FORMAT).extent(Extent::Fixed([config.shadow_atlas; 2])),
         );
 
-        let id = builder
-            .pass("punctual_shadows", PassKind::Inline)
-            .access(object_transforms, Access::StorageRead)
-            .access(instance_index, Access::StorageRead)
-            .access(atlas, Access::DepthAttachment)
-            .build();
+        let id = indirect(
+            builder
+                .pass("punctual_shadows", PassKind::Inline)
+                .access(object_transforms, Access::StorageRead)
+                .access(instance_index, Access::StorageRead),
+            draw_commands,
+        )
+        .access(atlas, Access::DepthAttachment)
+        .build();
         record(id, PassBody::PunctualShadows, &mut bodies);
 
         atlas
@@ -707,15 +801,18 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let hdr_color = builder.create_image("hdr_color", ImageDesc::new(color_format));
 
     if let Some(prepass) = prepass {
-        let id = builder
-            .pass("geometry_prepass", PassKind::Inline)
-            .access(object_transforms, Access::StorageRead)
-            .access(instance_index, Access::StorageRead)
-            .access(prepass.normal, Access::ColorAttachment)
-            .access(prepass.velocity, Access::ColorAttachment)
-            .access(prepass.material, Access::ColorAttachment)
-            .access(prepass.depth, Access::DepthAttachment)
-            .build();
+        let id = indirect(
+            builder
+                .pass("geometry_prepass", PassKind::Inline)
+                .access(object_transforms, Access::StorageRead)
+                .access(instance_index, Access::StorageRead),
+            draw_commands,
+        )
+        .access(prepass.normal, Access::ColorAttachment)
+        .access(prepass.velocity, Access::ColorAttachment)
+        .access(prepass.material, Access::ColorAttachment)
+        .access(prepass.depth, Access::DepthAttachment)
+        .build();
         record(id, PassBody::GeometryPrepass, &mut bodies);
     }
 
@@ -823,10 +920,13 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         )
     });
 
-    let mut forward = builder
-        .pass("forward", PassKind::Inline)
-        .access(object_transforms, Access::StorageRead)
-        .access(instance_index, Access::StorageRead);
+    let mut forward = indirect(
+        builder
+            .pass("forward", PassKind::Inline)
+            .access(object_transforms, Access::StorageRead)
+            .access(instance_index, Access::StorageRead),
+        draw_commands,
+    );
     if let Some(ssao) = ssao {
         forward = forward.access(ssao.ao, Access::Sampled);
     }
@@ -1052,7 +1152,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let mut accumulate = builder
             .pass("oit_accumulate", PassKind::Inline)
             .access(object_transforms, Access::StorageRead)
-            .access(instance_index, Access::StorageRead);
+            .access(blended_index, Access::StorageRead);
         if let Some(ssao) = ssao {
             accumulate = accumulate.access(ssao.ao, Access::Sampled);
         }
@@ -1146,7 +1246,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let mut draw = builder
             .pass("refraction_draw", PassKind::Inline)
             .access(object_transforms, Access::StorageRead)
-            .access(instance_index, Access::StorageRead)
+            .access(blended_index, Access::StorageRead)
             .access(scene, Access::Sampled)
             .access(source, Access::Sampled);
         if let Some(ssao) = ssao {

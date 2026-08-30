@@ -35,14 +35,11 @@ layout(location = 7) out vec3 v_view_pos;
 // space and the forward pass tests against it there, so testing here in any
 // other space would mean two descriptions of one box.
 layout(location = 8) out vec3 v_world_pos;
-
-layout(push_constant) uniform Push {
-    // Where this instanced run starts in `instances`; gl_InstanceIndex counts
-    // from it, and the entry found there is the object's row.
-    uint object_base;
-    // Row of the material table this run draws with; read by the fragment stage.
-    uint material_index;
-} push;
+// Which material row to alpha-test and write parameters for, read out of this
+// instance's entry rather than pushed: a multi-draw covers every batch of a
+// pipeline variant, so there is no per-draw push to put it in. `flat` because it
+// is a number, not a quantity to interpolate.
+layout(location = 9) flat out uint v_material;
 
 layout(set = 0, binding = 0) uniform Frame {
     mat4 view;
@@ -75,17 +72,20 @@ layout(set = 1, binding = 0, std430) readonly buffer Objects {
     Object objects[];
 };
 
-// This pass's slice of the frame's draw order, as row numbers into `objects`.
-// The indirection is what lets a row be shared: an object the camera sees and
-// four cascades also draw occupies one row named five times, rather than five
-// copies of the same three matrices. `push.object_base` is where this run's
-// slice starts. See `vulkan::instances`.
+// This pass's slice of the frame's draw order: for each entry, the row into
+// `objects` and the material to draw it with. The indirection is what lets a row
+// be shared — an object the camera sees and four cascades also draw occupies one
+// row named five times, rather than five copies of the same three matrices.
+// `gl_InstanceIndex` already counts from the draw's `firstInstance`, which is
+// where its slice starts. See `vulkan::instances`.
 layout(set = 1, binding = 1, std430) readonly buffer Instances {
-    uint instances[];
+    uvec2 instances[];
 };
 
 void main() {
-    uint object = instances[push.object_base + uint(gl_InstanceIndex)];
+    uvec2 entry = instances[uint(gl_InstanceIndex)];
+    uint object = entry.x;
+    v_material = entry.y;
     mat4 model = objects[object].model;
 
     // Same construction as forward.vert, one space along: Gram-Schmidt against

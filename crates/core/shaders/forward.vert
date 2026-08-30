@@ -12,15 +12,16 @@ layout(location = 2) out vec3 v_tangent;
 layout(location = 3) out vec3 v_bitangent;
 layout(location = 4) out vec2 v_uv;
 layout(location = 5) out vec3 v_color;
+// Which material row to shade with, read out of this instance's entry rather
+// than pushed: a multi-draw covers every batch of a pipeline variant, so there
+// is no per-draw push to put it in. `flat` because it is a number, not a
+// quantity to interpolate.
+layout(location = 6) flat out uint v_material;
 
-// Declared identically to the fragment shader so the two stages
-// share one push-constant range. `material_index` is unused here.
+// Declared identically to the fragment shader so the two stages share one
+// push-constant range.
 layout(push_constant) uniform Push {
     mat4 view_proj;
-    uint material_index;
-    // Where this instanced run starts in `instances`; gl_InstanceIndex counts
-    // from it, and the entry found there is the object's row.
-    uint object_base;
 } push;
 
 // Per-object transforms, indexed per instance. Mirrors GpuObject in
@@ -34,13 +35,14 @@ layout(set = 4, binding = 0, std430) readonly buffer Objects {
     Object objects[];
 };
 
-// This pass's slice of the frame's draw order, as row numbers into `objects`.
-// The indirection is what lets a row be shared: an object the camera sees and
-// four cascades also draw occupies one row named five times, rather than five
-// copies of the same three matrices. `push.object_base` is where this run's
-// slice starts. See `vulkan::instances`.
+// This pass's slice of the frame's draw order: for each entry, the row into
+// `objects` and the material to draw it with. The indirection is what lets a row
+// be shared — an object the camera sees and four cascades also draw occupies one
+// row named five times, rather than five copies of the same three matrices.
+// `gl_InstanceIndex` already counts from the draw's `firstInstance`, which is
+// where its slice starts. See `vulkan::instances`.
 layout(set = 4, binding = 1, std430) readonly buffer Instances {
-    uint instances[];
+    uvec2 instances[];
 };
 
 // The other half of the depth-invariance guarantee `prepass.vert` documents:
@@ -50,7 +52,9 @@ layout(set = 4, binding = 1, std430) readonly buffer Instances {
 invariant gl_Position;
 
 void main() {
-    uint object = instances[push.object_base + uint(gl_InstanceIndex)];
+    uvec2 entry = instances[uint(gl_InstanceIndex)];
+    uint object = entry.x;
+    v_material = entry.y;
     mat4 model = objects[object].model;
     mat4 normal_matrix = objects[object].normal_matrix;
 

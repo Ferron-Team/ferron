@@ -244,27 +244,32 @@ impl RefractionPass {
                 &bound,
             );
 
+        // The arena is bound for the pass, not per draw: a mesh is a span into
+        // it. The matrix is pushed once for the same reason — what used to vary
+        // per run, the material and the first object row, travels with the
+        // instance now.
+        renderer.arena.bind(builder);
+        builder.push_constants(
+            self.pipeline.layout(),
+            0,
+            &super::forward::PushConstants::new(view.view_proj),
+        );
+
         for run in draws.runs() {
             let item = draws.item(run.start);
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
-            // The refractive rows follow the transparent ones in the shared
-            // object buffer, so a run's base is its start plus where that block
-            // began.
-            let push = super::forward::PushConstants::new(
-                view.view_proj,
-                item.material.0,
+            // The refractive rows follow the ones before them in the shared object
+            // buffer, so a run's `firstInstance` is its start plus where that
+            // block began.
+            builder.draw_indexed(
+                mesh.span.index_count,
+                run.len() as u32,
+                mesh.span.first_index,
+                mesh.span.vertex_offset,
                 object_base + run.start as u32,
             );
-            builder
-                .push_constants(self.pipeline.layout(), 0, &push)
-                .bind_vertex_buffers(
-                    0,
-                    (mesh.position_buffer.clone(), mesh.surface_buffer.clone()),
-                )
-                .bind_index_buffer(mesh.index_buffer.clone());
-            builder.draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0);
         }
     }
 

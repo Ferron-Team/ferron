@@ -4,7 +4,7 @@ use std::sync::Arc;
 use glam::Mat4;
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::ClearDepthStencilImageInfo;
-use vulkano::command_buffer::{ClearAttachment, ClearRect};
+use vulkano::command_buffer::{ClearAttachment, ClearRect, DrawIndexedIndirectCommand};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
 use vulkano::format::ClearDepthStencilValue;
@@ -33,7 +33,8 @@ use crate::gfx::{DrawList, PositionVertex};
 
 use super::PassCtx;
 use super::context::VkContext;
-use super::instances::GpuObject;
+use super::cull::{CullFrame, Draws};
+use super::instances::{GpuObject, InstanceEntry};
 use super::record::{self, Recorder};
 use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
@@ -43,26 +44,19 @@ use super::swapchain::DEPTH_FORMAT;
 /// it, which is what [`VkContext::mark_texture_array_partial`] assumes.
 const TEXTURE_SET: usize = 2;
 
-/// Per-run push constants: 68 bytes, comfortably inside the 128-byte guaranteed
-/// `maxPushConstantsSize`. The cascade's matrix rides here rather than in a
+/// Per-pass push constants: 64 bytes, comfortably inside the 128-byte guaranteed
+/// `maxPushConstantsSize`. The light's matrix rides here rather than in a
 /// uniform buffer because it changes once per pass, not once per draw.
+///
+/// One struct for both pipeline variants. It was two while the cutout variant
+/// also named a material row to alpha-test against — a member the plain
+/// variant's reflected range did not have, so writing it there would have run
+/// past the end. The material now travels with the instance, which is what
+/// leaves the two ranges the same shape. See [`instances`](super::instances).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct PushConstants {
     light_view_proj: [[f32; 4]; 4],
-    object_base: u32,
-}
-
-/// The cutout variant's, four bytes longer: it also names the material row to
-/// alpha-test against. Two structs rather than one with an unused tail, because
-/// a push-constant member no stage reads can be stripped from the reflected
-/// range and the write would then run past its end.
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct MaskedPushConstants {
-    light_view_proj: [[f32; 4]; 4],
-    object_base: u32,
-    material_index: u32,
 }
 
 pub struct ShadowPass {
@@ -136,7 +130,7 @@ impl ShadowPass {
         &self,
         ctx: &VkContext,
         rows: &Subbuffer<[GpuObject]>,
-        indices: &Subbuffer<[u32]>,
+        indices: &Subbuffer<[InstanceEntry]>,
     ) -> Arc<DescriptorSet> {
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
@@ -203,13 +197,16 @@ impl ShadowPass {
         &self,
         builder: &mut Recorder,
         renderer: &PassCtx<'_>,
-        casters: DrawList<'_>,
+        casters: Draws<'_>,
         view_proj: Mat4,
-        object_base: u32,
         resolution: u32,
         sets: &CasterSets,
     ) {
         self.set_tile(builder, [0, 0], resolution);
+        // Position alone: a depth-only pass reads no surface stream. Bound here
+        // rather than in `draw` because vertex bindings are command-buffer
+        // state that outlives a draw, and a secondary starts with none.
+        renderer.arena.bind_positions(builder);
         // Dynamic so the editor's bias sliders tune acne live instead of
         // rebuilding the pipeline on every drag. `clamp` stays 0.0: a nonzero
         // one needs the `depth_bias_clamp` device feature. Set before any
@@ -225,7 +222,6 @@ impl ShadowPass {
             renderer,
             casters,
             view_proj,
-            object_base,
             sets,
             // Already culled, and against a wider test than this one: a caster
             // outside the cascade's box can still shadow into it, which is what
@@ -251,6 +247,7 @@ impl ShadowPass {
         atlas: &ShadowAtlas,
         casters: &[DrawList<'_>],
         bases: &[u32],
+        gpu: Option<(&CullFrame, &Subbuffer<[DrawIndexedIndirectCommand]>, u32)>,
         sets: &CasterSets,
     ) {
         // Every tile this frame assigned, cleared before anything draws — and
@@ -286,6 +283,7 @@ impl ShadowPass {
             return;
         }
         builder.clear_attachments([ClearAttachment::Depth(1.0)], tiles);
+        renderer.arena.bind_positions(builder);
 
         builder.set_depth_bias(self.punctual_constant_bias, 0.0, self.punctual_slope_bias);
 
@@ -296,13 +294,29 @@ impl ShadowPass {
         // the nineteen tiles a demo frame assigns.
         let mut bound = Bound::default();
         for (index, caster) in atlas.casters.iter().enumerate() {
-            let (Some(list), Some(&base)) = (casters.get(index), bases.get(index)) else {
-                continue;
-            };
-            if list.is_empty() {
+            // A light with nothing to draw is skipped on the CPU path only. The
+            // compute path has no per-light list to be empty: its faces are
+            // views, and a view whose every batch culled to zero records the
+            // same draws with a count of zero.
+            let list = casters.get(index).copied();
+            let base = bases.get(index).copied();
+            if gpu.is_none() && list.is_none_or(|list| list.is_empty()) {
                 continue;
             }
-            for face in &atlas.faces[caster.first_face..caster.first_face + caster.face_count] {
+            let faces = caster.first_face..caster.first_face + caster.face_count;
+            for (offset, face) in atlas.faces[faces].iter().enumerate() {
+                let face_index = (caster.first_face + offset) as u32;
+                let draws = match gpu {
+                    Some((frame, commands, first_view)) => Draws::Gpu {
+                        frame,
+                        view: first_view + face_index,
+                        commands,
+                    },
+                    None => Draws::Cpu {
+                        list: list.expect("a CPU-culled light with no list is skipped above"),
+                        base: base.expect("a caster list and its base are the same length"),
+                    },
+                };
                 self.set_tile(builder, face.tile.offset, face.tile.size);
                 // Culled per face, where the caster lists were culled per
                 // *light*. A point light's six frustums partition the space its
@@ -319,9 +333,8 @@ impl ShadowPass {
                 self.draw(
                     builder,
                     renderer,
-                    *list,
+                    draws,
                     face.view_proj,
-                    base,
                     sets,
                     Some(&frustum),
                     &mut bound,
@@ -375,21 +388,23 @@ impl ShadowPass {
         &self,
         builder: &mut Recorder,
         renderer: &PassCtx<'_>,
-        casters: DrawList<'_>,
+        casters: Draws<'_>,
         view_proj: Mat4,
-        object_base: u32,
         sets: &CasterSets,
         cull: Option<&Frustum>,
         bound: &mut Bound,
     ) {
-        for run in casters.runs() {
+        for unit in casters.units() {
+            // Only ever `Some` on the CPU path: the compute path culls each
+            // face as a view of its own, so what reaches here has already been
+            // tested against this very frustum.
             if let Some(frustum) = cull
-                && !run_intersects(&casters, &run, frustum)
+                && let Some((list, run)) = &unit.run
+                && !run_intersects(list, run, frustum)
             {
                 continue;
             }
-            let item = casters.item(run.start);
-            let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
+            let Some(mesh) = renderer.meshes.get(unit.mesh as usize) else {
                 continue;
             };
             // The same flag word the forward pass and the prepass read, so all
@@ -398,54 +413,61 @@ impl ShadowPass {
             // exactly what it recorded before this existed.
             let wants_masked = renderer
                 .materials
-                .get(item.material.0 as usize)
+                .get(unit.material as usize)
                 .is_some_and(super::forward::GpuMaterial::is_masked);
-            let pipeline = if wants_masked {
-                &self.masked_pipeline
-            } else {
-                &self.pipeline
-            };
-            if bound.needs_pipeline(wants_masked) {
-                builder
-                    .bind_pipeline_graphics(pipeline)
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        pipeline.layout(),
-                        0,
-                        &sets.for_pipeline(wants_masked),
-                    );
-            }
-
-            let object_base = object_base + run.start as u32;
-            let light_view_proj = view_proj.to_cols_array_2d();
-            // Two ranges, so two writes. The plain pipeline's layout has no
-            // material index in its range and pushing one would run past its
-            // end — see `MaskedPushConstants`.
-            if wants_masked {
-                builder.push_constants(
-                    pipeline.layout(),
-                    0,
-                    &MaskedPushConstants {
-                        light_view_proj,
-                        object_base,
-                        material_index: item.material.0,
-                    },
-                );
-            } else {
-                builder.push_constants(
-                    pipeline.layout(),
-                    0,
-                    &PushConstants {
-                        light_view_proj,
-                        object_base,
-                    },
-                );
-            }
-            builder
-                .bind_vertex_buffers(0, mesh.position_buffer.clone())
-                .bind_index_buffer(mesh.index_buffer.clone());
-            builder.draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0);
+            self.bind(builder, sets, bound, wants_masked, view_proj);
+            builder.draw_indexed(
+                mesh.span.index_count,
+                unit.instances,
+                mesh.span.first_index,
+                mesh.span.vertex_offset,
+                unit.object_base,
+            );
         }
+
+        // The compute path's two multi-draws over this view's commands. A face
+        // culled to nothing still records them, with every instance count zero.
+        for region in casters.regions() {
+            self.bind(builder, sets, bound, region.masked, view_proj);
+            builder.draw_indexed_indirect(region.commands);
+        }
+    }
+
+    /// Put the pipeline this draw needs, and the light's matrix, in front of it.
+    ///
+    /// `bound` is the caller's, so a run that wants what the last one bound
+    /// binds nothing — which is what keeps the atlas from rebinding a pipeline
+    /// and three descriptor sets on each of its nineteen tiles.
+    fn bind(
+        &self,
+        builder: &mut Recorder,
+        sets: &CasterSets,
+        bound: &mut Bound,
+        wants_masked: bool,
+        view_proj: Mat4,
+    ) {
+        let pipeline = if wants_masked {
+            &self.masked_pipeline
+        } else {
+            &self.pipeline
+        };
+        if bound.needs_pipeline(wants_masked) {
+            builder
+                .bind_pipeline_graphics(pipeline)
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipeline.layout(),
+                    0,
+                    &sets.for_pipeline(wants_masked),
+                );
+        }
+        builder.push_constants(
+            pipeline.layout(),
+            0,
+            &PushConstants {
+                light_view_proj: view_proj.to_cols_array_2d(),
+            },
+        );
     }
 }
 

@@ -39,8 +39,8 @@ use vulkano::buffer::{Buffer, BufferContents, IndexBuffer, Subbuffer};
 use vulkano::command_buffer::{
     BlitImageInfo, ClearAttachment, ClearDepthStencilImageInfo, ClearRect, CommandBuffer,
     CommandBufferBeginInfo, CommandBufferInheritanceInfo, CommandBufferLevel, CommandBufferUsage,
-    CopyBufferInfo, CopyBufferToImageInfo, CopyImageToBufferInfo, RecordingCommandBuffer,
-    RenderingInfo,
+    CopyBufferInfo, CopyBufferToImageInfo, CopyImageToBufferInfo, DrawIndexedIndirectCommand,
+    RecordingCommandBuffer, RenderingInfo,
 };
 use vulkano::descriptor_set::DescriptorSet;
 use vulkano::image::{Image, ImageLayout, ImageSubresourceRange};
@@ -648,6 +648,31 @@ impl Recorder {
             )
         }
         .expect("invalid indexed draw");
+        self
+    }
+
+    /// One draw per command in `commands`, which is sliced by the caller to the
+    /// batch it is drawing.
+    ///
+    /// The counts come from a buffer the GPU wrote, so nothing on this side has
+    /// seen them. What makes that sound is that the reset dispatch stamps every
+    /// command with its batch's own `index_count` and the cull only ever
+    /// increments the instance count — so a command names geometry the bound
+    /// index buffer really has, and a count of instances that really were
+    /// written into the slice this draw's base points at. See `gfx/vulkan/cull`.
+    pub(super) fn draw_indexed_indirect(
+        &mut self,
+        commands: Subbuffer<[DrawIndexedIndirectCommand]>,
+    ) -> &mut Self {
+        let count = commands.len() as u32;
+        unsafe {
+            self.inner.draw_indexed_indirect(
+                &commands,
+                count,
+                size_of::<DrawIndexedIndirectCommand>() as u32,
+            )
+        }
+        .expect("invalid indirect draw");
         self
     }
 

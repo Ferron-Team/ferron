@@ -349,6 +349,8 @@ pub(super) fn rendering_info(
         | PassBody::LuminanceAverage
         | PassBody::BloomPrefilter
         | PassBody::BloomDownsample(_)
-        | PassBody::BloomUpsample(_) => return None,
+        | PassBody::BloomUpsample(_)
+        | PassBody::CullReset
+        | PassBody::Cull => return None,
     })
 }

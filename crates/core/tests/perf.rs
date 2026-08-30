@@ -63,7 +63,7 @@ use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use orrin_core::gfx::punctual::{MAX_SHADOW_LIGHTS, ShadowAtlas};
 use orrin_core::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
 use orrin_core::gfx::vulkan::{ShadowFrame, VulkanRenderer};
-use orrin_core::gfx::{DecalInstance, DrawList, SceneLighting};
+use orrin_core::gfx::{DecalInstance, DrawList, RenderBackend, SceneLighting};
 use orrin_core::profile::{self, Lane, Profiler};
 use orrin_core::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
 use orrin_core::scene::model::{self, ImportSettings};
@@ -258,7 +258,14 @@ fn frame_cost() {
             };
             {
                 let _s = profile::scope("geometry");
-                systems::extract_geometry(&world, aspect, &cascade_set, &atlas, &mut geometry);
+                systems::extract_geometry(
+                    &world,
+                    aspect,
+                    &cascade_set,
+                    &atlas,
+                    renderer.gpu_culling(),
+                    &mut geometry,
+                );
             }
             entities = geometry.visible().len();
             // What the CPU actually records: one `draw_indexed` per maximal

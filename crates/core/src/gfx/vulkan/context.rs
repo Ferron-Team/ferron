@@ -69,6 +69,14 @@ pub struct VkContext {
     ///
     /// [`MAX_TEXTURES`]: crate::gfx::MAX_TEXTURES
     pub partially_bound: bool,
+    /// Whether one recorded command may issue many indirect draws, each with a
+    /// `firstInstance` of its own.
+    ///
+    /// Both halves are what GPU culling draws through: a view's batches are one
+    /// multi-draw, and a batch finds its instances through the `firstInstance`
+    /// the cull dispatch wrote into its command. A device without them keeps the
+    /// CPU sweep, which is the default path anyway — see `read_gpu_culling`.
+    pub multi_draw: bool,
 }
 
 impl VkContext {
@@ -147,6 +155,16 @@ impl VkContext {
             .image_view_format_swizzle;
 
         let anisotropy = physical_device.supported_features().sampler_anisotropy;
+
+        // Two features and one capability: `multi_draw_indirect` is what makes a
+        // command buffer's draw count independent of the batch count, and
+        // `draw_indirect_first_instance` is what lets each of those draws start
+        // at its own place in the instance list. Neither is asserted, because
+        // the path that needs them is optional.
+        let multi_draw = physical_device.supported_features().multi_draw_indirect
+            && physical_device
+                .supported_features()
+                .draw_indirect_first_instance;
 
         // Promoted to core in 1.2, and only read there: reaching it through
         // `VK_EXT_descriptor_indexing` on a 1.1 device would drag in that
@@ -233,6 +251,8 @@ impl VkContext {
                     sampler_anisotropy: anisotropy,
                     independent_blend: true,
                     descriptor_binding_partially_bound: partially_bound,
+                    multi_draw_indirect: multi_draw,
+                    draw_indirect_first_instance: multi_draw,
                     dynamic_rendering: true,
                     synchronization2: true,
                     ..DeviceFeatures::empty()
@@ -284,6 +304,7 @@ impl VkContext {
             profile,
             pipelines,
             partially_bound,
+            multi_draw,
         }
     }
 

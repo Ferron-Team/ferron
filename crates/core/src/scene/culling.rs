@@ -8,7 +8,11 @@ pub struct Culling {
     /// When false every renderable is drawn, whatever the frustum says. The A/B
     /// for "is this missing object a culling bug?".
     pub enabled: bool,
-    visible: usize,
+    /// `None` when the frustum test ran on the GPU, which is where the answer
+    /// then is — the CPU offered every opaque renderable to the dispatch and
+    /// was never told which survived. A number that would otherwise read as
+    /// "nothing was culled", which is the one wrong thing this panel could say.
+    visible: Option<usize>,
     total: usize,
 }
 
@@ -16,19 +20,19 @@ impl Default for Culling {
     fn default() -> Self {
         Self {
             enabled: true,
-            visible: 0,
+            visible: None,
             total: 0,
         }
     }
 }
 
 impl Culling {
-    pub fn record(&mut self, visible: usize, total: usize) {
+    pub fn record(&mut self, visible: Option<usize>, total: usize) {
         self.visible = visible;
         self.total = total;
     }
 
-    pub fn visible(&self) -> usize {
+    pub fn visible(&self) -> Option<usize> {
         self.visible
     }
 
@@ -36,7 +40,8 @@ impl Culling {
         self.total
     }
 
-    pub fn culled(&self) -> usize {
-        self.total.saturating_sub(self.visible)
+    pub fn culled(&self) -> Option<usize> {
+        self.visible
+            .map(|visible| self.total.saturating_sub(visible))
     }
 }
