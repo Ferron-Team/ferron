@@ -84,6 +84,27 @@ impl fmt::Display for FrameGraph {
         for resource in self.concurrent() {
             writeln!(f, "-- concurrent {}", self.resource_name(resource))?;
         }
+        // Who shares memory with whom, with the lifetimes that say they may.
+        // Here because it is the other half of the barrier above it: a widened
+        // source on a transient's first write means nothing until you can see
+        // which resource had the memory before it.
+        for group in self.alias_groups() {
+            write!(f, "-- aliased")?;
+            for (position, &member) in group.iter().enumerate() {
+                let lifetime = self
+                    .lifetime(member)
+                    .expect("an aliased resource is touched by a live pass");
+                write!(
+                    f,
+                    "{} {} [{:02}..{:02}]",
+                    if position == 0 { "" } else { " ->" },
+                    self.resource_name(member),
+                    lifetime.start,
+                    lifetime.end - 1,
+                )?;
+            }
+            writeln!(f)?;
+        }
         Ok(())
     }
 }

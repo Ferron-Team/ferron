@@ -1,12 +1,13 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
+use std::ops::Range;
 
 use vulkano::image::{ImageLayout, ImageUsage};
 use vulkano::sync::{AccessFlags, PipelineStages};
 
 use super::{
     Access, Barrier, GraphBuilder, GraphError, ImageDesc, PassDecl, PassId, PassKind, Queue,
-    ResourceDecl, ResourceId, ResourceKind, Segment, schedule,
+    ResourceDecl, ResourceId, ResourceKind, Segment, alias, schedule,
 };
 
 /// A graph-owned image, sized and flagged by the compiler. `usage` is the union
@@ -24,6 +25,9 @@ pub struct TransientImage {
     /// Reachable from both queues, because both touch it. See
     /// [`FrameGraph::concurrent`].
     pub concurrent: bool,
+    /// Which of [`FrameGraph::alias_groups`] this image shares its allocation
+    /// with, `None` for one that has its own. See [`alias`](super::alias).
+    pub alias: Option<u32>,
 }
 
 /// A compiled frame: passes in execution order, the barriers between them, and
@@ -47,6 +51,12 @@ pub struct FrameGraph {
     /// Resources reached from more than one queue, which therefore cannot be
     /// created in `SharingMode::Exclusive`. Indexed by `ResourceId`.
     concurrent: Vec<bool>,
+    /// The slots each resource is live across; `None` for one no live pass
+    /// touches. Indexed by `ResourceId`.
+    lifetimes: Vec<Option<Range<usize>>>,
+    /// Sets of transients that share one allocation, each in the order the
+    /// memory changes hands in.
+    alias_groups: Vec<Vec<ResourceId>>,
 }
 
 impl FrameGraph {
@@ -117,6 +127,25 @@ impl FrameGraph {
         &self.passes[pass.index()]
     }
 
+    /// The slots of [`order`](Self::order) this resource is live across, from
+    /// the first pass that touches it to the last inclusive. `None` for an
+    /// import, a buffer, or a resource only culled passes touch.
+    pub fn lifetime(&self, resource: ResourceId) -> Option<Range<usize>> {
+        self.lifetimes[resource.index()].clone()
+    }
+
+    /// The sets of transients that share one allocation, each in the order the
+    /// memory changes hands in.
+    ///
+    /// Members of a group are never alive at the same time — that is what makes
+    /// them a group — and the barrier plan already carries the dependency that
+    /// hands the memory over, so an executor that honours these needs nothing
+    /// else. One that ignores them and allocates separately is correct too, just
+    /// larger: see [`alias`](super::alias).
+    pub fn alias_groups(&self) -> &[Vec<ResourceId>] {
+        &self.alias_groups
+    }
+
     /// The images the executor must allocate, in declaration order.
     pub fn transient_images(&self) -> impl Iterator<Item = (ResourceId, TransientImage)> + '_ {
         self.images
@@ -147,7 +176,6 @@ pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
     // queue its pass is recorded on.
     let segments = schedule::segments(&order, &passes, async_compute);
     let queues = schedule::slot_queues(&segments, order.len());
-    let (barriers, final_barriers) = derive_barriers(&order, &passes, &resources, &queues)?;
     let mut images = derive_images(&order, &passes, &resources);
     let concurrent = derive_concurrent(&order, &passes, &resources, &segments);
     for (index, image) in images.iter_mut().enumerate() {
@@ -155,6 +183,24 @@ pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
             image.concurrent = concurrent[index];
         }
     }
+
+    // Before the barriers, because sharing an allocation is a dependency
+    // between the resources that share it and the plan has to carry it.
+    let lifetimes = alias::lifetimes(&order, &passes, resources.len());
+    let alias_groups = alias::groups(&images, &lifetimes);
+    let mut previous_in_group = vec![None; resources.len()];
+    for (index, group) in alias_groups.iter().enumerate() {
+        for (position, &member) in group.iter().enumerate() {
+            images[member.index()]
+                .as_mut()
+                .expect("only transients are grouped")
+                .alias = Some(index as u32);
+            previous_in_group[member.index()] = position.checked_sub(1).map(|before| group[before]);
+        }
+    }
+
+    let (barriers, final_barriers) =
+        derive_barriers(&order, &passes, &resources, &queues, &previous_in_group)?;
 
     Ok(FrameGraph {
         resources,
@@ -166,6 +212,8 @@ pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
         images,
         segments,
         concurrent,
+        lifetimes,
+        alias_groups,
     })
 }
 
@@ -441,6 +489,36 @@ impl State {
             src_queue: None,
         }
     }
+
+    /// The state a resource starts in when it is about to be handed the memory
+    /// `previous` has finished with.
+    ///
+    /// The layout is still the entry one — `Undefined`, because nothing of the
+    /// contents survives — but the *memory* is not fresh, and the pass that
+    /// dirtied it has to finish before this one starts.
+    ///
+    /// `previous`'s readers join its writers in `write_stages` rather than
+    /// staying reads, for two reasons that point the same way. Aliasing is the
+    /// one write-after-read a frame contains, and `step` sources a write from
+    /// `write_stages` alone because `dependency_edges` guarantees there are no
+    /// others; and a read of the old resource is a read of this memory, so it
+    /// belongs in the half that the next write waits for.
+    fn aliased(previous: State, resource: &ResourceDecl) -> Self {
+        Self {
+            layout: resource.entry_layout(),
+            has_write: true,
+            write_stages: previous.write_stages | previous.read_stages,
+            // Only the writes made anything to flush. Kept rather than dropped
+            // to an execution dependency because a transition out of
+            // `Undefined` may rewrite the image's compression metadata, and a
+            // driver doing that wants the previous writes available first.
+            write_access: previous.write_access,
+            read_stages: PipelineStages::empty(),
+            visible_stages: PipelineStages::empty(),
+            visible_access: AccessFlags::empty(),
+            src_queue: previous.src_queue,
+        }
+    }
 }
 
 fn derive_barriers(
@@ -448,8 +526,10 @@ fn derive_barriers(
     passes: &[PassDecl],
     resources: &[ResourceDecl],
     queues: &[Queue],
+    previous_in_group: &[Option<ResourceId>],
 ) -> Result<(Vec<Vec<Barrier>>, Vec<Barrier>), GraphError> {
     let mut states: Vec<State> = resources.iter().map(State::new).collect();
+    let mut touched = vec![false; resources.len()];
     let mut barriers = Vec::with_capacity(order.len());
 
     for (slot, &pass_id) in order.iter().enumerate() {
@@ -458,14 +538,29 @@ fn derive_barriers(
         let mut pass_barriers = Vec::new();
         for &(resource, access) in &pass.accesses {
             let decl = &resources[resource.index()];
-            let state = &mut states[resource.index()];
 
-            if !access.is_write() && !state.has_write && !decl.is_imported() {
+            if !access.is_write() && !states[resource.index()].has_write && !decl.is_imported() {
                 return Err(GraphError::ReadBeforeWrite {
                     pass: pass.name,
                     resource: decl.name,
                 });
             }
+
+            // Taking over an aliased allocation is seeded into the state rather
+            // than emitted as a barrier of its own, so it reaches the driver
+            // folded into this pass's first barrier and narrows across a queue
+            // boundary exactly as any other dependency does.
+            //
+            // After the check above rather than before: seeding sets
+            // `has_write`, which would make a read-before-write read as a
+            // legitimate read of what the previous tenant left.
+            if !touched[resource.index()]
+                && let Some(before) = previous_in_group[resource.index()]
+            {
+                states[resource.index()] = State::aliased(states[before.index()], decl);
+            }
+            touched[resource.index()] = true;
+            let state = &mut states[resource.index()];
 
             // Whether anything the barrier's source half describes ran on the
             // other queue, which is what decides whether the semaphore between
@@ -640,10 +735,11 @@ fn derive_images(
             desc,
             usage,
             memoryless,
-            // Filled in by `compile` once the frame has been cut into segments;
-            // `derive_images` is about what a pass declared, and this is about
-            // where the compiler put it.
+            // Both filled in by `compile` once the frame has been cut into
+            // segments and its lifetimes taken; `derive_images` is about what a
+            // pass declared, and these are about where the compiler put it.
             concurrent: false,
+            alias: None,
         });
     }
     images

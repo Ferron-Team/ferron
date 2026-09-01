@@ -5,19 +5,27 @@
 //! store, what they clear to — is [`rendering`](super::rendering)'s, and was
 //! a `RenderPass` and a `Framebuffer` per pass before dynamic rendering.
 //!
-//! Nothing here decides *what* to allocate. Format, extent and sample count come
-//! from the declaration; usage flags and the memoryless hint are derived by the
-//! compiler from what passes said they would do. So an image cannot be created
-//! missing a capability something needs, and cannot quietly carry one nothing
-//! asked for.
+//! Nothing here decides *what* to allocate, or how much. Format, extent and
+//! sample count come from the declaration; usage flags and the memoryless hint
+//! are derived by the compiler from what passes said they would do; and which
+//! transients are never alive at once, and may therefore be one allocation, is
+//! derived from their lifetimes. So an image cannot be created missing a
+//! capability something needs, cannot quietly carry one nothing asked for, and
+//! cannot share memory with something the frame still wants.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use vulkano::device::Device;
+use vulkano::image::sys::RawImage;
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{Image, ImageCreateInfo, ImageSubresourceRange, ImageType, ImageUsage};
-use vulkano::memory::MemoryPropertyFlags;
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::memory::allocator::{
+    AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator,
+};
+use vulkano::memory::{
+    DeviceMemory, MemoryAllocateInfo, MemoryPropertyFlags, MemoryRequirements, ResourceMemory,
+};
 use vulkano::sync::Sharing;
 
 use crate::gfx::graph::{FrameGraph, ResourceId};
@@ -49,6 +57,34 @@ struct ImageKey {
     array_layers: u32,
     mip_levels: u32,
     memoryless: bool,
+    /// The alias group this image was allocated as part of, named by its
+    /// members, or `None` for one allocated alone.
+    ///
+    /// In the key because memory is bound to an image once and for the image's
+    /// life: a cached image cannot be re-bound to the block a recompiled graph
+    /// would put it in. Keying without this would hand a graph that regrouped
+    /// its transients the images from the grouping *before* it, still sharing
+    /// memory with resources whose lifetimes now overlap theirs — corruption,
+    /// and of the kind that only appears when a checkbox is toggled.
+    alias: Option<String>,
+}
+
+/// Everything that distinguishes one shared block from another.
+///
+/// The group's members are in the key, and that is the whole safety argument on
+/// this side: a block is only ever handed to images of one alias group, and the
+/// compiler has already established that no two members of a group are alive at
+/// once. Whether an individual member hits the image cache or is allocated
+/// fresh cannot break that — the worst it can do is leave a member on a block of
+/// its own, which costs memory rather than correctness.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BlockKey {
+    group: String,
+    slot: usize,
+    /// Both in the key rather than checked, so a regrouped or resized graph
+    /// asks for a block that fits instead of being handed one that does not.
+    size: vulkano::DeviceSize,
+    memory_type_index: u32,
 }
 
 /// Graph-owned images, indexed by [`ResourceId`].
@@ -84,6 +120,10 @@ pub(super) struct GraphImages {
     /// resolves differently then, so every entry keyed at the old size is dead
     /// weight no lookup will ever hit again.
     cache: HashMap<ImageKey, Arc<ImageView>>,
+    /// The memory the graph's alias groups share, so that a structural toggle
+    /// re-binds the group it already allocated rather than allocating a second
+    /// one beside it. Cleared on resize with `cache`, and for the same reason.
+    blocks: HashMap<BlockKey, Arc<DeviceMemory>>,
     /// What [`Extent::Frame`](crate::gfx::graph::Extent::Frame) resolved to when
     /// these were allocated, so a resize is a comparison rather than a flag
     /// somebody has to remember to set.
@@ -102,6 +142,7 @@ impl GraphImages {
             views: Vec::new(),
             slot: 0,
             cache: HashMap::new(),
+            blocks: HashMap::new(),
             extent,
         };
         images.rebuild(memory, ctx, graph, extent, slots);
@@ -155,8 +196,24 @@ impl GraphImages {
 
         if self.extent != extent {
             self.cache.clear();
+            self.blocks.clear();
             self.extent = extent;
         }
+
+        // Which transients the compiler found are never alive at the same time,
+        // named by their members so that a group is identified by what is in it
+        // rather than by an index a recompile would renumber.
+        let groups: Vec<String> = graph
+            .alias_groups()
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|&id| graph.resource_name(id))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            })
+            .collect();
 
         let shared_families = ctx.shared_queue_families();
         let mut sets = Vec::with_capacity(slots);
@@ -191,6 +248,10 @@ impl GraphImages {
                     array_layers: image.desc.array_layers.unwrap_or(1),
                     mip_levels,
                     memoryless: image.memoryless,
+                    alias: image
+                        .alias
+                        .filter(|_| share_allocations())
+                        .map(|group| groups[group as usize].clone()),
                 };
                 assert!(
                     claimed.insert(key.clone()),
@@ -202,32 +263,45 @@ impl GraphImages {
                     continue;
                 }
 
-                let allocated = Image::new(
-                    memory.clone(),
-                    ImageCreateInfo {
-                        image_type: match image.desc.depth {
-                            Some(_) => ImageType::Dim3d,
-                            None => ImageType::Dim2d,
-                        },
-                        format: image.desc.format,
-                        extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
-                        usage: image.usage,
-                        samples: image.desc.samples,
-                        array_layers: image.desc.array_layers.unwrap_or(1),
-                        mip_levels,
-                        sharing: if key.concurrent {
-                            Sharing::Concurrent(shared_families.iter().copied().collect())
-                        } else {
-                            Sharing::Exclusive
-                        },
-                        ..Default::default()
+                let create_info = ImageCreateInfo {
+                    image_type: match image.desc.depth {
+                        Some(_) => ImageType::Dim3d,
+                        None => ImageType::Dim2d,
                     },
-                    if image.memoryless {
-                        lazy.clone()
+                    format: image.desc.format,
+                    extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
+                    usage: image.usage,
+                    samples: image.desc.samples,
+                    array_layers: image.desc.array_layers.unwrap_or(1),
+                    mip_levels,
+                    sharing: if key.concurrent {
+                        Sharing::Concurrent(shared_families.iter().copied().collect())
                     } else {
-                        AllocationCreateInfo::default()
+                        Sharing::Exclusive
                     },
-                )
+                    ..Default::default()
+                };
+
+                let allocated = match &key.alias {
+                    Some(group) => bind_shared(
+                        &ctx.device,
+                        memory,
+                        &mut self.blocks,
+                        group,
+                        slot,
+                        create_info,
+                    ),
+                    None => Image::new(
+                        memory.clone(),
+                        create_info,
+                        if image.memoryless {
+                            lazy.clone()
+                        } else {
+                            AllocationCreateInfo::default()
+                        },
+                    )
+                    .map_err(|error| error.to_string()),
+                }
                 .unwrap_or_else(|error| {
                     panic!(
                         "render graph: could not allocate `{}` ({:?}, {:?}): {error}",
@@ -348,6 +422,84 @@ impl GraphImages {
     pub fn mip_levels(&self, id: ResourceId) -> u32 {
         self.view(id).image().mip_levels()
     }
+}
+
+/// Create an image on the block its alias group shares, allocating the block if
+/// this is the first member to ask for it.
+///
+/// The block is one `DeviceMemory` per group rather than a suballocation,
+/// because every member of a group has identical create-info and therefore
+/// identical memory requirements — so they all sit at offset zero and the block
+/// is exactly one image large. A group is a set of equals, not a heap.
+///
+/// Not `ImageCreateFlags::ALIAS`: that flag is for images that must agree on
+/// what the bytes under them *mean*, and these deliberately do not. A transient
+/// enters every frame `Undefined`, which is precisely the transition that tells
+/// the driver the previous tenant's contents — and its compression metadata —
+/// may be thrown away.
+fn bind_shared(
+    device: &Arc<Device>,
+    allocator: &Arc<StandardMemoryAllocator>,
+    blocks: &mut HashMap<BlockKey, Arc<DeviceMemory>>,
+    group: &str,
+    slot: usize,
+    create_info: ImageCreateInfo,
+) -> Result<Arc<Image>, String> {
+    let raw = RawImage::new(device.clone(), create_info).map_err(|error| error.to_string())?;
+    let requirements: MemoryRequirements = raw.memory_requirements()[0];
+    let memory_type_index = allocator
+        .find_memory_type_index(
+            requirements.memory_type_bits,
+            MemoryTypeFilter::PREFER_DEVICE,
+        )
+        .ok_or("no device-local memory type accepts this image")?;
+
+    let key = BlockKey {
+        group: group.to_string(),
+        slot,
+        size: requirements.layout.size(),
+        memory_type_index,
+    };
+    let block = match blocks.get(&key) {
+        Some(block) => block.clone(),
+        None => {
+            let block = Arc::new(
+                DeviceMemory::allocate(
+                    device.clone(),
+                    MemoryAllocateInfo {
+                        allocation_size: key.size,
+                        memory_type_index,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            blocks.insert(key, block.clone());
+            block
+        }
+    };
+
+    // SAFETY: this block is only ever bound to members of one alias group, and
+    // the compiler established that no two of those are alive in the same slot
+    // of the frame — so the resources that share it are never in use at once.
+    // The hand-over is synchronised by the barrier `State::aliased` derives,
+    // which sources each member's first access from the last access of the
+    // member before it.
+    let resource = unsafe { ResourceMemory::new_dedicated_unchecked(block) };
+    raw.bind_memory([resource])
+        .map(Arc::new)
+        .map_err(|(error, ..)| error.to_string())
+}
+
+/// Whether transients the compiler grouped actually share their memory.
+///
+/// On unless `ORRIN_ALIAS=0`, which is the control the saving is measured
+/// against: the plan is identical either way — the compiler derives the
+/// hand-over dependency whether or not the executor takes the sharing up — so
+/// this changes how much VRAM the frame holds and nothing else about it.
+fn share_allocations() -> bool {
+    static SHARE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHARE.get_or_init(|| !std::env::var("ORRIN_ALIAS").is_ok_and(|value| value.trim() == "0"))
 }
 
 /// The deepest pyramid an extent can carry: halving stops at one texel.

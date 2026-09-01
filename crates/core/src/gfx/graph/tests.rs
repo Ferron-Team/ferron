@@ -1145,3 +1145,192 @@ fn a_dependency_inside_the_async_tail_is_kept() {
     assert_eq!(barrier.old_layout, ImageLayout::General);
     assert_eq!(barrier.new_layout, ImageLayout::ShaderReadOnlyOptimal);
 }
+
+/// A four-pass chain where `first` is finished with before `second` is touched,
+/// so the two are never alive at once and one allocation can serve both.
+fn aliasable_chain(second: ImageDesc) -> FrameGraph {
+    let mut builder = GraphBuilder::new();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let first = builder.create_image("first", image());
+    let second = builder.create_image("second", second);
+
+    builder
+        .pass("write_first", PassKind::Inline)
+        .access(first, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("read_first", PassKind::Inline)
+        .access(first, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("write_second", PassKind::Inline)
+        .access(second, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("read_second", PassKind::Inline)
+        .access(second, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    compile(builder).unwrap()
+}
+
+fn group_names(graph: &FrameGraph) -> Vec<Vec<&'static str>> {
+    graph
+        .alias_groups()
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|&id| graph.resource_name(id))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The whole feature: two images the frame is never holding at the same time
+/// are one allocation, and the graph is the only thing that knows it.
+#[test]
+fn two_transients_that_are_never_alive_at_once_share_an_allocation() {
+    let graph = aliasable_chain(image());
+    assert_eq!(group_names(&graph), vec![vec!["first", "second"]]);
+    // In lifetime order, because that is the order the memory changes hands in.
+    let (_, second) = graph
+        .transient_images()
+        .find(|(id, _)| graph.resource_name(*id) == "second")
+        .unwrap();
+    assert_eq!(second.alias, Some(0));
+}
+
+/// A resource is live from the first slot that touches it to the last, and
+/// nothing outside that window may be handed its memory.
+#[test]
+fn a_lifetime_spans_the_slots_that_touch_the_resource() {
+    let graph = aliasable_chain(image());
+    let lifetime = |name: &str| {
+        let (id, _) = graph
+            .transient_images()
+            .find(|(id, _)| graph.resource_name(*id) == name)
+            .unwrap();
+        graph.lifetime(id).unwrap()
+    };
+    assert_eq!(lifetime("first"), 0..2);
+    assert_eq!(lifetime("second"), 2..4);
+}
+
+/// The reason the two halves of a ping-pong stay two allocations: `blur_x` is
+/// still being read in the slot `blur_y` is first written.
+#[test]
+fn transients_alive_in_the_same_slot_are_never_aliased() {
+    let mut builder = GraphBuilder::new();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let blur_x = builder.create_image("blur_x", image());
+    let blur_y = builder.create_image("blur_y", image());
+
+    builder
+        .pass("horizontal", PassKind::Inline)
+        .access(blur_x, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("vertical", PassKind::Inline)
+        .access(blur_x, Access::Sampled)
+        .access(blur_y, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("composite", PassKind::Inline)
+        .access(blur_y, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    assert!(group_names(&graph).is_empty());
+}
+
+/// Only images whose allocations are interchangeable share one, because
+/// "interchangeable" is the only thing the compiler can establish without a
+/// `Device` to ask for memory requirements.
+#[test]
+fn transients_of_different_shape_are_never_aliased() {
+    let graph = aliasable_chain(ImageDesc::new(Format::R16G16B16A16_SFLOAT));
+    assert!(group_names(&graph).is_empty());
+}
+
+/// A memoryless target asks for a memory type the aliased block would not be
+/// allocated from, and on the tiler it exists for it costs nothing to leave
+/// alone.
+#[test]
+fn a_memoryless_target_is_never_aliased() {
+    let mut builder = GraphBuilder::new();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let msaa = builder.create_image("msaa", image());
+    let later = builder.create_image("later", image());
+
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(msaa, Access::ColorAttachment)
+        .access(target, Access::ResolveAttachment)
+        .build();
+    builder
+        .pass("write_later", PassKind::Inline)
+        .access(later, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("read_later", PassKind::Inline)
+        .access(later, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    assert!(group_names(&graph).is_empty());
+}
+
+/// The dependency aliasing adds, and the only thing that makes it safe: the
+/// first pass to write the shared memory waits for the last pass that read what
+/// was in it, even though the two name different resources.
+#[test]
+fn the_first_write_of_an_aliased_image_waits_for_the_reader_before_it() {
+    let graph = aliasable_chain(image());
+    let [barrier] = graph.barriers_before(2) else {
+        panic!("expected one barrier before `write_second`");
+    };
+    assert_eq!(graph.resource_name(barrier.resource), "second");
+    // Its contents are gone, so it enters undefined — and the memory under it
+    // is still being sampled by `read_first` until that pass finishes.
+    assert_eq!(barrier.old_layout, ImageLayout::Undefined);
+    assert_eq!(barrier.new_layout, ImageLayout::ColorAttachmentOptimal);
+    // Both halves of what the memory was doing: the pass that wrote `first` and
+    // the pass that sampled it. A read of the old resource is a read of this
+    // memory, so it is part of what the new write waits for.
+    assert_eq!(
+        barrier.src_stages,
+        Access::ColorAttachment.stages() | Access::Sampled.stages()
+    );
+    assert_eq!(barrier.dst_stages, PipelineStages::COLOR_ATTACHMENT_OUTPUT);
+}
+
+/// Without aliasing that same barrier sources nothing, which is what makes the
+/// one above a dependency the graph added rather than one it already had.
+#[test]
+fn the_first_write_of_an_unaliased_image_waits_for_nothing() {
+    let graph = aliasable_chain(ImageDesc::new(Format::R16G16B16A16_SFLOAT));
+    let [barrier] = graph.barriers_before(2) else {
+        panic!("expected one barrier before `write_second`");
+    };
+    assert_eq!(barrier.src_stages, PipelineStages::TOP_OF_PIPE);
+}

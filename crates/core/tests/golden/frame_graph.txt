@@ -927,7 +927,7 @@
      prepass_depth DepthAttachmentRead
 10 pass oit_accumulate [Inline]
   ! oit_accum Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
-  ! oit_reveal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+  ! oit_reveal Undefined->ColorAttachmentOptimal src VertexShader|FragmentShader|ColorAttachmentOutput|ComputeShader/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      ssao_ao Sampled
@@ -1036,6 +1036,7 @@
      swapchain_color ColorAttachment
 -- end of frame
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
+-- aliased ssao_raw_ao [05..06] -> oit_reveal [10..11]
 
 === editor frame, depth of field and motion blur ===
 00 pass geometry_prepass [Inline]
@@ -1693,7 +1694,7 @@
      prepass_depth Sampled
      ssao_ao ColorAttachment
 07 pass contact_shadows [Inline]
-  ! contact_shadow_mask Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+  ! contact_shadow_mask Undefined->ColorAttachmentOptimal src VertexShader|FragmentShader|ColorAttachmentOutput|ComputeShader/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      prepass_depth Sampled
      prepass_normal Sampled
      contact_shadow_mask ColorAttachment
@@ -1801,6 +1802,7 @@
      swapchain_color ColorAttachment
 -- end of frame
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
+-- aliased ssao_raw_ao [05..06] -> contact_shadow_mask [07..08]
 
 === editor frame, contact shadows alone ===
 00 pass geometry_prepass [Inline]
@@ -1893,7 +1895,7 @@
      prepass_depth Sampled
      ssao_ao ColorAttachment
 08 pass contact_shadows [Inline]
-  ! contact_shadow_mask Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+  ! contact_shadow_mask Undefined->ColorAttachmentOptimal src VertexShader|FragmentShader|ColorAttachmentOutput|ComputeShader/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      prepass_depth Sampled
      prepass_normal Sampled
      contact_shadow_mask ColorAttachment
@@ -2003,6 +2005,7 @@
      swapchain_color ColorAttachment
 -- end of frame
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
+-- aliased ssao_raw_ao [06..07] -> contact_shadow_mask [08..09]
 
 === editor frame, punctual shadows without cascades ===
 00 pass punctual_shadows [Inline]
@@ -2158,7 +2161,7 @@
      prepass_depth Sampled
      ssao_ao ColorAttachment
 07 pass contact_shadows [Inline]
-  ! contact_shadow_mask Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+  ! contact_shadow_mask Undefined->ColorAttachmentOptimal src VertexShader|FragmentShader|ColorAttachmentOutput|ComputeShader/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      prepass_depth Sampled
      prepass_normal Sampled
      contact_shadow_mask ColorAttachment
@@ -2238,7 +2241,7 @@
      taa_color StorageWrite
 16 pass dof_prefilter [Compute]
   ! taa_color General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
-  ! dof_prefiltered Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! dof_prefiltered Undefined->General src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      taa_color Sampled
      prepass_depth Sampled
      dof_prefiltered StorageWrite
@@ -2258,7 +2261,7 @@
 19 pass dof_composite [Compute]
   ! dof_near General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! dof_far General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
-  ! dof_color Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! dof_color Undefined->General src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      taa_color Sampled
      prepass_depth Sampled
      dof_near Sampled
@@ -2345,6 +2348,9 @@
      swapchain_color ColorAttachment
 -- end of frame
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
+-- aliased ssao_raw_ao [05..06] -> contact_shadow_mask [07..13]
+-- aliased ssr_rays [11..12] -> dof_prefiltered [16..18]
+-- aliased ssr_color [12..14] -> dof_color [19..33]
 
 === editor frame, transparency alone ===
 00 pass geometry_prepass [Inline]
@@ -2440,7 +2446,7 @@
      prepass_depth Sampled
      ssao_ao ColorAttachment
 07 pass contact_shadows [Inline]
-  ! contact_shadow_mask Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+  ! contact_shadow_mask Undefined->ColorAttachmentOptimal src VertexShader|FragmentShader|ColorAttachmentOutput|ComputeShader/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      prepass_depth Sampled
      prepass_normal Sampled
      contact_shadow_mask ColorAttachment
@@ -2510,12 +2516,12 @@
      oit_color StorageWrite
 15 pass refraction_scene [Compute]
   ! oit_color General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
-  ! refraction_scene Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! refraction_scene Undefined->General src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      oit_color Sampled
      refraction_scene StorageWrite
 16 pass refraction_draw [Inline]
   ! refraction_scene General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
-  ! refraction_accum Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+  ! refraction_accum Undefined->ColorAttachmentOptimal src VertexShader|FragmentShader|ColorAttachmentOutput|ComputeShader/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      refraction_scene Sampled
@@ -2527,7 +2533,7 @@
      prepass_depth DepthAttachmentRead
 17 pass refraction_composite [Compute]
   ! refraction_accum ColorAttachmentOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
-  ! refraction_color Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! refraction_color Undefined->General src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      oit_color Sampled
      refraction_accum Sampled
      refraction_color StorageWrite
@@ -2543,7 +2549,7 @@
      taa_color StorageWrite
 19 pass dof_prefilter [Compute]
   ! taa_color General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
-  ! dof_prefiltered Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! dof_prefiltered Undefined->General src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      taa_color Sampled
      prepass_depth Sampled
      dof_prefiltered StorageWrite
@@ -2563,7 +2569,7 @@
 22 pass dof_composite [Compute]
   ! dof_near General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! dof_far General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
-  ! dof_color Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! dof_color Undefined->General src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      taa_color Sampled
      prepass_depth Sampled
      dof_near Sampled
@@ -2650,6 +2656,11 @@
      swapchain_color ColorAttachment
 -- end of frame
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
+-- aliased ssao_raw_ao [05..06] -> contact_shadow_mask [07..16]
+-- aliased ssr_source [10..11] -> refraction_scene [15..16]
+-- aliased ssr_rays [11..12] -> dof_prefiltered [19..21]
+-- aliased ssr_color [12..14] -> refraction_color [17..18] -> dof_color [22..36]
+-- aliased oit_accum [13..14] -> refraction_accum [16..17]
 
 === editor frame, refraction alone ===
 00 pass geometry_prepass [Inline]
@@ -2748,7 +2759,7 @@
      prepass_depth Sampled
      ssao_ao ColorAttachment
 07 pass contact_shadows [Inline]
-  ! contact_shadow_mask Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+  ! contact_shadow_mask Undefined->ColorAttachmentOptimal src VertexShader|FragmentShader|ColorAttachmentOutput|ComputeShader/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      prepass_depth Sampled
      prepass_normal Sampled
      contact_shadow_mask ColorAttachment
@@ -2906,6 +2917,7 @@
      swapchain_color ColorAttachment
 -- end of frame
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
+-- aliased ssao_raw_ao [05..06] -> contact_shadow_mask [07..08]
 
 === editor frame, subsurface scattering alone ===
 00 pass geometry_prepass [Inline]
@@ -3821,7 +3833,7 @@
      prepass_material Sampled
      ssr_color StorageWrite
 19 pass oit_accumulate [Inline]
-  ! oit_accum Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+  ! oit_accum Undefined->ColorAttachmentOptimal src VertexShader|FragmentShader|ColorAttachmentOutput|ComputeShader/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! oit_reveal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! prepass_depth ShaderReadOnlyOptimal->DepthStencilReadOnlyOptimal src VertexShader|FragmentShader|EarlyFragmentTests|LateFragmentTests|ComputeShader/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead
      object_transforms StorageRead
@@ -3845,7 +3857,7 @@
      oit_color StorageWrite
 21 pass refraction_scene [Compute]
   ! oit_color General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
-  ! refraction_scene Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! refraction_scene Undefined->General src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      oit_color Sampled
      refraction_scene StorageWrite
 22 pass refraction_draw [Inline]
@@ -3901,7 +3913,7 @@
 28 pass dof_composite [Compute]
   ! dof_near General->ShaderReadOnlyOptimal src ComputeShader/ShaderStorageRead|ShaderStorageWrite dst ComputeShader/ShaderSampledRead
   ! dof_far General->ShaderReadOnlyOptimal src ComputeShader/ShaderStorageRead|ShaderStorageWrite dst ComputeShader/ShaderSampledRead
-  ! dof_color Undefined->General src TopOfPipe/- dst ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! dof_color Undefined->General src ComputeShader/ShaderStorageRead|ShaderStorageWrite dst ComputeShader/ShaderStorageRead|ShaderStorageWrite
      taa_color Sampled
      prepass_depth Sampled
      dof_near Sampled
@@ -3920,7 +3932,7 @@
 31 pass motion_blur_gather [Compute]
   ! dof_color General->ShaderReadOnlyOptimal src ComputeShader/ShaderStorageRead|ShaderStorageWrite dst ComputeShader/ShaderSampledRead
   ! motion_blur_neighbour General->ShaderReadOnlyOptimal src ComputeShader/ShaderStorageRead|ShaderStorageWrite dst ComputeShader/ShaderSampledRead
-  ! motion_blur_color Undefined->General src TopOfPipe/- dst ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! motion_blur_color Undefined->General src ComputeShader/ShaderStorageRead|ShaderStorageWrite dst ComputeShader/ShaderStorageRead|ShaderStorageWrite
      dof_color Sampled
      prepass_velocity Sampled
      prepass_depth Sampled
@@ -4012,4 +4024,9 @@
 -- concurrent motion_blur_color
 -- concurrent exposure
 -- concurrent bloom_up_0
+-- aliased subsurface_diffusible [11..12] -> oit_accum [19..20]
+-- aliased subsurface_color [14..18] -> refraction_color [23..24] -> dof_color [28..31]
+-- aliased ssr_source [16..17] -> refraction_scene [21..22]
+-- aliased ssr_rays [17..18] -> dof_prefiltered [25..27]
+-- aliased oit_color [20..23] -> motion_blur_color [31..45]
 

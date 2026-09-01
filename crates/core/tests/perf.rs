@@ -349,6 +349,22 @@ fn frame_cost() {
         extent[1],
         orrin_core::threads::count(),
     );
+    // The row for an optimisation that costs no frame time. Transient aliasing
+    // moves this number and nothing else in this file, so without it there is no
+    // table to choose it against — `ORRIN_ALIAS=0` is the other side.
+    let (used, total) = renderer.gpu_memory();
+    match used {
+        Some(used) => println!(
+            "     {:<28} {:>9.1} MB of {:.0} MB",
+            "device-local memory",
+            used as f64 / 1e6,
+            total as f64 / 1e6,
+        ),
+        None => println!(
+            "     {:<28} not reported by this driver",
+            "device-local memory"
+        ),
+    }
     for lane in [Lane::Cpu, Lane::Gpu] {
         let mut rows = profiler.aggregate(lane);
         rows.sort_by(|a, b| b.avg_ms.total_cmp(&a.avg_ms));

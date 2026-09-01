@@ -1940,3 +1940,101 @@ fn occlusion_base() -> FrameConfig {
         occlusion_culling: false,
     }
 }
+
+/// The whole safety condition for sharing an allocation, asserted over every
+/// configuration the frame has: two images that share memory are never wanted at
+/// the same time.
+///
+/// A violation is not a wrong pixel somewhere, it is one pass overwriting
+/// another's target — so this is checked as a property of all 28 frames rather
+/// than as a case, and from the lifetimes the compiler derived rather than from
+/// the ones a reader would expect the post chain to have.
+#[test]
+fn nothing_shares_memory_with_something_still_alive() {
+    for (label, config) in configs() {
+        let graph = declare(config).unwrap().graph;
+        for group in graph.alias_groups() {
+            for pair in group.windows(2) {
+                let (before, after) = (
+                    graph.lifetime(pair[0]).unwrap(),
+                    graph.lifetime(pair[1]).unwrap(),
+                );
+                assert!(
+                    before.end <= after.start,
+                    "{label}: {} is still live at {:?} when {} takes its memory at {:?}",
+                    graph.resource_name(pair[0]),
+                    before,
+                    graph.resource_name(pair[1]),
+                    after,
+                );
+            }
+        }
+    }
+}
+
+/// The other half of that condition, and the one a `Device` would otherwise have
+/// to be asked about: images share a block only when they would have been
+/// allocated identically, so the block one of them fits is the block all of them
+/// fit.
+#[test]
+fn everything_sharing_a_block_would_have_been_allocated_alike() {
+    for (label, config) in configs() {
+        let graph = declare(config).unwrap().graph;
+        let image = |id| {
+            graph
+                .transient_images()
+                .find(|(other, _)| *other == id)
+                .unwrap_or_else(|| panic!("{label}: an aliased resource is a transient image"))
+                .1
+        };
+        for group in graph.alias_groups() {
+            let first = image(group[0]);
+            for &member in &group[1..] {
+                let member_image = image(member);
+                assert_eq!(
+                    (first.desc, first.usage, first.concurrent),
+                    (
+                        member_image.desc,
+                        member_image.usage,
+                        member_image.concurrent
+                    ),
+                    "{label}: {} and {} share a block without sharing a shape",
+                    graph.resource_name(group[0]),
+                    graph.resource_name(member),
+                );
+                // Lazily-allocated memory is a different memory type, and on the
+                // tiler it exists for it is no allocation at all.
+                assert!(!member_image.memoryless, "{label}: memoryless and aliased");
+            }
+        }
+    }
+}
+
+/// What the frame actually gets out of it, pinned so the feature cannot quietly
+/// become a no-op — a shape change upstream that stopped two stages matching
+/// would show up here as nothing shared, and nowhere else.
+///
+/// The count rather than the arrangement, because which stage inherits which
+/// target is the greedy fit's business and reshuffles legitimately whenever a
+/// pass moves. How many allocations the frame ends up needing is the thing the
+/// item was asked for, so it is the thing asserted.
+#[test]
+fn the_post_chain_hands_its_targets_down() {
+    let (label, config) = configs()
+        .into_iter()
+        .find(|(label, _)| *label == "editor frame, async compute with every optical stage")
+        .expect("the every-stage configuration is what shows the sharing off");
+    let graph = declare(config).unwrap().graph;
+    let groups: Vec<Vec<&str>> = graph
+        .alias_groups()
+        .iter()
+        .map(|group| group.iter().map(|&id| graph.resource_name(id)).collect())
+        .collect();
+    let shared: usize = groups.iter().map(|group| group.len()).sum();
+    let saved = shared - groups.len();
+    assert!(
+        saved >= 5,
+        "{label}: sharing saved {saved} allocations out of {} transients: {groups:?}",
+        graph.transient_images().count(),
+    );
+}
