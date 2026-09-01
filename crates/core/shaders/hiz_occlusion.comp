@@ -1,0 +1,132 @@
+#version 460
+
+// The depth pyramid the *next* frame's cull tests against: level `n` holds the
+// **farthest** depth of the 2^(n+1) x 2^(n+1) block of this frame's depth
+// buffer under it, so an object whose nearest point is behind a cell's maximum
+// is behind every surface that cell covers and need not be drawn.
+//
+// Farthest, not nearest, and the difference is the whole test. `hiz_build.comp`
+// reduces the same depth with `min` because a reflection ray needs to know it
+// cannot have hit anything *yet*; a visibility test needs to know something is
+// already in front, everywhere, and the frontmost surface that is farthest away
+// is the one that decides it. The two pyramids are therefore separate images
+// and neither can stand in for the other.
+//
+// The tile is `hiz_build.comp`'s and so is the argument for it: one dispatch
+// writes every level, because resources are unversioned and a chain of passes
+// each reading level n-1 of the image it writes level n of would make "readers
+// after all writers" point both ways. A workgroup owns a 64x64 block of the
+// depth buffer and reduces it alone.
+//
+// Level 0 is half the frame rather than a copy of it. A copy would be three
+// quarters of the pyramid's memory spent on the one level the test never picks
+// — the coarsest cell that can still bound a screen rect is what it reads — and
+// halving first is what lets an invocation keep the same 8x8 block of source
+// texels this shader's ancestor does.
+
+const int MAX_LEVELS = 6;
+
+// 8x8 invocations, each owning an 8x8 block of the depth buffer, which is a
+// 4x4 block of level 0.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_depth;
+// One view per level, because a storage image descriptor takes exactly one mip.
+// Indices are literals below, so this needs no descriptor-indexing feature.
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D u_mips[MAX_LEVELS];
+
+layout(push_constant) uniform Push {
+    // The depth buffer's extent, not the pyramid's.
+    ivec2 extent;
+    int levels;
+} push;
+
+shared float lds[64];
+
+// Outside the frame reads as the far plane, which is the value that culls
+// nothing: a cell claiming a near surface where there is no surface at all is
+// the one direction this reduction is not allowed to err in.
+float load(ivec2 p) {
+    if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, push.extent))) {
+        return 1.0;
+    }
+    return texelFetch(u_depth, p, 0).r;
+}
+
+#define STORE(level, coord, value)                                \
+    if (push.levels > (level)) {                                  \
+        ivec2 size_ = imageSize(u_mips[level]);                   \
+        if (all(lessThan(coord, size_))) {                        \
+            imageStore(u_mips[level], coord, vec4(value));        \
+        }                                                         \
+    }
+
+float max4(float a, float b, float c, float d) {
+    return max(max(a, b), max(c, d));
+}
+
+void main() {
+    ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    // Where this invocation's 8x8 block of the depth buffer starts, and where
+    // the 4x4 block of level 0 it reduces to starts.
+    ivec2 source = ivec2(gl_WorkGroupID.xy) * 64 + lid * 8;
+    ivec2 base = ivec2(gl_WorkGroupID.xy) * 32 + lid * 4;
+
+    // Level 0: the farthest of each 2x2 of the depth buffer. An odd frame
+    // extent loses its last column or row (Vulkan floors each mip's size and
+    // the bounds check above drops the write), which leaves that one strip
+    // untested rather than wrongly tested — a dropped write is a cell that
+    // stays whatever it was, and the cull refuses any box whose screen rect
+    // reaches the frame's edge in any case.
+    float m0[16];
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 4; ++i) {
+            ivec2 p = source + 2 * ivec2(i, j);
+            float v = max4(load(p), load(p + ivec2(1, 0)),
+                           load(p + ivec2(0, 1)), load(p + ivec2(1, 1)));
+            m0[j * 4 + i] = v;
+            STORE(0, base + ivec2(i, j), v)
+        }
+    }
+
+    // Levels 1 and 2 come out of this invocation's own block: a level-2 texel
+    // covers exactly it.
+    float m1[4];
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            float v = max4(m0[(2 * j) * 4 + 2 * i], m0[(2 * j) * 4 + 2 * i + 1],
+                           m0[(2 * j + 1) * 4 + 2 * i], m0[(2 * j + 1) * 4 + 2 * i + 1]);
+            m1[j * 2 + i] = v;
+            STORE(1, (base >> 1) + ivec2(i, j), v)
+        }
+    }
+
+    float m2 = max4(m1[0], m1[1], m1[2], m1[3]);
+    STORE(2, (base >> 2) + ivec2(0, 0), m2)
+
+    // Past level 2 a texel spans more than one invocation's block, so the
+    // reduction moves into shared memory. Every barrier is in uniform control
+    // flow; only the stores are predicated.
+    int slot = lid.y * 8 + lid.x;
+    lds[slot] = m2;
+    barrier();
+
+    if ((lid.x & 1) == 0 && (lid.y & 1) == 0) {
+        float v = max4(lds[slot], lds[slot + 1], lds[slot + 8], lds[slot + 9]);
+        lds[slot] = v;
+        STORE(3, ivec2(gl_WorkGroupID.xy) * 4 + (lid >> 1), v)
+    }
+    barrier();
+
+    if ((lid.x & 3) == 0 && (lid.y & 3) == 0) {
+        float v = max4(lds[slot], lds[slot + 2], lds[slot + 16], lds[slot + 18]);
+        lds[slot] = v;
+        STORE(4, ivec2(gl_WorkGroupID.xy) * 2 + (lid >> 2), v)
+    }
+    barrier();
+
+    if (slot == 0) {
+        float v = max4(lds[0], lds[4], lds[32], lds[36]);
+        STORE(5, ivec2(gl_WorkGroupID.xy), v)
+    }
+}

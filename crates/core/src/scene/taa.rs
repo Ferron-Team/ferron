@@ -18,6 +18,25 @@ pub struct TaaSettings {
     /// which is what actually antialiases; lower trades edge quality for less
     /// texture softening.
     pub jitter_scale: f32,
+    /// Rasterise the forward pass at four samples rather than one.
+    ///
+    /// The alternative to `enabled` above rather than a companion to it, and off
+    /// by default. TAA already resolves geometric edges, so multisampling on top
+    /// of it buys the absence of one frame of temporal lag on silhouettes for
+    /// roughly a quarter of the frame time — and it costs more than the samples:
+    /// at one sample the forward pass can attach the geometry prepass's depth
+    /// read-only and test `EQUAL` against it, which gives it perfect early-Z and
+    /// no shading overdraw. Multisampled, the same geometry is rasterised twice
+    /// and the second rasterisation gets nothing from the first.
+    ///
+    /// The multisampled targets ask for lazily-allocated memory, which makes
+    /// them tile-only and free on MoltenVK. No desktop driver exposes that
+    /// memory type, so on AMD and NVIDIA they are ordinary VRAM paying full
+    /// write-and-resolve traffic — the most expensive pass in the frame.
+    ///
+    /// Kept switchable rather than deleted so that comparison stays reproducible
+    /// and the tiler path stays reachable. Structural: it recompiles the graph.
+    pub msaa: bool,
 }
 
 impl Default for TaaSettings {
@@ -26,6 +45,7 @@ impl Default for TaaSettings {
             enabled: true,
             feedback: 0.92,
             jitter_scale: 1.0,
+            msaa: false,
         }
     }
 }

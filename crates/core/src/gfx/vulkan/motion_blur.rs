@@ -15,11 +15,9 @@
 
 use std::sync::Arc;
 
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::MemoryTypeFilter;
@@ -32,6 +30,7 @@ use vulkano::pipeline::{
 use crate::scene::{Camera, MotionBlurSettings};
 
 use super::context::VkContext;
+use super::record::{Arena, Recorder};
 use super::taa::FrameView;
 
 /// Side of the compute workgroup for every pass here.
@@ -75,7 +74,7 @@ pub struct MotionBlurPass {
     /// describe a surface that is not there, and a tile maximum averaged with
     /// its neighbour is no longer a maximum.
     nearest_clamp: Arc<Sampler>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
     settings: MotionBlurSettings,
     near: f32,
     far: f32,
@@ -85,21 +84,21 @@ impl MotionBlurPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
         let tile_max_pipeline = build_pipeline(
-            device,
+            ctx,
             tile_max_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap(),
         );
         let neighbour_max_pipeline = build_pipeline(
-            device,
+            ctx,
             neighbour_max_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap(),
         );
         let gather_pipeline = build_pipeline(
-            device,
+            ctx,
             gather_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
@@ -117,7 +116,7 @@ impl MotionBlurPass {
         )
         .unwrap();
 
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -152,10 +151,7 @@ impl MotionBlurPass {
     /// derived from the same [`FrameView`], so they cannot disagree about where
     /// the sky went.
     fn uniforms(&self, view: &FrameView) -> vulkano::buffer::Subbuffer<MotionBlurUbo> {
-        let uniforms = self
-            .uniform_allocator
-            .allocate_sized::<MotionBlurUbo>()
-            .unwrap();
+        let uniforms = self.uniform_allocator.allocate_sized::<MotionBlurUbo>();
         *uniforms.write().unwrap() = MotionBlurUbo {
             // Unjittered, so the sky's reprojection agrees with the motion
             // vectors the prepass wrote — those are unjittered too.
@@ -173,7 +169,7 @@ impl MotionBlurPass {
 
     pub(super) fn record_tile_max(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         view: &FrameView,
         velocity: Arc<ImageView>,
@@ -194,21 +190,19 @@ impl MotionBlurPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.tile_max_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.tile_max_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.tile_max_pipeline.layout().clone(),
+                self.tile_max_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 
     pub fn record_neighbour_max(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         tiles: Arc<ImageView>,
         target: Arc<ImageView>,
@@ -225,22 +219,20 @@ impl MotionBlurPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.neighbour_max_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.neighbour_max_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.neighbour_max_pipeline.layout().clone(),
+                self.neighbour_max_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_gather(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         view: &FrameView,
         color: Arc<ImageView>,
@@ -265,40 +257,32 @@ impl MotionBlurPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.gather_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.gather_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.gather_pipeline.layout().clone(),
+                self.gather_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 }
 
-fn dispatch_over(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    target: &Arc<ImageView>,
-) {
+fn dispatch_over(builder: &mut Recorder, target: &Arc<ImageView>) {
     let extent = target.image().extent();
 
     // SAFETY: the dispatch covers exactly `extent`, and each shader discards
     // invocations past `imageSize`, so nothing writes outside the image. The
     // descriptors bound above match the shader's layout, and the graph declared
     // every resource this pass touches, so its barriers precede it.
-    unsafe {
-        builder
-            .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
-            .unwrap()
-    };
+    builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
 }
 
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     entry_point: vulkano::shader::EntryPoint,
 ) -> Arc<ComputePipeline> {
+    let device = &ctx.device;
     let stage = PipelineShaderStageCreateInfo::new(entry_point);
     let layout = PipelineLayout::new(
         device.clone(),
@@ -309,7 +293,7 @@ fn build_pipeline(
     .unwrap();
     ComputePipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .unwrap()

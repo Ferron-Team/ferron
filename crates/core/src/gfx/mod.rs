@@ -17,21 +17,90 @@ use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
 
-#[derive(BufferContents, VertexTrait, Clone, Copy, Debug)]
+/// A vertex as meshes are *authored*: one struct with everything in it, which is
+/// what mesh generation, model import and the collision builders all write.
+///
+/// Deliberately not what the GPU is given. Upload de-interleaves it into
+/// [`PositionVertex`] and [`SurfaceVertex`], for the reason those two document —
+/// but nothing on the CPU side has to know that, which is why this type still
+/// exists and still has every field.
+#[derive(BufferContents, Clone, Copy, Debug)]
 #[repr(C)]
 pub struct Vertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub color: [f32; 3],
+    pub uv: [f32; 2],
+    /// Object-space tangent (+U texture direction) in `xyz`; `w` is the
+    /// bitangent handedness (±1) used to rebuild the TBN basis for normal maps.
+    pub tangent: [f32; 4],
+}
+
+/// The half of a vertex a *depth-only* pass reads: where it is, and — for a
+/// cutout material — where to sample the alpha from.
+///
+/// Split out of [`Vertex`] because the shadow passes are the frame's only
+/// consumers that need this and nothing else, and a stride is paid whether or
+/// not the attributes in it are fetched. AMD's RDNA guide asks for exactly this
+/// ("allocate position data in a separate vertex stream to improve depth-only
+/// passes"): with one interleaved 60-byte vertex, every cascade and every atlas
+/// tile pulls 60 bytes per vertex to use 12 of them, four to five times over per
+/// frame.
+///
+/// 20 bytes rather than 12 because the cutout shadow variant alpha-tests and so
+/// needs the texture coordinate, and one stream that serves both shadow
+/// pipelines beats a third buffer that serves one. The plain variant declares no
+/// `uv` and therefore fetches none — only the stride is shared.
+///
+/// This costs no memory: the two halves partition [`Vertex`] rather than
+/// duplicating any of it, so a mesh occupies exactly what it did before, in two
+/// buffers instead of one.
+#[derive(BufferContents, VertexTrait, Clone, Copy, Debug)]
+#[repr(C)]
+pub struct PositionVertex {
     #[format(R32G32B32_SFLOAT)]
     pub position: [f32; 3],
+    #[format(R32G32_SFLOAT)]
+    pub uv: [f32; 2],
+}
+
+/// The other half: what a pass that actually *shades* needs on top of
+/// [`PositionVertex`].
+///
+/// Bound alongside it by the four passes that rasterise a surface rather than
+/// just its depth — the geometry prepass, the forward pass, and the two
+/// non-opaque queues. Between them the two streams still add up to the same 60
+/// bytes the single interleaved vertex was.
+#[derive(BufferContents, VertexTrait, Clone, Copy, Debug)]
+#[repr(C)]
+pub struct SurfaceVertex {
     #[format(R32G32B32_SFLOAT)]
     pub normal: [f32; 3],
     #[format(R32G32B32_SFLOAT)]
     pub color: [f32; 3],
-    #[format(R32G32_SFLOAT)]
-    pub uv: [f32; 2],
-    /// Object-space tangent (+U texture direction) in `xyz`; `w` is the
-    /// bitangent handedness (±1) used to rebuild the TBN basis for normal maps.
     #[format(R32G32B32A32_SFLOAT)]
     pub tangent: [f32; 4],
+}
+
+impl Vertex {
+    /// The two halves this vertex is uploaded as.
+    ///
+    /// One function so the split is stated once: a field that moved between the
+    /// two streams without its shader declaration moving with it would be a
+    /// silently wrong mesh, not a compile error.
+    pub fn split(&self) -> (PositionVertex, SurfaceVertex) {
+        (
+            PositionVertex {
+                position: self.position,
+                uv: self.uv,
+            },
+            SurfaceVertex {
+                normal: self.normal,
+                color: self.color,
+                tangent: self.tangent,
+            },
+        )
+    }
 }
 
 /// One renderable instance, as extraction hands it to the passes. Everything a
@@ -59,6 +128,13 @@ pub struct RenderItem {
     pub bounds: Aabb,
     pub mesh: MeshHandle,
     pub material: MaterialHandle,
+    /// Which row of the persistent instance buffer holds this object's
+    /// matrices: the entity's slot, which is stable for as long as the entity
+    /// lives. Every list that draws this object names the same row, so an
+    /// object in the camera's list and in four cascades occupies one row rather
+    /// than five, and a row survives the frames in which nothing about it
+    /// changed. See `vulkan::instances::InstanceStore`.
+    pub instance: u32,
 }
 
 /// One pass's draw order over a shared item array.
@@ -105,26 +181,44 @@ impl<'a> DrawList<'a> {
     /// Correct only because extraction groups on the same key: an ungrouped
     /// order still yields valid runs, just short ones, so a missed grouping
     /// costs performance rather than producing wrong pixels.
-    pub fn runs(&self) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
-        let list = *self;
-        let mut start = 0usize;
-        std::iter::from_fn(move || {
-            if start >= list.len() {
-                return None;
-            }
-            let first = list.item(start);
-            let key = (first.mesh.0, first.material.0);
-            let mut end = start + 1;
-            while end < list.len() && {
-                let item = list.item(end);
-                (item.mesh.0, item.material.0) == key
-            } {
-                end += 1;
-            }
-            let run = start..end;
-            start = end;
-            Some(run)
-        })
+    pub fn runs(&self) -> Runs<'a> {
+        Runs {
+            list: *self,
+            start: 0,
+        }
+    }
+}
+
+/// [`DrawList::runs`], as a type a caller can hold.
+///
+/// Named rather than `impl Iterator` because the passes wrap it in an iterator
+/// of their own — one that yields either these runs or the batches a compute
+/// dispatch culled — and a wrapper cannot store what it cannot name. Collecting
+/// instead would be an allocation per pass per frame.
+pub struct Runs<'a> {
+    list: DrawList<'a>,
+    start: usize,
+}
+
+impl Iterator for Runs<'_> {
+    type Item = std::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start >= self.list.len() {
+            return None;
+        }
+        let first = self.list.item(self.start);
+        let key = (first.mesh.0, first.material.0);
+        let mut end = self.start + 1;
+        while end < self.list.len() && {
+            let item = self.list.item(end);
+            (item.mesh.0, item.material.0) == key
+        } {
+            end += 1;
+        }
+        let run = self.start..end;
+        self.start = end;
+        Some(run)
     }
 }
 
@@ -634,6 +728,16 @@ impl Default for SceneLighting {
 // The seam between the engine and a concrete graphics API: implement for other
 // backends (wgpu, D3D12) without touching scene/app code.
 pub trait RenderBackend {
+    /// Whether this backend decides each opaque view's visible set itself.
+    ///
+    /// Asked by [`extract_geometry`](crate::systems::extract_geometry), which
+    /// otherwise does that work per entity for every view. False for a backend
+    /// that has no compute of its own — the headless one — so the sweep answers
+    /// the question the way it always did.
+    fn gpu_culling(&self) -> bool {
+        false
+    }
+
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle;
     /// Object-space bounds derived at upload; `None` for a handle this backend
     /// never issued. Mirrored into [`MeshBounds`](crate::scene::MeshBounds) at
@@ -690,7 +794,7 @@ pub trait RenderBackend {
 mod draw_list_tests {
     use super::{DrawList, MaterialHandle, MeshHandle, RenderItem};
     use crate::geom::Aabb;
-    use glam::{Mat3, Mat4, Vec3};
+    use glam::{Mat3, Mat4, Vec3A};
 
     fn item(mesh: u32, material: u32) -> RenderItem {
         RenderItem {
@@ -698,11 +802,12 @@ mod draw_list_tests {
             prev_model: Mat4::IDENTITY,
             normal_matrix: Mat3::IDENTITY,
             bounds: Aabb {
-                min: Vec3::splat(-0.5),
-                max: Vec3::splat(0.5),
+                min: Vec3A::splat(-0.5),
+                max: Vec3A::splat(0.5),
             },
             mesh: MeshHandle(mesh),
             material: MaterialHandle(material),
+            instance: 0,
         }
     }
 

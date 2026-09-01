@@ -5,7 +5,7 @@
 //! contact normal is unit length and points from the *first* argument's shape
 //! toward the second's.
 
-use glam::Vec3;
+use glam::{Vec3, Vec3A};
 
 use super::{Aabb, Contact, WorldShape};
 
@@ -61,7 +61,7 @@ fn aabb_aabb(a: &Aabb, b: &Aabb) -> Option<Contact> {
 
     Some(Contact {
         normal,
-        point,
+        point: point.into(),
         depth,
     })
 }
@@ -84,6 +84,7 @@ fn sphere_sphere(ca: Vec3, ra: f32, cb: Vec3, rb: f32) -> Option<Contact> {
 }
 
 fn aabb_sphere(a: &Aabb, center: Vec3, radius: f32) -> Option<Contact> {
+    let center = Vec3A::from(center);
     let closest = center.clamp(a.min, a.max);
     let d = center - closest;
     let dist = d.length();
@@ -116,14 +117,14 @@ fn aabb_sphere(a: &Aabb, center: Vec3, radius: f32) -> Option<Contact> {
         return Some(Contact {
             normal: *normal,
             depth: face_dist + radius,
-            point: center,
+            point: center.into(),
         });
     }
 
     Some(Contact {
-        normal: d / dist,
+        normal: (d / dist).into(),
         depth: radius - dist,
-        point: closest,
+        point: closest.into(),
     })
 }
 
@@ -139,9 +140,10 @@ mod tests {
     use super::*;
 
     fn unit_box_at(center: Vec3) -> Aabb {
+        let center = Vec3A::from(center);
         Aabb {
-            min: center - Vec3::splat(0.5),
-            max: center + Vec3::splat(0.5),
+            min: center - Vec3A::splat(0.5),
+            max: center + Vec3A::splat(0.5),
         }
     }
 

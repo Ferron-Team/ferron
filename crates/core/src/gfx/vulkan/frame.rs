@@ -14,8 +14,8 @@ use vulkano::format::Format;
 use vulkano::image::ImageLayout;
 
 use crate::gfx::graph::{
-    Access, Extent, FrameGraph, GraphBuilder, GraphError, ImageDesc, PassId, PassKind, ResourceId,
-    compile,
+    Access, Extent, FrameGraph, GraphBuilder, GraphError, ImageDesc, PassBuilder, PassId, PassKind,
+    ResourceId, compile,
 };
 use crate::gfx::shadows::MAX_CASCADES;
 
@@ -24,8 +24,9 @@ use super::bloom::MAX_BLOOM_MIPS;
 use super::contact_shadows::MASK_FORMAT;
 use super::dof::COC_TILE_SHIFT;
 use super::fog::{FOG_FORMAT, FROXEL_SHIFT, FROXEL_SLICES};
-use super::hdr::HDR_FORMAT;
+use super::hdr::{HDR_FORMAT, HDR_WIDE_FORMAT};
 use super::motion_blur::TILE_SHIFT;
+use super::occlusion::{OCCLUSION_FORMAT, OCCLUSION_LEVELS};
 use super::oit::{ACCUM_FORMAT, REVEAL_FORMAT};
 use super::prepass::{MATERIAL_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT};
 use super::refraction::{ACCUM_FORMAT as REFRACTION_ACCUM_FORMAT, SCENE_LEVELS};
@@ -40,7 +41,34 @@ use super::swapchain::DEPTH_FORMAT;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FrameConfig {
     pub color_format: Format,
+    /// Whether the forward pass rasterises at [`MSAA_SAMPLES`] rather than one.
+    ///
+    /// Off by default, and the default is the point: this frame also runs TAA,
+    /// which already resolves geometric edges, so multisampling on top of it
+    /// buys the absence of one frame of temporal lag on silhouettes for roughly
+    /// a quarter of the frame time. `resources.rs` asks for `LAZILY_ALLOCATED`
+    /// memory so that the multisampled targets cost no DRAM at all, which is
+    /// true on MoltenVK's tile memory and false on every desktop driver —
+    /// AMD and NVIDIA expose no lazily-allocated memory type, so there the pair
+    /// is ordinary VRAM paying full write-and-resolve traffic.
+    ///
+    /// Kept as a field rather than deleted because the evidence is worth being
+    /// able to reproduce, and because the MoltenVK path really is nearly free.
+    /// It costs a second set of pipelines at startup, which the masked and
+    /// subsurface variants already establish as the shape of this pass.
+    ///
+    /// Structural, and more deeply than most: it decides which forward *render
+    /// pass* the frame opens, whether the multisampled targets are declared at
+    /// all, and — off — makes the geometry prepass mandatory, because the
+    /// forward pass then depth-tests against the depth that pass wrote instead
+    /// of rasterising its own.
+    pub msaa: bool,
     pub ssao: bool,
+    /// Whether the occlusion is resolved at half the frame's extent. Structural
+    /// because it is a size rather than a uniform: the two AO images change
+    /// extent, so the graph has to reallocate them and the passes that draw into
+    /// them have to be told the new viewport.
+    pub ssao_half_res: bool,
     /// Whether the frame marches the depth buffer for the shadow band the
     /// cascades cannot resolve. Structural like the rest, and one more consumer
     /// that keeps the geometry prepass alive on its own — it reads the depth and
@@ -123,6 +151,40 @@ pub struct FrameConfig {
     /// One number and one pass however many lights cast — the tile count varies
     /// frame to frame *inside* the pass, which is exactly why it is not here.
     pub shadow_atlas: u32,
+    /// Whether the frame's compute tail may be submitted to a second queue, so
+    /// that the *next* frame's graphics head can start before this frame's post
+    /// chain has finished.
+    ///
+    /// Structural, and the reason it is a config field rather than a runtime
+    /// check: it changes how many submissions a frame is, which resources have
+    /// to be reachable from both queues, and therefore how they are allocated.
+    /// The renderer sets it from what the device turned out to have — a device
+    /// with no compute-only queue family plans exactly the frame it always did.
+    pub async_compute: bool,
+    /// Whether the visible set for each opaque view is decided by a compute
+    /// dispatch rather than by the CPU sweep in `systems::extract_geometry`.
+    ///
+    /// Structural: it registers two passes, it makes `instance_index` something
+    /// the frame *writes* rather than something it is handed, and it changes
+    /// every opaque geometry pass from one draw per run to one indirect draw
+    /// per batch. Kept as a flag rather than taken as the only path so that the
+    /// two can be measured against each other on one binary — the CPU sweep is
+    /// the control, and `ORRIN_GPU_CULL=0` selects it.
+    pub gpu_culling: bool,
+    /// Whether the compute cull also drops what the previous frame's depth
+    /// already covered.
+    ///
+    /// Structural: it registers the pyramid build and gives the cull a texture
+    /// to read, and it is one more thing that keeps the geometry prepass alive
+    /// — the pyramid is reduced from the depth that pass writes, and a frame
+    /// with no prepass has no depth to reduce.
+    ///
+    /// Only meaningful with [`gpu_culling`](Self::gpu_culling), because the
+    /// test lives in `cull.comp`. Kept as a flag of its own rather than folded
+    /// into it for the reason that one is a flag: the visible set it produces
+    /// is *smaller* than the frustum's, so the two have to be comparable on one
+    /// binary to say what the difference cost and what it drew.
+    pub occlusion_culling: bool,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -132,7 +194,16 @@ pub struct FrameConfig {
 /// is exhaustive by the compiler's own reckoning rather than by convention.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PassBody {
+    /// Stamps every draw command with the geometry its batch draws and an
+    /// instance count of zero, which is the value the cull increments from.
+    CullReset,
+    /// Tests every live instance against every view and appends the ones that
+    /// survive to their batch's slice of that view's instance list.
+    Cull,
     GeometryPrepass,
+    /// Reduces the depth this frame rasterised to a max pyramid, for the *next*
+    /// frame's cull to test against.
+    OcclusionHiz,
     SsaoResolve,
     SsaoBlur,
     /// The sun's visibility over the short range a cascade texel cannot resolve.
@@ -214,6 +285,7 @@ pub enum PassBody {
 #[derive(Clone, Copy, Debug)]
 pub struct FrameIds {
     pub object_transforms: ResourceId,
+    pub instance_index: ResourceId,
     pub swapchain_color: ResourceId,
     pub hdr_color: ResourceId,
     /// What the tonemap, metering and bloom passes read: whichever image the
@@ -223,8 +295,10 @@ pub struct FrameIds {
     /// frame it is in, which is what makes inserting a stage a change to one
     /// binding rather than to every consumer.
     pub scene_color: ResourceId,
-    pub msaa_hdr: ResourceId,
-    pub msaa_depth: ResourceId,
+    /// The multisampled pair, in a frame that rasterises at more than one
+    /// sample. `None` on the default path, where the forward pass shades
+    /// straight into `hdr_color` and borrows the prepass depth.
+    pub msaa: Option<MsaaIds>,
     /// Written by the metering passes and read by the tonemap pass. Always
     /// declared, because the tonemap pass binds it whether or not anything wrote
     /// it this frame — an import may be read without a writer, which is exactly
@@ -237,6 +311,9 @@ pub struct FrameIds {
     /// SSAO, TAA, motion blur, depth of field, or any combination of them.
     pub prepass: Option<PrepassIds>,
     pub ssao: Option<SsaoIds>,
+    /// The two pyramids occlusion culling carries across the frame boundary.
+    /// `None` when the frame does not test against depth, along with the build.
+    pub occlusion: Option<OcclusionIds>,
     /// The sun-visibility mask, when the frame marches for one. One image and no
     /// struct: the pass reads the prepass and writes this, and there is nothing
     /// else to name.
@@ -355,6 +432,19 @@ pub struct SsrIds {
     pub output: ResourceId,
 }
 
+/// The forward pass's multisampled targets, declared only when `FrameConfig::msaa`
+/// is on.
+///
+/// Both are `DontCare`/`DontCare` within the render pass: the colour is resolved
+/// into `hdr_color` and the depth is never read again, which is what lets both
+/// ask for lazily-allocated memory on a tiler. On a desktop driver that request
+/// is silently ignored and they are the most expensive images in the frame.
+#[derive(Clone, Copy, Debug)]
+pub struct MsaaIds {
+    pub hdr: ResourceId,
+    pub depth: ResourceId,
+}
+
 /// Subsurface scattering's targets: the one the forward pass resolves into, the
 /// two the separable blur ping-pongs through, and what the composite was handed.
 ///
@@ -365,7 +455,10 @@ pub struct SsrIds {
 #[derive(Clone, Copy, Debug)]
 pub struct SubsurfaceIds {
     pub source: ResourceId,
-    pub msaa_diffusible: ResourceId,
+    /// The multisampled half of the pair, and `None` for the same reason
+    /// [`FrameIds::msaa`] is: at one sample the forward pass writes `diffusible`
+    /// directly and there is nothing to resolve from.
+    pub msaa_diffusible: Option<ResourceId>,
     /// `rgb` = the radiance that left the surface elsewhere, `a` = the widest
     /// channel's mean free path in metres. The alpha is the only mask the passes
     /// need, so nothing else carries one.
@@ -414,6 +507,28 @@ pub struct RefractionIds {
     /// pixel nothing refractive covered leaves the frame as it found it.
     pub accum: ResourceId,
     pub output: ResourceId,
+}
+
+/// The two depth pyramids occlusion culling carries across the frame boundary.
+///
+/// Both are **imported** and ping-ponged, for the reason the TAA history is —
+/// a transient is `Undefined` at every frame's start by contract, and what the
+/// cull tests against is precisely a survivor of the last one.
+///
+/// Two resources rather than one, and this is the whole shape of the feature.
+/// The cull decides what the prepass draws; the prepass writes the depth; the
+/// pyramid reduces that depth. A cull that read a pyramid of *this* frame's
+/// depth would close that ring, and `compile` orders every reader after every
+/// writer precisely so that it would say so — the cull after the build, the
+/// build after the prepass, the prepass after the cull, and a cycle. So the
+/// cull reads `history`, which no pass in this frame writes, and the build
+/// writes `hiz`, which no pass in this frame reads. The allocations swap.
+#[derive(Clone, Copy, Debug)]
+pub struct OcclusionIds {
+    /// Last frame's pyramid: what the cull samples.
+    pub history: ResourceId,
+    /// This frame's: what the build writes, and what `history` names next frame.
+    pub hiz: ResourceId,
 }
 
 /// The two images TAA carries across the frame boundary.
@@ -474,18 +589,134 @@ pub struct Frame {
     pub bodies: Vec<PassBody>,
 }
 
+/// Declares the draw commands on a pass that issues its draws indirectly, and
+/// nothing at all while the frame still culls on the CPU — which is what
+/// `commands` being `None` means.
+///
+/// One function rather than the declaration written out at each of the four
+/// sites, so that converting a pass to indirect draws cannot half-land: the
+/// pass either goes through here and is ordered after the cull, or it does not
+/// draw indirectly.
+fn indirect<'a>(pass: PassBuilder<'a>, commands: Option<ResourceId>) -> PassBuilder<'a> {
+    match commands {
+        Some(commands) => pass.access(commands, Access::IndirectRead),
+        None => pass,
+    }
+}
+
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let mut builder = GraphBuilder::new();
+    if config.async_compute {
+        builder.request_async_compute();
+    }
     let mut bodies = Vec::new();
     let record = |id: PassId, body: PassBody, bodies: &mut Vec<PassBody>| {
         debug_assert_eq!(id.index(), bodies.len());
         bodies.push(body);
     };
 
-    // Host-written each frame and read by both geometry passes; the per-object
-    // inverse-transpose is too expensive to compute twice, so the two passes
-    // share one upload and the graph records that they do.
+    // Read by every geometry pass. The rows persist between frames and are
+    // brought up to date by a copy recorded ahead of the schedule — the
+    // per-object inverse-transpose is too expensive to compute twice, so the
+    // passes share one buffer and the graph records that they do.
     let object_transforms = builder.import_buffer("object_transforms");
+    // The draw orders over those rows, which unlike the rows themselves are
+    // written afresh every frame. A second resource rather than a share of the
+    // first because they have different lifetimes, and the graph's whole claim
+    // is to know each resource's exact one. See `vulkan::instances`.
+    let instance_index = builder.import_buffer("instance_index");
+    // Culling is two dispatches because a count can only be atomically
+    // incremented from a known value. The reset stamps each command with the
+    // geometry its batch draws and an instance count of zero; the cull tests
+    // every live instance against every view and increments the counts it
+    // survives, appending its row to that batch's slice.
+    //
+    // Two graph nodes rather than one dispatch with a barrier in the middle,
+    // because a pass may not write its own barrier — the point of the compiler
+    // is that the write-after-write between these two is derived rather than
+    // remembered.
+    // The blended and refractive queues stay CPU-culled — a refractive surface
+    // has to be drawn back to front, which is a correctness requirement no
+    // atomic append can meet — so under GPU culling their orders are still
+    // written by the host, into a buffer of their own. A second resource rather
+    // than a share of the first because it really is a second allocation, and
+    // one name over two buffers is precisely the declaration this compiler
+    // exists to catch.
+    let blended_index = if config.gpu_culling {
+        builder.import_buffer("blended_instance_index")
+    } else {
+        instance_index
+    };
+
+    // Only with the compute cull, because the test is a branch in `cull.comp`
+    // and there is nowhere else to put it: the CPU sweep would have to read
+    // back a pyramid the GPU wrote, a frame late, to answer a question it is
+    // already answering per entity.
+    let occlusion = config.gpu_culling && config.occlusion_culling;
+    let occlusion_ids = occlusion.then(|| {
+        // Entry `ShaderReadOnlyOptimal` states the steady state the ping-pong
+        // guarantees: `hiz` leaves every frame in exactly that layout and is
+        // the allocation `history` names next frame. The one frame where it is
+        // not true — the first after an allocation — is the frame the cull is
+        // told to test nothing anyway.
+        let history = builder.import_image(
+            "occlusion_history",
+            ImageDesc::new(OCCLUSION_FORMAT)
+                .extent(Extent::FrameDiv(1))
+                .mip_levels(OCCLUSION_LEVELS),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        // Entered `Undefined` because every texel is written, and left where
+        // the next frame wants to find it.
+        let hiz = builder.import_image(
+            "occlusion_hiz",
+            ImageDesc::new(OCCLUSION_FORMAT)
+                .extent(Extent::FrameDiv(1))
+                .mip_levels(OCCLUSION_LEVELS),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        OcclusionIds { history, hiz }
+    });
+
+    let draw_commands = config.gpu_culling.then(|| {
+        // Which rows the dispatch is offered, and which batch each belongs to.
+        // Written afresh every frame, like the draw orders under CPU culling
+        // and unlike the rows themselves — the batch a row belongs to is
+        // cached, but the list of rows is not. See `vulkan::cull`.
+        let instance_table = builder.import_buffer("instance_table");
+        // One entry per (mesh, material) batch: the geometry its draw command
+        // names and where its slice of a view's `instance_index` block begins.
+        let batch_table = builder.import_buffer("batch_table");
+        // One `VkDrawIndexedIndirectCommand` per batch per view. Imported
+        // rather than transient because it is the same allocation frame after
+        // frame and only its contents change, which is the argument
+        // `object_transforms` makes one comment above.
+        let draw_commands = builder.import_buffer("draw_commands");
+
+        let id = builder
+            .pass("cull_reset", PassKind::Compute)
+            .access(batch_table, Access::StorageRead)
+            .access(draw_commands, Access::StorageWrite)
+            .build();
+        record(id, PassBody::CullReset, &mut bodies);
+
+        let mut cull = builder
+            .pass("cull", PassKind::Compute)
+            .access(object_transforms, Access::StorageRead)
+            .access(instance_table, Access::StorageRead)
+            .access(batch_table, Access::StorageRead)
+            .access(draw_commands, Access::StorageWrite)
+            .access(instance_index, Access::StorageWrite);
+        if let Some(ids) = occlusion_ids {
+            cull = cull.access(ids.history, Access::Sampled);
+        }
+        let id = cull.build();
+        record(id, PassBody::Cull, &mut bodies);
+
+        draw_commands
+    });
 
     let swapchain_color = builder.import_image(
         "swapchain_color",
@@ -538,11 +769,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
     if let Some(shadows) = shadows {
         for cascade in 0..config.shadow_cascades as u32 {
-            let id = builder
-                .pass(CASCADE_PASS_NAMES[cascade as usize], PassKind::Inline)
-                .access(object_transforms, Access::StorageRead)
-                .access(shadows, Access::DepthAttachment)
-                .build();
+            let id = indirect(
+                builder
+                    .pass(CASCADE_PASS_NAMES[cascade as usize], PassKind::Inline)
+                    .access(object_transforms, Access::StorageRead)
+                    .access(instance_index, Access::StorageRead),
+                draw_commands,
+            )
+            .access(shadows, Access::DepthAttachment)
+            .build();
             record(id, PassBody::ShadowCascade(cascade), &mut bodies);
         }
     }
@@ -558,11 +793,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             ImageDesc::new(DEPTH_FORMAT).extent(Extent::Fixed([config.shadow_atlas; 2])),
         );
 
-        let id = builder
-            .pass("punctual_shadows", PassKind::Inline)
-            .access(object_transforms, Access::StorageRead)
-            .access(atlas, Access::DepthAttachment)
-            .build();
+        let id = indirect(
+            builder
+                .pass("punctual_shadows", PassKind::Inline)
+                .access(object_transforms, Access::StorageRead)
+                .access(instance_index, Access::StorageRead),
+            draw_commands,
+        )
+        .access(atlas, Access::DepthAttachment)
+        .build();
         record(id, PassBody::PunctualShadows, &mut bodies);
 
         atlas
@@ -580,7 +819,14 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // material target — and transparency and refraction both attach the depth
     // read-only, the two readers that want it as an attachment rather than as a
     // texture.
-    let prepass = (config.ssao
+    //
+    // And one more, which is why `!config.msaa` is in the list: at one sample
+    // the forward pass does not rasterise a depth buffer of its own at all. It
+    // attaches this one read-only and tests `EQUAL` against it, which is what
+    // turns the prepass from a cost the forward pass ignores into perfect
+    // early-Z with no shading overdraw.
+    let prepass = (!config.msaa
+        || config.ssao
         || config.contact_shadows
         || config.subsurface
         || config.taa
@@ -588,7 +834,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         || config.dof
         || config.ssr
         || config.transparency
-        || config.refraction)
+        || config.refraction
+        || occlusion)
         .then(|| PrepassIds {
             normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
             velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
@@ -596,29 +843,75 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             depth: builder.create_image("prepass_depth", ImageDesc::new(DEPTH_FORMAT)),
         });
 
+    // Both AO images at one extent, whichever it is: the blur samples the
+    // resolve's output texel for texel, and the forward pass reads the result by
+    // screen UV through a linear sampler, so the only pass that has to know
+    // which extent this is is the one setting the viewport.
+    let ao_extent = if config.ssao_half_res {
+        Extent::FrameDiv(1)
+    } else {
+        Extent::Frame
+    };
     let ssao = config.ssao.then(|| SsaoIds {
-        raw_ao: builder.create_image("ssao_raw_ao", ImageDesc::new(AO_FORMAT)),
-        ao: builder.create_image("ssao_ao", ImageDesc::new(AO_FORMAT)),
+        raw_ao: builder.create_image("ssao_raw_ao", ImageDesc::new(AO_FORMAT).extent(ao_extent)),
+        ao: builder.create_image("ssao_ao", ImageDesc::new(AO_FORMAT).extent(ao_extent)),
     });
 
-    let msaa_hdr =
-        builder.create_image("msaa_hdr", ImageDesc::new(HDR_FORMAT).samples(MSAA_SAMPLES));
-    let msaa_depth = builder.create_image(
-        "msaa_depth",
-        ImageDesc::new(DEPTH_FORMAT).samples(MSAA_SAMPLES),
-    );
-    let hdr_color = builder.create_image("hdr_color", ImageDesc::new(HDR_FORMAT));
+    let msaa = config.msaa.then(|| MsaaIds {
+        hdr: builder.create_image(
+            "msaa_hdr",
+            ImageDesc::new(HDR_WIDE_FORMAT).samples(MSAA_SAMPLES),
+        ),
+        depth: builder.create_image(
+            "msaa_depth",
+            ImageDesc::new(DEPTH_FORMAT).samples(MSAA_SAMPLES),
+        ),
+    });
+    // The packed format, except in a multisampled frame. Two constraints force
+    // that exception and either alone would be enough: a render-pass resolve
+    // requires the source and destination formats to match, and alpha to
+    // coverage reads the first attachment's alpha — which an attachment with no
+    // alpha component supplies as 1.0, quietly un-cutting every cutout.
+    let color_format = if config.msaa {
+        HDR_WIDE_FORMAT
+    } else {
+        HDR_FORMAT
+    };
+    let hdr_color = builder.create_image("hdr_color", ImageDesc::new(color_format));
 
     if let Some(prepass) = prepass {
-        let id = builder
-            .pass("geometry_prepass", PassKind::Inline)
-            .access(object_transforms, Access::StorageRead)
-            .access(prepass.normal, Access::ColorAttachment)
-            .access(prepass.velocity, Access::ColorAttachment)
-            .access(prepass.material, Access::ColorAttachment)
-            .access(prepass.depth, Access::DepthAttachment)
-            .build();
+        let id = indirect(
+            builder
+                .pass("geometry_prepass", PassKind::Inline)
+                .access(object_transforms, Access::StorageRead)
+                .access(instance_index, Access::StorageRead),
+            draw_commands,
+        )
+        .access(prepass.normal, Access::ColorAttachment)
+        .access(prepass.velocity, Access::ColorAttachment)
+        .access(prepass.material, Access::ColorAttachment)
+        .access(prepass.depth, Access::DepthAttachment)
+        .build();
         record(id, PassBody::GeometryPrepass, &mut bodies);
+    }
+
+    // Registered here because this is where the depth it reduces becomes
+    // complete, and scheduled here for the same reason — nothing downstream
+    // waits on it, so the earliest slot after the prepass is also the one with
+    // the most of the frame left to hide it behind.
+    //
+    // One dispatch writes every level, which is not a choice: a pass per level,
+    // each reading the level above out of the same image, is the cycle
+    // `ImageDesc::mip_levels` documents. See `hiz_occlusion.comp` for the tile
+    // that buys.
+    if let Some(ids) = occlusion_ids {
+        let prepass = prepass.expect("occlusion culling reduces the geometry prepass's depth");
+        let id = builder
+            .pass("occlusion_hiz", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(ids.hiz, Access::StorageWrite)
+            .build();
+        record(id, PassBody::OcclusionHiz, &mut bodies);
     }
 
     if let Some(ssao) = ssao {
@@ -631,9 +924,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .build();
         record(id, PassBody::SsaoResolve, &mut bodies);
 
+        // The depth as well as the raw term: the blur is bilateral, and at half
+        // resolution it is also the upsample. See `ssao_blur.frag`.
         let id = builder
             .pass("ssao_blur", PassKind::Inline)
             .access(ssao.raw_ao, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
             .access(ssao.ao, Access::ColorAttachment)
             .build();
         record(id, PassBody::SsaoBlur, &mut bodies);
@@ -712,17 +1008,23 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // same shape as the frame's first pair, and only in a frame that diffuses.
     let subsurface_targets = config.subsurface.then(|| {
         (
-            builder.create_image(
-                "msaa_subsurface",
-                ImageDesc::new(SUBSURFACE_FORMAT).samples(MSAA_SAMPLES),
-            ),
+            msaa.map(|_| {
+                builder.create_image(
+                    "msaa_subsurface",
+                    ImageDesc::new(SUBSURFACE_FORMAT).samples(MSAA_SAMPLES),
+                )
+            }),
             builder.create_image("subsurface_diffusible", ImageDesc::new(SUBSURFACE_FORMAT)),
         )
     });
 
-    let mut forward = builder
-        .pass("forward", PassKind::Inline)
-        .access(object_transforms, Access::StorageRead);
+    let mut forward = indirect(
+        builder
+            .pass("forward", PassKind::Inline)
+            .access(object_transforms, Access::StorageRead)
+            .access(instance_index, Access::StorageRead),
+        draw_commands,
+    );
     if let Some(ssao) = ssao {
         forward = forward.access(ssao.ao, Access::Sampled);
     }
@@ -738,18 +1040,35 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     if let Some(fog) = fog {
         forward = forward.access(fog.volume, Access::Sampled);
     }
-    forward = forward
-        .access(msaa_hdr, Access::ColorAttachment)
-        .access(msaa_depth, Access::DepthAttachment)
-        .access(hdr_color, Access::ResolveAttachment);
+    forward = match msaa {
+        Some(msaa) => forward
+            .access(msaa.hdr, Access::ColorAttachment)
+            .access(msaa.depth, Access::DepthAttachment)
+            .access(hdr_color, Access::ResolveAttachment),
+        // One sample, so there is nothing to resolve from: shade straight into
+        // the image the resolve used to land in, and attach the depth the
+        // prepass wrote read-only. `DepthAttachmentRead` is the declaration that
+        // makes it legal for the passes after this one to keep sampling it —
+        // the image never leaves `DepthStencilReadOnlyOptimal`, which is the
+        // same contract `oit_accumulate` and `refraction_draw` already sign.
+        None => forward.access(hdr_color, Access::ColorAttachment).access(
+            prepass
+                .expect("a one-sample forward pass depth-tests against the prepass")
+                .depth,
+            Access::DepthAttachmentRead,
+        ),
+    };
     // Between the first colour attachment and its resolve in the render pass's
     // own declaration order, but the graph does not care about order — only that
     // an attachment declared here is one the framebuffer binds. `PassFramebuffers`
     // is what keeps the two lists in step.
     if let Some((msaa_diffusible, diffusible)) = subsurface_targets {
-        forward = forward
-            .access(msaa_diffusible, Access::ColorAttachment)
-            .access(diffusible, Access::ResolveAttachment);
+        forward = match msaa_diffusible {
+            Some(msaa_diffusible) => forward
+                .access(msaa_diffusible, Access::ColorAttachment)
+                .access(diffusible, Access::ResolveAttachment),
+            None => forward.access(diffusible, Access::ColorAttachment),
+        };
     }
     let id = forward.build();
     record(id, PassBody::Forward, &mut bodies);
@@ -930,7 +1249,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // the same set.
         let mut accumulate = builder
             .pass("oit_accumulate", PassKind::Inline)
-            .access(object_transforms, Access::StorageRead);
+            .access(object_transforms, Access::StorageRead)
+            .access(blended_index, Access::StorageRead);
         if let Some(ssao) = ssao {
             accumulate = accumulate.access(ssao.ao, Access::Sampled);
         }
@@ -1024,6 +1344,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let mut draw = builder
             .pass("refraction_draw", PassKind::Inline)
             .access(object_transforms, Access::StorageRead)
+            .access(blended_index, Access::StorageRead)
             .access(scene, Access::Sampled)
             .access(source, Access::Sampled);
         if let Some(ssao) = ssao {
@@ -1131,25 +1452,31 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // composite's bilinear upsample puts back more detail than the extra
         // resolution would have carried, because the field it is upsampling is
         // by definition out of focus.
+        // The wide format through the whole chain bar its output, and every
+        // stage needs it for a different reason. The prefilter packs a *signed*
+        // circle of confusion into alpha; the gather writes premultiplied
+        // radiance whose coverage weight the composite divides by; and the tile
+        // image carries two channels of signed maxima. None of the three
+        // survives a format with no alpha and no negatives.
         let prefiltered = builder.create_image(
             "dof_prefiltered",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
         );
         let near = builder.create_image(
             "dof_near",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
         );
         let far = builder.create_image(
             "dof_far",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
         );
-        // Two channels of maxima in an `HDR_FORMAT` image, for the reason the
-        // motion blur tiles are: `R16G16_SFLOAT` is only a guaranteed storage
-        // format behind an optional device feature, and at one texel per 4096
-        // the unused half is not worth a feature flag.
+        // Two channels of maxima, for the reason the motion blur tiles are:
+        // `R16G16_SFLOAT` is only a guaranteed storage format behind an optional
+        // device feature, and at one texel per 4096 the unused half is not worth
+        // a feature flag.
         let tile = builder.create_image(
             "dof_tile",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(COC_TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(COC_TILE_SHIFT)),
         );
         let output = builder.create_image("dof_color", ImageDesc::new(HDR_FORMAT));
 
@@ -1219,18 +1546,20 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // from its own pixel coordinate, and a level sized any other way is a
         // texel off from the one it means to read at odd extents.
         //
-        // Both carry a two-component vector in an `HDR_FORMAT` image. A storage
+        // Both carry a two-component *signed* vector, which is the other reason
+        // they stay on the wide format: a velocity points in both directions and
+        // the packed one is unsigned. A storage
         // image is only guaranteed to support `R16G16_SFLOAT` behind an optional
         // device feature, while `R16G16B16A16_SFLOAT` is always available — and
         // at one texel per 256 the two unused channels are not worth a feature
         // flag on the device.
         let tile = builder.create_image(
             "motion_blur_tile",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
         );
         let neighbour = builder.create_image(
             "motion_blur_neighbour",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
         );
         let output = builder.create_image("motion_blur_color", ImageDesc::new(HDR_FORMAT));
 
@@ -1396,16 +1725,17 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         graph: compile(builder)?,
         ids: FrameIds {
             object_transforms,
+            instance_index,
             swapchain_color,
             hdr_color,
             scene_color,
-            msaa_hdr,
-            msaa_depth,
+            msaa,
             exposure,
             histogram,
             bloom,
             prepass,
             ssao,
+            occlusion: occlusion_ids,
             contact_shadows,
             fog,
             ssr,

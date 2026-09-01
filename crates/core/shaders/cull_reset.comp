@@ -1,0 +1,70 @@
+#version 460
+
+// Put every draw command back to the geometry its batch draws, with an instance
+// count of zero.
+//
+// A pass of its own rather than the top of `cull.comp`, because the count it
+// writes is the value `cull.comp`'s atomics increment from: the two dispatches
+// have to be separated by a barrier, and in this renderer a barrier between two
+// dispatches is two graph nodes. See `gfx/vulkan/frame.rs`.
+
+layout(local_size_x = 64) in;
+
+struct Batch {
+    uint index_count;
+    uint first_index;
+    int vertex_offset;
+    // Where this batch's slice of a view's block of `instance_index` begins,
+    // which is the `firstInstance` its command carries.
+    uint instance_base;
+    // The material every instance of the batch is drawn with, and the object-
+    // space bounds they share. Both unread here; the layout is shared with
+    // `cull.comp` and stating it once is what keeps the two from disagreeing
+    // about the stride.
+    uint material;
+    vec4 bounds_min;
+    vec4 bounds_max;
+};
+
+// `VkDrawIndexedIndirectCommand`, field for field. The order is the spec's and
+// is not ours to choose.
+struct DrawCommand {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int vertex_offset;
+    uint first_instance;
+};
+
+layout(set = 0, binding = 0) readonly buffer Batches { Batch batches[]; };
+layout(set = 0, binding = 1) writeonly buffer Commands { DrawCommand commands[]; };
+
+layout(push_constant) uniform Push {
+    uint batch_count;
+    // Commands for every view, laid out view-major. One dispatch covers all of
+    // them because the reset only needs to know which view a command belongs to
+    // in order to give it its base.
+    uint command_count;
+    // How wide one view's block of `instance_index` is.
+    uint stride;
+} push;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push.command_count) {
+        return;
+    }
+    uint view = index / push.batch_count;
+    Batch batch = batches[index % push.batch_count];
+    // `firstInstance` is where this batch's slice of this view's block begins.
+    // The vertex shader adds gl_InstanceIndex to it and finds the row and the
+    // material there, which is what lets every batch of a pipeline variant be
+    // one multi-draw with nothing pushed between its draws.
+    commands[index] = DrawCommand(
+        batch.index_count,
+        0,
+        batch.first_index,
+        batch.vertex_offset,
+        view * push.stride + batch.instance_base
+    );
+}

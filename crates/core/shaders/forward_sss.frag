@@ -29,6 +29,16 @@ void main() {
     // scattered light is carved out by the same samples its colour is — which is
     // what keeps the diffusion from spreading radiance out of a texel the cutout
     // removed.
-    f_color = vec4(shaded.color, mask_coverage(shaded.alpha));
+    float coverage = mask_coverage(shaded.alpha);
+#ifdef ORRIN_ALPHA_TEST
+    // The hard cut `forward.frag` documents. Discarding rather than masking the
+    // coverage keeps the two targets in step for free: a discarded fragment
+    // writes neither, which is what alpha to coverage was doing for both at four
+    // samples.
+    if (coverage < 0.5) {
+        discard;
+    }
+#endif
+    f_color = vec4(shaded.color, coverage);
     f_subsurface = vec4(shaded.diffusible, shaded.scatter);
 }

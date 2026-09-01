@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec3};
+use glam::{Mat3, Mat4, Vec3};
 
 use crate::scene::Camera;
 
@@ -42,6 +42,18 @@ pub struct CascadeSet {
     pub cascades: [Cascade; MAX_CASCADES],
     pub splits: [f32; MAX_CASCADES],
     pub count: usize,
+    /// `|R|` for the rotation every cascade's `light_view` shares: the element-
+    /// wise absolute value of world-to-light-space, with no translation.
+    ///
+    /// A property of the *set* rather than of a cascade, because it is the same
+    /// matrix in all of them — see [`light_rotation`]. Multiplying a box's half-
+    /// extents by it gives that box's half-extent in light space, which is what
+    /// the culling sweep tests against every cascade in turn. Hoisted here so
+    /// the sweep derives it once per entity instead of once per entity per
+    /// cascade, which was the same answer computed four times.
+    ///
+    /// Inert when `count` is zero, like every other field.
+    pub abs_light_rotation: Mat3,
 }
 
 pub fn split_distances(near: f32, config: &CascadeConfig) -> [f32; MAX_CASCADES] {
@@ -74,6 +86,41 @@ pub fn split_distances(near: f32, config: &CascadeConfig) -> [f32; MAX_CASCADES]
     splits
 }
 
+/// The up vector the light-space frame is built from: +Y, except where the
+/// light is near enough to vertical that +Y is degenerate as an up.
+///
+/// One function rather than two copies, because [`light_rotation`] claiming to
+/// reproduce `fit_cascade`'s frame is only true while they agree about this.
+fn light_up(light_dir: Vec3) -> Vec3 {
+    if light_dir.dot(Vec3::Y).abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    }
+}
+
+/// The rotation every cascade's `light_view` shares: world space into light
+/// space, with the eye at the origin.
+///
+/// `look_at_rh`'s upper 3x3 is a function of the view direction and `up` alone —
+/// the eye contributes only the translation — and every cascade looks along the
+/// same `light_dir` with the same `up`. Only where each one is *standing*
+/// differs, which is why the culling sweep can transform a centre per cascade
+/// but an extent only once.
+///
+/// `light_dir` must be unit length, as everywhere else in this module.
+pub fn light_rotation(light_dir: Vec3) -> Mat3 {
+    Mat3::from_mat4(Mat4::look_at_rh(Vec3::ZERO, light_dir, light_up(light_dir)))
+}
+
+/// Element-wise `|m|`. Along each light-space axis the farthest corner of a
+/// rotated box picks the sign of every term, which is what makes the absolute
+/// value the right thing to multiply half-extents by — the same trick
+/// [`Aabb::transformed`](crate::geom::Aabb::transformed) uses.
+fn abs_mat3(m: Mat3) -> Mat3 {
+    Mat3::from_cols(m.x_axis.abs(), m.y_axis.abs(), m.z_axis.abs())
+}
+
 pub fn sub_frustum_corners(camera: &Camera, aspect: f32, near: f32, far: f32) -> [Vec3; 8] {
     let inv = (camera.projection_range(aspect, near, far) * camera.view()).inverse();
     NDC_CORNERS.map(|ndc| inv.project_point3(ndc))
@@ -97,11 +144,7 @@ pub fn fit_cascade(
     // clips the far corners out of the map with no error anywhere.
     let light_dir = light_dir.normalize();
 
-    let up = if light_dir.dot(Vec3::Y).abs() > 0.99 {
-        Vec3::Z
-    } else {
-        Vec3::Y
-    };
+    let up = light_up(light_dir);
     let rot = Mat4::look_at_rh(Vec3::ZERO, light_dir, up); // Rotation only, eye at origin
 
     let texel = 2.0 * radius / config.resolution as f32;
@@ -162,10 +205,27 @@ pub fn cascades(
         cascades[i] = fit_cascade(&corners, light_dir, splits[i], config);
     }
 
+    // The sweep culls against a rotation it is told the cascades share. If a
+    // future change to the fit ever breaks that — a per-cascade up vector, a
+    // stabilisation pass that rotates one of them — this is where it says so,
+    // rather than the culling quietly answering for the wrong box.
+    #[cfg(debug_assertions)]
+    {
+        let shared = light_rotation(light_dir);
+        for (index, cascade) in cascades[..count].iter().enumerate() {
+            assert!(
+                Mat3::from_mat4(cascade.light_view).abs_diff_eq(shared, 1e-4),
+                "cascade {index} does not share the set's light rotation; \
+                 `CascadeSet::abs_light_rotation` is no longer valid for it",
+            );
+        }
+    }
+
     CascadeSet {
         cascades,
         splits,
         count,
+        abs_light_rotation: abs_mat3(light_rotation(light_dir)),
     }
 }
 

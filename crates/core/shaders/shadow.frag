@@ -17,12 +17,8 @@
 
 #ifdef ORRIN_MASKED
 layout(location = 0) in vec2 v_uv;
-
-layout(push_constant) uniform Push {
-    mat4 light_view_proj;
-    uint object_base;
-    uint material_index;
-} push;
+// The material row this instance is drawn with. See `shadow.vert`.
+layout(location = 1) flat in uint v_material;
 
 // Mirrors GpuMaterial in forward.rs, as `prepass.frag` does and for the same
 // std430 reason: the stride comes from the struct, so a short mirror would read
@@ -58,7 +54,7 @@ layout(set = 2, binding = 1) uniform sampler u_sampler;
 
 void main() {
 #ifdef ORRIN_MASKED
-    GpuMaterial m = materials[push.material_index];
+    GpuMaterial m = materials[v_material];
     // Deliberately not the parallax-marched coordinate the other two passes use.
     // The march needs a view direction, and the view here is the light's, so a
     // relief-mapped cutout would be tested along the wrong ray. A height field

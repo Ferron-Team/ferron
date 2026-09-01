@@ -16,7 +16,7 @@ layout(set = 0, binding = 1) uniform sampler2D u_accum;
 // The product of (1 - alpha) over every surface that covered this pixel: 1.0
 // where nothing transparent was drawn.
 layout(set = 0, binding = 2) uniform sampler2D u_reveal;
-layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D u_output;
+layout(set = 0, binding = 3, r11f_g11f_b10f) uniform writeonly image2D u_output;
 
 // How close to fully revealed counts as "nothing was drawn here". One step of
 // the 8-bit revealage target, so the early-out cannot skip a surface the target

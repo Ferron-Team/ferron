@@ -27,7 +27,7 @@ const int MAX_LEVELS = 7;
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D u_source;
-layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_mips[MAX_LEVELS];
+layout(set = 0, binding = 1, r11f_g11f_b10f) uniform writeonly image2D u_mips[MAX_LEVELS];
 
 layout(push_constant) uniform Push {
     // Extent of level 0, which is half the frame — the resolution the trace

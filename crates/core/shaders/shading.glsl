@@ -30,9 +30,10 @@
 //
 // The five extra lobes — clear coat, sheen, anisotropy, transmission,
 // subsurface — are gated on bits in the material rather than on separate shaders.
-// `push.material_index` is dynamically uniform, so each test is a coherent branch
-// a draw either takes whole or skips whole; a plain metallic-roughness material
-// costs what it did before any of them existed.
+// `v_material` is one value for a whole draw — a draw is one batch, and a batch
+// is one (mesh, material) pair on both culling paths — so each test is a
+// coherent branch a draw either takes whole or skips whole; a plain
+// metallic-roughness material costs what it did before any of them existed.
 
 layout(location = 0) in vec3 v_world_pos;
 layout(location = 1) in vec3 v_normal;
@@ -40,6 +41,8 @@ layout(location = 2) in vec3 v_tangent;
 layout(location = 3) in vec3 v_bitangent;
 layout(location = 4) in vec2 v_uv;
 layout(location = 5) in vec3 v_color;
+// The material row this instance is drawn with. See `forward.vert`.
+layout(location = 6) flat in uint v_material;
 
 // Keep in sync with MAX_POINT_LIGHTS / MAX_SPOT_LIGHTS / MAX_TEXTURES in
 // forward.rs.
@@ -115,7 +118,7 @@ struct GpuMaterial {
 
 // Feature bits in `tex_flags.y`, mirroring `material_flags` in forward.rs.
 //
-// `push.material_index` is dynamically uniform, so every test against these is a
+// `v_material` is one value for a whole draw, so every test against these is a
 // coherent branch: a draw either takes a lobe or does not, and a material that
 // never asked for one pays a single comparison rather than the lobe's cost.
 const uint MATERIAL_CLEARCOAT    = 1u << 0;
@@ -187,8 +190,11 @@ layout(set = 3, binding = 9) uniform Fog {
     GpuFog f;
 } u_fog;
 
-// Index is dynamically uniform (from the material), so plain indexing
-// is legal without the nonuniform qualifier.
+// Index is dynamically uniform, so plain indexing is legal without the
+// nonuniform qualifier. It comes from the material, and the material comes from
+// `v_material`, which is one value for every invocation of a draw: a draw is one
+// batch and a batch is one (mesh, material) pair. An invocation group never
+// spans a draw, which is what makes "the same across the draw" enough.
 vec4 sample_tex(uint index, vec2 uv) {
     return texture(sampler2D(textures[index], tex_sampler), uv);
 }
@@ -208,11 +214,9 @@ vec4 decal_sample(uint index, vec2 uv, vec2 dx, vec2 dy) {
 #include "decals.glsl"
 
 // Declared identically to the vertex shader so the stages share one
-// push-constant range; only material_index is read here.
+// push-constant range.
 layout(push_constant) uniform Push {
     mat4 view_proj;
-    uint material_index;
-    uint object_base;
 } push;
 
 // --- Cook-Torrance terms (metallic-roughness workflow) ---
@@ -1157,7 +1161,7 @@ struct Shaded {
 };
 
 Shaded shade_surface() {
-    GpuMaterial m = materials[push.material_index];
+    GpuMaterial m = materials[v_material];
 
     float alpha;
     Surface s = read_surface(m, alpha);
@@ -1391,7 +1395,7 @@ Shaded shade_surface() {
 // alpha to coverage off and ignores this — is never handed a number that would
 // mean something if it were switched on.
 float mask_coverage(float alpha) {
-    GpuMaterial m = materials[push.material_index];
+    GpuMaterial m = materials[v_material];
     if ((m.tex_flags.y & MATERIAL_MASKED) == 0u) {
         return 1.0;
     }

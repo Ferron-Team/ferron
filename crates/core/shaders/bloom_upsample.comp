@@ -15,7 +15,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D u_coarse;
 // This level's down-chain result, which the spread is added to.
 layout(set = 0, binding = 1) uniform sampler2D u_same_level;
-layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_target;
+layout(set = 0, binding = 2, r11f_g11f_b10f) uniform writeonly image2D u_target;
 
 layout(push_constant) uniform Push {
     float radius;

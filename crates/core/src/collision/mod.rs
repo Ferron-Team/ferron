@@ -9,7 +9,7 @@
 mod bvh;
 mod narrowphase;
 
-use glam::{Mat3, Vec3};
+use glam::{Mat3, Vec3, Vec3A};
 
 use orrin_ecs::{Entity, FxHashMap, World};
 
@@ -71,8 +71,8 @@ impl WorldShape {
         match *self {
             WorldShape::Box(aabb) => aabb,
             WorldShape::Sphere { center, radius } => Aabb {
-                min: center - Vec3::splat(radius),
-                max: center + Vec3::splat(radius),
+                min: Vec3A::from(center) - Vec3A::splat(radius),
+                max: Vec3A::from(center) + Vec3A::splat(radius),
             },
         }
     }
@@ -110,7 +110,8 @@ fn world_shape(transform: &WorldTransform, collider: &Collider) -> WorldShape {
                 linear.y_axis.abs(),
                 linear.z_axis.abs(),
             );
-            let world_half = abs * half_extents;
+            let world_half = Vec3A::from(abs * half_extents);
+            let center = Vec3A::from(center);
 
             WorldShape::Box(Aabb {
                 min: center - world_half,

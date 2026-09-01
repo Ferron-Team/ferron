@@ -35,15 +35,12 @@
 use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{
     LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
 };
 use vulkano::image::view::ImageView;
-use vulkano::image::{ImageLayout, SampleCount};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
@@ -60,17 +57,15 @@ use vulkano::pipeline::{
     ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{
-    AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass,
-    RenderPassCreateInfo, Subpass, SubpassDescription,
-};
 
-use crate::gfx::{DrawList, Vertex};
+use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
-use super::VulkanRenderer;
+use super::PassCtx;
 use super::context::VkContext;
 use super::forward::ForwardSets;
-use super::hdr::HDR_FORMAT;
+use super::hdr::HDR_WIDE_FORMAT;
+use super::record::Recorder;
+use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -97,14 +92,6 @@ struct PyramidPush {
 }
 
 pub struct RefractionPass {
-    /// One subpass, one colour target and the prepass depth attached read-only.
-    /// Built by hand rather than through `single_pass_renderpass!` for the
-    /// reason [`OitPass`](super::oit::OitPass) documents: that macro hard-codes
-    /// a depth attachment's reference layout to `DepthStencilAttachmentOptimal`,
-    /// and this pass declares
-    /// [`Access::DepthAttachmentRead`](crate::gfx::graph::Access::DepthAttachmentRead),
-    /// so the graph leaves the image in `DepthStencilReadOnlyOptimal`.
-    pub(super) render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
     pyramid_pipeline: Arc<ComputePipeline>,
     composite_pipeline: Arc<ComputePipeline>,
@@ -126,8 +113,7 @@ impl RefractionPass {
     /// first five set layouts are lifted from it verbatim; see `build_pipeline`.
     pub fn new(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Self {
         let device = &ctx.device;
-        let render_pass = build_render_pass(device);
-        let pipeline = build_pipeline(device, &render_pass, forward_layout);
+        let pipeline = build_pipeline(ctx, forward_layout);
 
         let clamp = |info: SamplerCreateInfo| {
             Sampler::new(
@@ -141,10 +127,9 @@ impl RefractionPass {
         };
 
         Self {
-            render_pass,
             pipeline,
-            pyramid_pipeline: build_compute(device, pyramid_cs::load(device.clone()).unwrap()),
-            composite_pipeline: build_compute(device, composite_cs::load(device.clone()).unwrap()),
+            pyramid_pipeline: build_compute(ctx, pyramid_cs::load(device.clone()).unwrap()),
+            composite_pipeline: build_compute(ctx, composite_cs::load(device.clone()).unwrap()),
             linear_clamp: clamp(SamplerCreateInfo::simple_repeat_linear_no_mipmap()),
             linear_mip: clamp(SamplerCreateInfo {
                 mipmap_mode: SamplerMipmapMode::Linear,
@@ -159,7 +144,7 @@ impl RefractionPass {
     /// background out of.
     pub(super) fn record_pyramid(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         source: Arc<ImageView>,
         mips: &[Arc<ImageView>],
@@ -184,34 +169,27 @@ impl RefractionPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.pyramid_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.pyramid_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.pyramid_pipeline.layout().clone(),
+                self.pyramid_pipeline.layout(),
                 0,
-                set,
+                &[set],
             )
-            .unwrap()
             .push_constants(
-                self.pyramid_pipeline.layout().clone(),
+                self.pyramid_pipeline.layout(),
                 0,
-                PyramidPush {
+                &PyramidPush {
                     extent: [extent[0] as i32, extent[1] as i32],
                     levels: levels as i32,
                 },
-            )
-            .unwrap();
+            );
 
         // SAFETY: one workgroup owns a 64x64 tile of level 0, and every store
         // the shader makes is bounds-checked against `imageSize` and against
         // `push.levels`. The descriptors bound above match the shader's layout,
         // and the graph declared every resource this pass touches.
-        unsafe {
-            builder
-                .dispatch([extent[0].div_ceil(64), extent[1].div_ceil(64), 1])
-                .unwrap()
-        };
+        builder.dispatch([extent[0].div_ceil(64), extent[1].div_ceil(64), 1]);
     }
 
     /// Draw the refractive queue, back to front, into the premultiplied target.
@@ -223,8 +201,8 @@ impl RefractionPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        renderer: &VulkanRenderer,
+        builder: &mut Recorder,
+        renderer: &PassCtx<'_>,
         draws: DrawList<'_>,
         sets: &ForwardSets,
         blur: Arc<ImageView>,
@@ -252,57 +230,53 @@ impl RefractionPass {
         builder
             .set_viewport(
                 0,
-                [Viewport {
+                &[Viewport {
                     offset: [0.0, 0.0],
                     extent: [extent[0] as f32, extent[1] as f32],
                     depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
+                }],
             )
-            .unwrap()
-            .bind_pipeline_graphics(self.pipeline.clone())
-            .unwrap()
+            .bind_pipeline_graphics(&self.pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.pipeline.layout().clone(),
+                self.pipeline.layout(),
                 0,
-                bound,
-            )
-            .unwrap();
+                &bound,
+            );
+
+        // The arena is bound for the pass, not per draw: a mesh is a span into
+        // it. The matrix is pushed once for the same reason — what used to vary
+        // per run, the material and the first object row, travels with the
+        // instance now.
+        renderer.arena.bind(builder);
+        builder.push_constants(
+            self.pipeline.layout(),
+            0,
+            &super::forward::PushConstants::new(view.view_proj),
+        );
 
         for run in draws.runs() {
             let item = draws.item(run.start);
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
-            // The refractive rows follow the transparent ones in the shared
-            // object buffer, so a run's base is its start plus where that block
-            // began.
-            let push = super::forward::PushConstants::new(
-                view.view_proj,
-                item.material.0,
+            // The refractive rows follow the ones before them in the shared object
+            // buffer, so a run's `firstInstance` is its start plus where that
+            // block began.
+            builder.draw_indexed(
+                mesh.span.index_count,
+                run.len() as u32,
+                mesh.span.first_index,
+                mesh.span.vertex_offset,
                 object_base + run.start as u32,
             );
-            builder
-                .push_constants(self.pipeline.layout().clone(), 0, push)
-                .unwrap()
-                .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
-                .unwrap()
-                .bind_index_buffer(mesh.index_buffer.clone())
-                .unwrap();
-            unsafe {
-                builder
-                    .draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0)
-                    .unwrap()
-            };
         }
     }
 
     /// Put what the draw pass gathered over the lit frame.
     pub(super) fn record_composite(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         scene: Arc<ImageView>,
         accum: Arc<ImageView>,
@@ -321,84 +295,25 @@ impl RefractionPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.composite_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.composite_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.composite_pipeline.layout().clone(),
+                self.composite_pipeline.layout(),
                 0,
-                set,
-            )
-            .unwrap();
+                &[set],
+            );
 
         let extent = target.image().extent();
         // SAFETY: the dispatch covers exactly `extent`, and the shader discards
         // invocations past `imageSize`, so nothing writes outside the image. The
         // descriptors bound above match the shader's layout, and the graph
         // declared every resource this pass touches, so its barriers precede it.
-        unsafe {
-            builder
-                .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
-                .unwrap()
-        };
+        builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
     }
 }
 
-/// The draw pass's render pass.
-///
-/// The depth attachment is referenced in `DepthStencilReadOnlyOptimal` and never
-/// transitions, exactly as the transparency accumulation's does — see the note
-/// there for why a reference layout that disagreed with the barrier plan is the
-/// class of bug the graph exists to prevent.
-fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
-    let create_info = RenderPassCreateInfo {
-        attachments: vec![
-            AttachmentDescription {
-                format: HDR_FORMAT,
-                samples: SampleCount::Sample1,
-                load_op: AttachmentLoadOp::Clear,
-                store_op: AttachmentStoreOp::Store,
-                initial_layout: ImageLayout::ColorAttachmentOptimal,
-                final_layout: ImageLayout::ColorAttachmentOptimal,
-                ..Default::default()
-            },
-            AttachmentDescription {
-                format: DEPTH_FORMAT,
-                samples: SampleCount::Sample1,
-                load_op: AttachmentLoadOp::Load,
-                // Nothing was written, so there is nothing to discard — and
-                // `DontCare` would license a driver to leave the prepass depth
-                // undefined for the passes that read it after this one.
-                store_op: AttachmentStoreOp::Store,
-                initial_layout: ImageLayout::DepthStencilReadOnlyOptimal,
-                final_layout: ImageLayout::DepthStencilReadOnlyOptimal,
-                ..Default::default()
-            },
-        ],
-        subpasses: vec![SubpassDescription {
-            color_attachments: vec![Some(AttachmentReference {
-                attachment: 0,
-                layout: ImageLayout::ColorAttachmentOptimal,
-                ..Default::default()
-            })],
-            depth_stencil_attachment: Some(AttachmentReference {
-                attachment: 1,
-                layout: ImageLayout::DepthStencilReadOnlyOptimal,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-
-    RenderPass::new(device.clone(), create_info).unwrap()
-}
-
-fn build_pipeline(
-    device: &Arc<Device>,
-    render_pass: &Arc<RenderPass>,
-    forward_layout: &Arc<PipelineLayout>,
-) -> Arc<GraphicsPipeline> {
+fn build_pipeline(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     // The forward pass's vertex shader, unchanged: a refractive surface is the
     // same geometry read from the same per-object rows, and `shading.glsl` reads
     // the same varyings from it.
@@ -408,7 +323,9 @@ fn build_pipeline(
         .entry_point("main")
         .unwrap();
 
-    let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
+    let vertex_input_state = [PositionVertex::per_vertex(), SurfaceVertex::per_vertex()]
+        .definition(&vs)
+        .unwrap();
     let stages = [
         PipelineShaderStageCreateInfo::new(vs),
         PipelineShaderStageCreateInfo::new(fs),
@@ -423,7 +340,7 @@ fn build_pipeline(
     // `Sampler::new` of the identical description is a different sampler and
     // therefore an incompatible set. Lifting the objects is what makes the five
     // sets the executor already built bind to this pipeline at all.
-    let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
+    let layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
     layout_info
         .set_layouts
         .get(SCENE_SET)
@@ -439,11 +356,9 @@ fn build_pipeline(
 
     let layout = PipelineLayout::new(device.clone(), create_info).unwrap();
 
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),
@@ -491,7 +406,7 @@ fn build_pipeline(
                 ..Default::default()
             }),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(rendering::pipeline_info(&[HDR_WIDE_FORMAT], Some(DEPTH_FORMAT)).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
@@ -499,9 +414,10 @@ fn build_pipeline(
 }
 
 fn build_compute(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     module: Arc<vulkano::shader::ShaderModule>,
 ) -> Arc<ComputePipeline> {
+    let device = &ctx.device;
     let stage = PipelineShaderStageCreateInfo::new(module.entry_point("main").unwrap());
     let layout = PipelineLayout::new(
         device.clone(),
@@ -512,7 +428,7 @@ fn build_compute(
     .unwrap();
     ComputePipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .unwrap()
@@ -520,8 +436,11 @@ fn build_compute(
 
 /// The format the accumulation target is created with. Float and wide because
 /// what it holds is premultiplied HDR radiance, exactly as the frame it will be
-/// composited over holds.
-pub(super) const ACCUM_FORMAT: Format = HDR_FORMAT;
+/// composited over holds — and premultiplied means the coverage it was
+/// multiplied by has to survive in alpha for `refraction_composite` to put the
+/// scene back underneath it. That is what keeps this off the packed colour
+/// format the rest of the chain moved to.
+pub(super) const ACCUM_FORMAT: Format = HDR_WIDE_FORMAT;
 
 mod fs {
     vulkano_shaders::shader! {

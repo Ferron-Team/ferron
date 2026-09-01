@@ -1,4 +1,4 @@
-use glam::{Mat3, Mat4, Vec3};
+use glam::{Mat3, Mat4, Vec3, Vec3A};
 
 use orrin_ecs::{Entity, World};
 
@@ -153,6 +153,7 @@ pub fn extract_geometry(
     aspect: f32,
     cascades: &CascadeSet,
     atlas: &ShadowAtlas,
+    gpu_culling: bool,
     out: &mut FrameGeometry,
 ) {
     out.items.clear();
@@ -181,6 +182,7 @@ pub fn extract_geometry(
     let punctual = &atlas.casters[..atlas.casters.len().min(MAX_SHADOW_LIGHTS)];
     let mut total = 0usize;
 
+    let sweep = crate::profile::scope("sweep");
     world
         .query::<(&WorldTransform, &MeshHandle, Option<&MaterialHandle>)>()
         .for_each(|entity, (transform, mesh, material)| {
@@ -206,22 +208,50 @@ pub fn extract_geometry(
                 .map_or(BlendMode::Opaque, |table| table.get(material));
             let blended = !mode.is_opaque();
 
-            let visible = !cull
+            let in_frustum = !cull
                 || frustum
                     .as_ref()
                     .is_none_or(|frustum| frustum.intersects(&world_bounds));
-            let casts: [bool; MAX_CASCADES] = std::array::from_fn(|i| {
-                !blended
-                    && active
-                        .get(i)
-                        .is_some_and(|cascade| casts_into(&world_bounds, cascade))
-            });
+            // Under GPU culling every *opaque* renderable is offered to the
+            // dispatch and the frustum decides there, per view — this is the
+            // test the whole feature exists to move. The blended and refractive
+            // queues are culled here either way: they are drawn from the order
+            // this list is in, and a refractive surface has to be drawn back to
+            // front, which is a correctness requirement no atomic append meets.
+            let visible = if gpu_culling && !blended {
+                true
+            } else {
+                in_frustum
+            };
+            // The cascades share a rotation, so a box's half-extent in light
+            // space is a property of the box and the light — not of which
+            // cascade is asking. Derived once here; each cascade then costs one
+            // point transform and five compares instead of a second abs-matrix
+            // build and 3x3 multiply.
+            //
+            // An unmeasurable box casts nothing, which is what the old
+            // per-cascade `Aabb::transformed` answered by returning `EMPTY` and
+            // failing every compare. Stated rather than inferred, so the answer
+            // does not rest on how infinities compare.
+            let casts: [bool; MAX_CASCADES] =
+                if gpu_culling || blended || active.is_empty() || !world_bounds.is_valid() {
+                    [false; MAX_CASCADES]
+                } else {
+                    let center = world_bounds.center();
+                    let ls_extents = cascades.abs_light_rotation * world_bounds.half_extents();
+                    std::array::from_fn(|i| {
+                        active
+                            .get(i)
+                            .is_some_and(|cascade| casts_into(center, ls_extents, cascade))
+                    })
+                };
             // A punctual light reaches a sphere, so anything outside it cannot
             // shadow anything it lights. Distance to the *box* rather than to
             // its centre, or a long wall through a light's volume would be
             // culled out of the shadow it plainly casts.
             let lights: [bool; MAX_SHADOW_LIGHTS] = std::array::from_fn(|i| {
-                !blended
+                !gpu_culling
+                    && !blended
                     && punctual.get(i).is_some_and(|caster| {
                         world_bounds.distance_squared_to(caster.center)
                             <= caster.radius * caster.radius
@@ -243,6 +273,10 @@ pub fn extract_geometry(
                 bounds: world_bounds,
                 mesh: *mesh,
                 material,
+                // The entity's own slot, which is what makes the row persistent:
+                // it is the same number next frame, so a row the GPU already
+                // holds does not have to be written again.
+                instance: entity.index(),
             });
 
             if visible {
@@ -270,14 +304,23 @@ pub fn extract_geometry(
             }
         });
 
+    drop(sweep);
+
     // Grouping by mesh lets the passes bind vertex/index buffers once per run
     // instead of once per draw, and collapse each run into a single instanced
     // draw.
+    let sorting = crate::profile::scope("sort");
     let key = |items: &[RenderItem], index: &u32| {
         let item = &items[*index as usize];
         (item.mesh.0, item.material.0)
     };
-    out.visible.sort_unstable_by_key(|i| key(&out.items, i));
+    // Under GPU culling the opaque list is not a draw order at all — it is the
+    // set the dispatch is offered, and `cull::CullPass::prepare` groups it by a
+    // hash rather than by a sort. Sorting it would be an O(n log n) walk over
+    // every renderable to produce an ordering nothing reads.
+    if !gpu_culling {
+        out.visible.sort_unstable_by_key(|i| key(&out.items, i));
+    }
     // Grouped, and then deliberately left alone. Weighted-blended
     // transparency's whole claim is that the composite is commutative, so this
     // list has no back-to-front pass to go with it — and the popping a sort
@@ -291,13 +334,21 @@ pub fn extract_geometry(
         list.sort_unstable_by_key(|i| key(&out.items, i));
     }
 
+    drop(sorting);
+
     // Within the grouping, order the runs front to back. Opaque geometry is
     // depth-tested, so this changes no pixel — it changes how many fragments
     // reach the shader, since a nearer run already in the depth buffer rejects
     // the ones behind it before they shade. Runs move whole, so every run is
     // still one instanced draw.
+    let ordering = crate::profile::scope("order runs");
     if let Some(camera) = camera.as_ref() {
-        order_runs_front_to_back(&out.items, &mut out.visible, camera.position);
+        // Not under GPU culling, for the reason the sort above is skipped: the
+        // opaque list is a set there, and the order the batches are drawn in is
+        // the order `cull::CullPass::prepare` assigned their numbers.
+        if !gpu_culling {
+            order_runs_front_to_back(&out.items, &mut out.visible, camera.position);
+        }
         // The opposite order, and for the opposite reason. Front to back above
         // is an optimisation over geometry the depth test already resolves; back
         // to front here is *correctness*, because a refractive surface samples
@@ -307,13 +358,17 @@ pub fn extract_geometry(
         out.refractive.reverse();
     }
 
+    drop(ordering);
+
     out.motion.end();
 
     if let Some(mut culling) = world.get_resource_mut::<Culling>() {
-        culling.record(
-            out.visible.len() + out.transparent.len() + out.refractive.len(),
-            total,
-        );
+        // Unknown under GPU culling: `out.visible` there is what the dispatch
+        // was *offered*, not what it kept, and the counts it wrote are still on
+        // the device when this runs.
+        let visible = (!gpu_culling)
+            .then(|| out.visible.len() + out.transparent.len() + out.refractive.len());
+        culling.record(visible, total);
     }
 }
 
@@ -348,17 +403,24 @@ fn order_runs_front_to_back(items: &[RenderItem], order: &mut Vec<u32>, eye: Vec
     *order = sorted;
 }
 
-/// Whether `bounds`, extended infinitely toward the light, reaches `cascade`.
-fn casts_into(bounds: &Aabb, cascade: &Cascade) -> bool {
-    let ls = bounds.transformed(&cascade.light_view);
+/// Whether a box, extended infinitely toward the light, reaches `cascade`.
+///
+/// Takes the box already split into the two parts that behave differently across
+/// a cascade set: `center` in world space, which each cascade's `light_view`
+/// must transform for itself, and `ls_extents`, its half-extent in light space,
+/// which every cascade agrees on — that is
+/// [`CascadeSet::abs_light_rotation`](crate::gfx::shadows::CascadeSet::abs_light_rotation)
+/// times the box's half-extents, and the reason this is not `&Aabb`.
+fn casts_into(center: Vec3A, ls_extents: Vec3A, cascade: &Cascade) -> bool {
+    let c = cascade.light_view.transform_point3a(center);
     let half = cascade.half_extent;
     // `light_view` is a right-handed look-at, so what the pass renders lies at
     // negative z, between the eye at 0 and the far plane at -depth_range.
-    ls.min.x <= half
-        && ls.max.x >= -half
-        && ls.min.y <= half
-        && ls.max.y >= -half
-        && ls.max.z >= -cascade.depth_range
+    c.x - ls_extents.x <= half
+        && c.x + ls_extents.x >= -half
+        && c.y - ls_extents.y <= half
+        && c.y + ls_extents.y >= -half
+        && c.z + ls_extents.z >= -cascade.depth_range
 }
 
 #[cfg(test)]
@@ -366,7 +428,7 @@ mod shadow_culling_tests {
     use super::*;
     use crate::gfx::shadows::{CascadeConfig, cascades};
     use crate::scene::Camera;
-    use glam::Vec3;
+    use glam::{Vec3, Vec3A};
 
     const ASPECT: f32 = 16.0 / 9.0;
 
@@ -387,10 +449,21 @@ mod shadow_culling_tests {
     }
 
     fn box_at(center: Vec3, half: f32) -> Aabb {
+        let center = Vec3A::from(center);
         Aabb {
-            min: center - Vec3::splat(half),
-            max: center + Vec3::splat(half),
+            min: center - Vec3A::splat(half),
+            max: center + Vec3A::splat(half),
         }
+    }
+
+    /// What the sweep does per entity, in one call: split the box into the
+    /// centre each cascade transforms and the extent they all share.
+    fn casts(set: &CascadeSet, bounds: &Aabb, index: usize) -> bool {
+        super::casts_into(
+            bounds.center(),
+            set.abs_light_rotation * bounds.half_extents(),
+            &set.cascades[index],
+        )
     }
 
     /// The whole reason a cascade is not the camera's list with a different
@@ -413,7 +486,7 @@ mod shadow_culling_tests {
         let overhead = center + Vec3::Y * 500.0;
 
         assert!(
-            casts_into(&box_at(overhead, 1.0), cascade),
+            casts(&set, &box_at(overhead, 1.0), 0),
             "an object between the sun and the cascade was culled",
         );
     }
@@ -432,7 +505,7 @@ mod shadow_culling_tests {
             -cascade.depth_range - 100.0,
         ));
 
-        assert!(!casts_into(&box_at(below, 1.0), cascade));
+        assert!(!casts(&set, &box_at(below, 1.0), 0));
     }
 
     #[test]
@@ -446,7 +519,7 @@ mod shadow_culling_tests {
                 axis * (cascade.half_extent + 10.0) - Vec3::Z * cascade.depth_range * 0.5,
             );
             assert!(
-                !casts_into(&box_at(outside, 1.0), cascade),
+                !casts(&set, &box_at(outside, 1.0), 0),
                 "an object {} past the box edge was kept",
                 cascade.half_extent + 10.0,
             );
@@ -462,10 +535,10 @@ mod shadow_culling_tests {
         let set = set(&camera);
         let bounds = box_at(camera.position + Vec3::new(0.0, 0.0, -5.0), 0.5);
 
-        assert!(casts_into(&bounds, &set.cascades[0]));
+        assert!(casts(&set, &bounds, 0));
         for index in 1..set.count {
             assert!(
-                casts_into(&bounds, &set.cascades[index]),
+                casts(&set, &bounds, index),
                 "cascade {index} rejected what cascade 0 accepted",
             );
         }
@@ -477,6 +550,76 @@ mod shadow_culling_tests {
     fn an_empty_cascade_set_casts_nothing() {
         let set = CascadeSet::default();
         assert_eq!(set.count, 0);
+    }
+
+    /// The predicate this replaced: a full `Aabb::transformed` per cascade,
+    /// kept here as the thing the hoisted form has to keep agreeing with.
+    fn reference_casts_into(bounds: &Aabb, cascade: &Cascade) -> bool {
+        let ls = bounds.transformed(&cascade.light_view);
+        ls.min.x <= cascade.half_extent
+            && ls.max.x >= -cascade.half_extent
+            && ls.min.y <= cascade.half_extent
+            && ls.max.y >= -cascade.half_extent
+            && ls.max.z >= -cascade.depth_range
+    }
+
+    /// Hoisting the rotation is only sound if it computes the same predicate.
+    ///
+    /// Swept over a grid that straddles every plane of every cascade — inside,
+    /// outside, and across each edge — because a test that only samples the
+    /// interior would pass for a predicate that got the bounds wrong. The sun is
+    /// off every axis, so the shared rotation is a general one rather than the
+    /// permutation a straight-down light produces.
+    #[test]
+    fn the_hoisted_extents_agree_with_a_full_transform_per_cascade() {
+        let camera = Camera::default();
+        let set = cascades(
+            &camera,
+            ASPECT,
+            Vec3::new(-0.4, -1.0, -0.3).normalize(),
+            &config(),
+        );
+        let reach = set.cascades[set.count - 1].half_extent * 1.5;
+
+        let mut tested = 0usize;
+        let mut kept = [0usize; MAX_CASCADES];
+        let mut reference_kept = [0usize; MAX_CASCADES];
+        let steps = 11;
+        for xi in 0..steps {
+            for yi in 0..steps {
+                for zi in 0..steps {
+                    let at = |i: usize| (i as f32 / (steps - 1) as f32 * 2.0 - 1.0) * reach;
+                    // Sizes that are not all the same, so the extent term is
+                    // doing real work rather than cancelling out.
+                    let half = 0.5 + (xi + yi + zi) as f32 * 0.25;
+                    let bounds = box_at(Vec3::new(at(xi), at(yi), at(zi)), half);
+                    tested += 1;
+                    for index in 0..set.count {
+                        let hoisted = casts(&set, &bounds, index);
+                        let reference = reference_casts_into(&bounds, &set.cascades[index]);
+                        assert_eq!(
+                            hoisted,
+                            reference,
+                            "cascade {index} disagrees about a box of half-extent {half} at \
+                             {:?}",
+                            bounds.center(),
+                        );
+                        kept[index] += usize::from(hoisted);
+                        reference_kept[index] += usize::from(reference);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(kept, reference_kept, "per-cascade caster counts differ");
+        // A sweep where every box is kept, or none is, would agree trivially.
+        for index in 0..set.count {
+            assert!(
+                kept[index] > 0 && kept[index] < tested,
+                "cascade {index} kept {} of {tested}: the sweep straddles nothing",
+                kept[index],
+            );
+        }
     }
 }
 
@@ -604,7 +747,7 @@ mod tests {
         Camera, CpuMesh, Culling, Decal, DecalSettings, LocalTransform, MeshBounds, MeshHandle,
         Transform, WorldTransform,
     };
-    use glam::{Mat3, Mat4, Quat, Vec3};
+    use glam::{Mat3, Mat4, Quat, Vec3, Vec3A};
     use orrin_ecs::World;
 
     const ASPECT: f32 = 16.0 / 9.0;
@@ -641,6 +784,7 @@ mod tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let visible = geometry.visible();
@@ -813,6 +957,7 @@ mod tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let before = *geometry.visible().item(0);
@@ -826,6 +971,7 @@ mod tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let after = *geometry.visible().item(0);
@@ -850,6 +996,7 @@ mod tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let first = *geometry.visible().item(0);
@@ -866,6 +1013,7 @@ mod tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let second = *geometry.visible().item(0);
@@ -887,7 +1035,7 @@ mod tests {
         let culling = world.resource::<Culling>();
         assert_eq!(
             (culling.visible(), culling.total(), culling.culled()),
-            (1, 2, 1)
+            (Some(1), 2, Some(1))
         );
     }
 
@@ -1100,8 +1248,8 @@ mod tests {
     #[test]
     fn a_mesh_reports_the_bounds_of_its_vertices() {
         let bounds = CpuMesh::cube().bounds();
-        assert!((bounds.min - Vec3::splat(-0.5)).length() < 1e-6);
-        assert!((bounds.max - Vec3::splat(0.5)).length() < 1e-6);
+        assert!((bounds.min - Vec3A::splat(-0.5)).length() < 1e-6);
+        assert!((bounds.max - Vec3A::splat(0.5)).length() < 1e-6);
 
         let empty = CpuMesh::default().bounds();
         assert!(!empty.is_valid());
@@ -1295,7 +1443,14 @@ mod geometry_tests {
         let set = sun_cascades(&camera);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &set, &ShadowAtlas::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &set,
+            &ShadowAtlas::default(),
+            false,
+            &mut geometry,
+        );
 
         assert_eq!(geometry.visible().len(), 0, "it should not be visible");
         assert!(
@@ -1314,7 +1469,14 @@ mod geometry_tests {
         let set = sun_cascades(&camera);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &set, &ShadowAtlas::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &set,
+            &ShadowAtlas::default(),
+            false,
+            &mut geometry,
+        );
 
         assert_eq!(geometry.visible().len(), 0);
         for i in 0..set.count {
@@ -1336,7 +1498,14 @@ mod geometry_tests {
         let set = sun_cascades(&camera);
 
         let mut geometry = FrameGeometry::default();
-        extract_geometry(&world, ASPECT, &set, &ShadowAtlas::default(), &mut geometry);
+        extract_geometry(
+            &world,
+            ASPECT,
+            &set,
+            &ShadowAtlas::default(),
+            false,
+            &mut geometry,
+        );
 
         assert_eq!(geometry.items.len(), 1);
         assert_eq!(geometry.visible.len(), 1);
@@ -1349,7 +1518,6 @@ mod geometry_tests {
     /// draws instances against the wrong transforms.
     #[test]
     fn front_to_back_ordering_keeps_every_run_whole() {
-        let camera = Camera::default();
         // Two meshes interleaved in depth, so ordering has something to do and
         // the grouping has something to hold together.
         let world = world_with(&[
@@ -1365,6 +1533,7 @@ mod geometry_tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let visible = geometry.visible();
@@ -1400,6 +1569,7 @@ mod geometry_tests {
             ASPECT,
             &CascadeSet::default(),
             &ShadowAtlas::default(),
+            false,
             &mut geometry,
         );
         let visible = geometry.visible();

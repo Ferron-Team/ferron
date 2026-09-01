@@ -7,7 +7,6 @@ use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageUsage};
 use vulkano::memory::allocator::AllocationCreateInfo;
-use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
 use vulkano::swapchain::{PresentMode, Surface, Swapchain, SwapchainCreateInfo};
 
 pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
@@ -16,6 +15,7 @@ pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
 fn present_mode(vsync: VsyncMode) -> PresentMode {
     match vsync {
         VsyncMode::Fifo => PresentMode::Fifo,
+        VsyncMode::FifoRelaxed => PresentMode::FifoRelaxed,
         VsyncMode::Mailbox => PresentMode::Mailbox,
         VsyncMode::Immediate => PresentMode::Immediate,
     }
@@ -47,15 +47,48 @@ fn resolve(
         })
         .unwrap_or(PresentMode::Fifo);
 
-    let mut images = want.images.max(1);
-    if let Ok(caps) = physical.surface_capabilities(surface, Default::default()) {
-        images = images.max(caps.min_image_count);
-        if let Some(max) = caps.max_image_count {
-            images = images.min(max);
-        }
-    }
+    let (min, max) = match physical.surface_capabilities(surface, Default::default()) {
+        Ok(caps) => (caps.min_image_count, caps.max_image_count),
+        Err(_) => (1, None),
+    };
 
-    (mode, images)
+    (mode, image_count(want.images, mode, min, max))
+}
+
+/// Images an uncapped present mode needs before it can do anything a capped one
+/// cannot: one on screen, one queued, one being drawn.
+const UNCAPPED_MINIMUM: u32 = 3;
+
+/// How many images to build the swapchain with, given what was asked for, the
+/// mode the surface honoured, and the range it advertises.
+///
+/// Split out from [`resolve`] because it is the half worth asserting and the
+/// half that needs no device.
+fn image_count(want: u32, mode: PresentMode, min: u32, max: Option<u32>) -> u32 {
+    // `Mailbox` and `Immediate` are the modes that let a frame finish ahead of
+    // the display, and with two images they cannot: one is on screen and one is
+    // queued, so the acquire blocks until the presentation engine hands one back
+    // and the uncapped mode measures as the capped one it was chosen over.
+    //
+    // A floor rather than a default, and applied here rather than in
+    // `PresentSettings`, because it belongs to the mode and not to the setting:
+    // somebody switching to `Mailbox` in the performance panel has asked for
+    // this, whatever the image count they did not touch still says. The default
+    // stays two, so a `Fifo` number taken before this and one taken after are
+    // the same measurement.
+    let floor = match mode {
+        PresentMode::Mailbox | PresentMode::Immediate => UNCAPPED_MINIMUM,
+        _ => 1,
+    };
+
+    let images = want.max(floor).max(min);
+    // Last, so a surface that advertises a smaller maximum than the floor gets a
+    // worse frame rather than a failed swapchain — the same fallback the mode
+    // itself takes above.
+    match max {
+        Some(max) => images.min(max),
+        None => images,
+    }
 }
 
 /// What the frame's last pass draws into: a real swapchain, or — offscreen — a
@@ -71,17 +104,17 @@ pub struct SwapchainState {
     /// `None` offscreen. The only two places that branch on it are the acquire
     /// and the present.
     pub swapchain: Option<Arc<Swapchain>>,
-    /// The images behind `framebuffers`, kept so an offscreen render can copy
+    /// The images behind `image_views`, kept so an offscreen render can copy
     /// the finished frame back out. Empty for a windowed target, which has
     /// nothing to read back.
     pub readback: Vec<Arc<Image>>,
     /// Carried rather than read off the swapchain, because offscreen there is no
     /// swapchain to read it off.
     pub format: Format,
-    pub framebuffers: Vec<Arc<Framebuffer>>,
-    /// One view per swapchain image, parallel to `framebuffers`. An overlay
-    /// (e.g. the editor UI) draws onto these directly, after the tonemap pass
-    /// has written the scene into the same image.
+    /// One view per swapchain image, indexed by the acquired image index. The
+    /// tonemap pass renders into one of these directly — there is no
+    /// framebuffer to bind it to — and an overlay (e.g. the editor UI) draws
+    /// onto the same image afterwards.
     pub image_views: Vec<Arc<ImageView>>,
     pub extent: [u32; 2],
 }
@@ -90,7 +123,6 @@ impl SwapchainState {
     pub fn new(
         ctx: &VkContext,
         surface: &Arc<Surface>,
-        render_pass: &Arc<RenderPass>,
         format: Format,
         extent: [u32; 2],
         present: PresentSettings,
@@ -119,14 +151,11 @@ impl SwapchainState {
         )
         .expect("failed to create swapchain");
 
-        let (framebuffers, image_views) = build_framebuffers(render_pass, &images);
-
         Self {
             swapchain: Some(swapchain),
             readback: Vec::new(),
             format,
-            framebuffers,
-            image_views,
+            image_views: build_views(&images),
             extent,
         }
     }
@@ -136,12 +165,7 @@ impl SwapchainState {
     /// `TRANSFER_SRC` is the one usage a windowed target does not need: it is
     /// what lets the finished frame be copied back to host memory and written
     /// out as a PNG.
-    pub fn offscreen(
-        ctx: &VkContext,
-        render_pass: &Arc<RenderPass>,
-        format: Format,
-        extent: [u32; 2],
-    ) -> Self {
+    pub fn offscreen(ctx: &VkContext, format: Format, extent: [u32; 2]) -> Self {
         let image = Image::new(
             ctx.memory_allocator.clone(),
             ImageCreateInfo {
@@ -157,14 +181,12 @@ impl SwapchainState {
         .expect("failed to allocate the offscreen target");
 
         let images = [image];
-        let (framebuffers, image_views) = build_framebuffers(render_pass, &images);
 
         Self {
             swapchain: None,
+            image_views: build_views(&images),
             readback: images.to_vec(),
             format,
-            framebuffers,
-            image_views,
             extent,
         }
     }
@@ -175,12 +197,7 @@ impl SwapchainState {
     // the one path a present-mode or image-count change travels, so the two
     // settings reach the swapchain the same way an extent does and there is no
     // second place for them to be applied from.
-    pub fn recreate(
-        &mut self,
-        render_pass: &Arc<RenderPass>,
-        extent: [u32; 2],
-        present: PresentSettings,
-    ) -> bool {
+    pub fn recreate(&mut self, extent: [u32; 2], present: PresentSettings) -> bool {
         if extent[0] == 0 || extent[1] == 0 {
             return false;
         }
@@ -201,9 +218,7 @@ impl SwapchainState {
             .expect("failed to recreate swapchain");
 
         self.swapchain = Some(swapchain);
-        let (framebuffers, image_views) = build_framebuffers(render_pass, &images);
-        self.framebuffers = framebuffers;
-        self.image_views = image_views;
+        self.image_views = build_views(&images);
         self.extent = extent;
         true
     }
@@ -222,25 +237,48 @@ impl SwapchainState {
     }
 }
 
-/// Build a framebuffer and keep its color view for each swapchain image. The
-/// views are returned alongside so an overlay can target the same images.
-fn build_framebuffers(
-    render_pass: &Arc<RenderPass>,
-    images: &[Arc<Image>],
-) -> (Vec<Arc<Framebuffer>>, Vec<Arc<ImageView>>) {
+/// One colour view per target image. The tonemap pass renders into the acquired
+/// one and an overlay draws onto the same image after it.
+fn build_views(images: &[Arc<Image>]) -> Vec<Arc<ImageView>> {
     images
         .iter()
-        .map(|image| {
-            let view = ImageView::new_default(image.clone()).unwrap();
-            let framebuffer = Framebuffer::new(
-                render_pass.clone(),
-                FramebufferCreateInfo {
-                    attachments: vec![view.clone()],
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            (framebuffer, view)
-        })
-        .unzip()
+        .map(|image| ImageView::new_default(image.clone()).unwrap())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A capped mode is handed exactly what was asked for: the floor below
+    /// exists for the acquire an uncapped mode blocks in, and `Fifo` is supposed
+    /// to block there.
+    #[test]
+    fn a_capped_mode_gets_the_count_it_asked_for() {
+        assert_eq!(image_count(2, PresentMode::Fifo, 1, None), 2);
+        assert_eq!(image_count(2, PresentMode::FifoRelaxed, 1, None), 2);
+    }
+
+    /// The defect this floor exists for: two images and `Mailbox` is `Fifo` with
+    /// extra steps, because the acquire waits for the presentation engine either
+    /// way.
+    #[test]
+    fn an_uncapped_mode_gets_a_third_image() {
+        assert_eq!(image_count(2, PresentMode::Mailbox, 1, None), 3);
+        assert_eq!(image_count(2, PresentMode::Immediate, 1, None), 3);
+    }
+
+    /// The floor raises a count, never lowers one.
+    #[test]
+    fn asking_for_more_than_the_floor_is_honoured() {
+        assert_eq!(image_count(5, PresentMode::Mailbox, 1, None), 5);
+    }
+
+    /// And the surface has the last word in both directions, because a count it
+    /// cannot honour has to be a worse frame rather than a dead window.
+    #[test]
+    fn the_surface_range_wins_over_both() {
+        assert_eq!(image_count(2, PresentMode::Mailbox, 1, Some(2)), 2);
+        assert_eq!(image_count(2, PresentMode::Fifo, 4, None), 4);
+    }
 }

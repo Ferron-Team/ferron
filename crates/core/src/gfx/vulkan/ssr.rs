@@ -20,11 +20,9 @@
 use std::sync::Arc;
 
 use glam::Vec3;
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -37,6 +35,7 @@ use vulkano::pipeline::{
 use crate::scene::SsrSettings;
 
 use super::context::VkContext;
+use super::record::{Arena, Recorder};
 use super::taa::FrameView;
 
 /// Side of the compute workgroup for the trace and the composite.
@@ -118,7 +117,7 @@ pub struct SsrPass {
     /// a cone that grows smoothly with distance would otherwise step between
     /// blurs, and the step would be visible as a ring on a curved surface.
     linear_mip: Arc<Sampler>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
     settings: SsrSettings,
     /// Advanced every frame the pass runs, and what decorrelates the sample
     /// sequence frame to frame. Without it every frame would trace the same ray
@@ -131,28 +130,28 @@ impl SsrPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
         let hiz_pipeline = build_pipeline(
-            device,
+            ctx,
             hiz_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap(),
         );
         let source_pipeline = build_pipeline(
-            device,
+            ctx,
             source_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap(),
         );
         let trace_pipeline = build_pipeline(
-            device,
+            ctx,
             trace_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap(),
         );
         let resolve_pipeline = build_pipeline(
-            device,
+            ctx,
             resolve_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
@@ -193,7 +192,7 @@ impl SsrPass {
         )
         .unwrap();
 
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -243,7 +242,7 @@ impl SsrPass {
         // put the reconstructed position half a pixel from the depth it came
         // from, and the march would start beside the surface rather than on it.
         let proj = view.proj;
-        let uniforms = self.uniform_allocator.allocate_sized::<SsrUbo>().unwrap();
+        let uniforms = self.uniform_allocator.allocate_sized::<SsrUbo>();
         *uniforms.write().unwrap() = SsrUbo {
             proj: proj.to_cols_array_2d(),
             inv_proj: proj.inverse().to_cols_array_2d(),
@@ -287,7 +286,7 @@ impl SsrPass {
     /// view per level, because a storage image descriptor takes exactly one.
     pub(super) fn record_hiz(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         depth: Arc<ImageView>,
         mips: &[Arc<ImageView>],
@@ -311,45 +310,38 @@ impl SsrPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.hiz_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.hiz_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.hiz_pipeline.layout().clone(),
+                self.hiz_pipeline.layout(),
                 0,
-                vec![set],
+                &[set],
             )
-            .unwrap()
             .push_constants(
-                self.hiz_pipeline.layout().clone(),
+                self.hiz_pipeline.layout(),
                 0,
-                HizPush {
+                &HizPush {
                     extent: [extent[0] as i32, extent[1] as i32],
                     levels: levels as i32,
                 },
-            )
-            .unwrap();
+            );
 
         // SAFETY: one workgroup per HIZ_TILE-sized tile covers the frame, and
         // every store is bounds-checked against the level it writes, so nothing
         // lands outside an image. The descriptors match the shader's layout, and
         // the graph declared every resource this pass touches.
-        unsafe {
-            builder
-                .dispatch([
-                    extent[0].div_ceil(HIZ_TILE),
-                    extent[1].div_ceil(HIZ_TILE),
-                    1,
-                ])
-                .unwrap()
-        };
+        builder.dispatch([
+            extent[0].div_ceil(HIZ_TILE),
+            extent[1].div_ceil(HIZ_TILE),
+            1,
+        ]);
     }
 
     /// Reduce the lit frame into the pyramid the trace samples cones out of.
     /// Same dispatch shape as the depth pyramid, and for the same reason.
     pub(super) fn record_source(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         source: Arc<ImageView>,
         mips: &[Arc<ImageView>],
@@ -373,44 +365,37 @@ impl SsrPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.source_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.source_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.source_pipeline.layout().clone(),
+                self.source_pipeline.layout(),
                 0,
-                vec![set],
+                &[set],
             )
-            .unwrap()
             .push_constants(
-                self.source_pipeline.layout().clone(),
+                self.source_pipeline.layout(),
                 0,
-                HizPush {
+                &HizPush {
                     extent: [extent[0] as i32, extent[1] as i32],
                     levels: levels as i32,
                 },
-            )
-            .unwrap();
+            );
 
         // SAFETY: one workgroup per HIZ_TILE-sized tile covers level 0, and
         // every store is bounds-checked against the level it writes, so nothing
         // lands outside an image. The descriptors match the shader's layout, and
         // the graph declared every resource this pass touches.
-        unsafe {
-            builder
-                .dispatch([
-                    extent[0].div_ceil(HIZ_TILE),
-                    extent[1].div_ceil(HIZ_TILE),
-                    1,
-                ])
-                .unwrap()
-        };
+        builder.dispatch([
+            extent[0].div_ceil(HIZ_TILE),
+            extent[1].div_ceil(HIZ_TILE),
+            1,
+        ]);
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_trace(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         hiz: Arc<ImageView>,
         depth: Arc<ImageView>,
@@ -436,22 +421,20 @@ impl SsrPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.trace_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.trace_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.trace_pipeline.layout().clone(),
+                self.trace_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_resolve(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         source: Arc<ImageView>,
         rays: Arc<ImageView>,
@@ -484,40 +467,32 @@ impl SsrPass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.resolve_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.resolve_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.resolve_pipeline.layout().clone(),
+                self.resolve_pipeline.layout(),
                 0,
-                vec![set],
-            )
-            .unwrap();
+                &[set],
+            );
         dispatch_over(builder, &target);
     }
 }
 
-fn dispatch_over(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    target: &Arc<ImageView>,
-) {
+fn dispatch_over(builder: &mut Recorder, target: &Arc<ImageView>) {
     let extent = target.image().extent();
 
     // SAFETY: the dispatch covers exactly `extent`, and each shader discards
     // invocations past `imageSize`, so nothing writes outside the image. The
     // descriptors bound above match the shader's layout, and the graph declared
     // every resource this pass touches, so its barriers precede it.
-    unsafe {
-        builder
-            .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
-            .unwrap()
-    };
+    builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
 }
 
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     entry_point: vulkano::shader::EntryPoint,
 ) -> Arc<ComputePipeline> {
+    let device = &ctx.device;
     let stage = PipelineShaderStageCreateInfo::new(entry_point);
     let layout = PipelineLayout::new(
         device.clone(),
@@ -528,7 +503,7 @@ fn build_pipeline(
     .unwrap();
     ComputePipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .unwrap()

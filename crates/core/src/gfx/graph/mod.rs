@@ -24,12 +24,19 @@
 //!
 //! # What v1 deliberately does not do
 //!
-//! - **One queue.** No async compute, no cross-queue semaphores.
+//! - **Two queues at most, cut in one place.** A frame that asked for it is
+//!   split into a graphics head, a compute tail and the trailing draw that
+//!   presents it — see `schedule.rs` for why that one cut is the only one worth
+//!   making, and why what it buys is overlap between *frames* rather than
+//!   inside one.
 //! - **Images and buffers only**, and buffers may only be imported — there is no
 //!   transient buffer allocator, because nothing needs one yet.
-//! - **No memory aliasing.** Transient images each get their own allocation;
-//!   the lifetime information needed to alias them is already in the graph, so
-//!   this is an optimisation, not a redesign.
+//! - **Memory aliasing only between equals.** Transients whose lifetimes do not
+//!   overlap share an allocation, but only when their allocations would have
+//!   been identical: a device-free compiler cannot ask for memory requirements,
+//!   so matching create-info is how it knows they match. Packing a small image
+//!   inside a larger one's block is the part that is still missing — see
+//!   `alias.rs`.
 //! - **No resource versioning.** A resource written twice is ordered by
 //!   registration order rather than by data flow (see `compile::timeline`).
 //! - **Recompiled on structure change, not per frame.** Toggling SSAO or
@@ -51,11 +58,13 @@
 //! changes.
 
 mod access;
+mod alias;
 mod builder;
 mod compile;
 mod error;
 mod plan;
 mod resource;
+mod schedule;
 
 pub use access::Access;
 pub use builder::{GraphBuilder, PassBuilder, PassId, PassKind};
@@ -63,6 +72,7 @@ pub use compile::{FrameGraph, TransientImage, compile};
 pub use error::GraphError;
 pub use plan::Barrier;
 pub use resource::{Extent, ImageDesc, ImportedLayouts, ResourceId};
+pub use schedule::{Queue, Segment};
 
 use builder::PassDecl;
 use resource::{ResourceDecl, ResourceKind};

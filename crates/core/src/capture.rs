@@ -22,6 +22,7 @@ use orrin_ecs::World;
 use vulkano::VulkanLibrary;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
+use crate::gfx::RenderBackend;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
 use crate::gfx::vulkan::{ShadowFrame, VulkanRenderer};
@@ -202,7 +203,14 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
         } else {
             CascadeSet::default()
         };
-        systems::extract_geometry(&world, aspect, &cascade_set, &atlas, &mut geometry);
+        systems::extract_geometry(
+            &world,
+            aspect,
+            &cascade_set,
+            &atlas,
+            renderer.gpu_culling(),
+            &mut geometry,
+        );
         systems::extract_decals(&world, aspect, &mut decals);
 
         let caster_lists: [DrawList<'_>; MAX_CASCADES] =

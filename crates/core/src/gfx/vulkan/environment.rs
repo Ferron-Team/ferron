@@ -16,12 +16,8 @@ use std::sync::Arc;
 
 use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, CopyBufferToImageInfo, ImageBlit,
-    PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents,
-};
+use vulkano::command_buffer::{BlitImageInfo, CopyBufferToImageInfo, ImageBlit};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
@@ -43,8 +39,6 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
-use vulkano::sync::{self, GpuFuture};
 
 use crate::gfx::sh::{self, SH9};
 use crate::scene::EnvironmentSettings;
@@ -53,12 +47,23 @@ use super::fog::GpuFog;
 
 use super::MSAA_SAMPLES;
 use super::context::VkContext;
-use super::hdr::HDR_FORMAT;
+use super::forward::ForwardTargets;
+use super::hdr::HDR_WIDE_FORMAT;
+use super::record::{self, Recorder};
+use super::rendering;
 use super::taa::FrameView;
+use vulkano::command_buffer::{RenderingAttachmentInfo, RenderingInfo};
+use vulkano::image::{ImageLayout, SampleCount};
+use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
+use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
 
 /// The environment carries the same radiance the scene does, so it uses the
 /// same format the forward target does.
-pub const CUBE_FORMAT: Format = HDR_FORMAT;
+// The wide format, not the packed one the frame's colour uses. This is baked
+// once when an environment is loaded rather than written every frame, so there
+// is no per-frame bandwidth to win here — and the prefilter accumulates weighted
+// taps through the alpha channel the packed format does not have.
+pub const CUBE_FORMAT: Format = HDR_WIDE_FORMAT;
 
 /// Edge length of one cube face. Enough for a background at ordinary fields of
 /// view; not enough for sharp mirror reflections, which is what would drive
@@ -122,16 +127,13 @@ struct SkyboxPush {
 }
 
 pub struct EnvironmentPass {
-    bake_rp: Arc<RenderPass>,
     bake_pipeline: Arc<GraphicsPipeline>,
     prefilter_pipeline: Arc<GraphicsPipeline>,
     equirect_sampler: Arc<Sampler>,
-    skybox_pipeline: Arc<GraphicsPipeline>,
-    /// The skybox against the forward pass's subsurface render pass, which has a
-    /// colour attachment more. Both live for the session, for the reason
-    /// [`ForwardPass::subsurface_render_pass`](super::forward::ForwardPass)
-    /// documents.
-    skybox_subsurface_pipeline: Arc<GraphicsPipeline>,
+    /// The skybox against each of the forward pass's four target shapes,
+    /// indexed `[msaa][subsurface]`. All four live for the session, for the
+    /// reason [`ForwardTargets`](super::forward::ForwardTargets) documents.
+    skybox_pipelines: [[Arc<GraphicsPipeline>; 2]; 2],
     cube_sampler: Arc<Sampler>,
     /// Bound in place of the prefiltered chain when nothing is loaded.
     fallback_cube: Arc<ImageView>,
@@ -151,19 +153,22 @@ pub struct EnvironmentPass {
 }
 
 impl EnvironmentPass {
-    /// `forward_rp` is the forward pass's render pass: the skybox draws inside
-    /// it, after the geometry.
-    pub fn new(
-        ctx: &VkContext,
-        forward_rp: &Arc<RenderPass>,
-        forward_subsurface_rp: &Arc<RenderPass>,
-    ) -> Self {
+    /// `targets` are the forward pass's: the skybox rasterises into the same
+    /// attachments, after the geometry.
+    pub fn new(ctx: &VkContext, targets: &ForwardTargets) -> Self {
         let device = &ctx.device;
-        let bake_rp = bake_render_pass(device);
-        let bake_pipeline = build_bake_pipeline(device, &bake_rp);
-        let prefilter_pipeline = build_prefilter_pipeline(device, &bake_rp);
-        let skybox_pipeline = build_skybox_pipeline(device, forward_rp);
-        let skybox_subsurface_pipeline = build_skybox_pipeline(device, forward_subsurface_rp);
+        let bake_pipeline = build_bake_pipeline(ctx);
+        let prefilter_pipeline = build_prefilter_pipeline(ctx);
+        let skybox_pipelines = [
+            [
+                build_skybox_pipeline(ctx, &targets.single, SampleCount::Sample1),
+                build_skybox_pipeline(ctx, &targets.single_subsurface, SampleCount::Sample1),
+            ],
+            [
+                build_skybox_pipeline(ctx, &targets.multisampled, MSAA_SAMPLES),
+                build_skybox_pipeline(ctx, &targets.multisampled_subsurface, MSAA_SAMPLES),
+            ],
+        ];
 
         // Repeat in u so the seam wraps, clamp in v so the poles do not fold
         // across to the opposite hemisphere.
@@ -192,12 +197,10 @@ impl EnvironmentPass {
         .unwrap();
 
         Self {
-            bake_rp,
             bake_pipeline,
             prefilter_pipeline,
             equirect_sampler,
-            skybox_pipeline,
-            skybox_subsurface_pipeline,
+            skybox_pipelines,
             fallback_cube: white_cube(ctx),
             cube_sampler,
             cube: None,
@@ -283,7 +286,6 @@ impl EnvironmentPass {
         let equirect = upload_equirect(ctx, pixels, extent);
         self.cube = Some(bake(
             ctx,
-            &self.bake_rp,
             &self.bake_pipeline,
             &self.prefilter_pipeline,
             &self.equirect_sampler,
@@ -296,12 +298,13 @@ impl EnvironmentPass {
     /// geometry, so the depth test rejects it everywhere something was drawn.
     pub fn record_skybox(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         view: &FrameView,
         extent: [u32; 2],
         settings: &EnvironmentSettings,
         subsurface: bool,
+        msaa: bool,
         fog: Subbuffer<GpuFog>,
         fog_volume: Arc<ImageView>,
         fog_sampler: Arc<Sampler>,
@@ -314,11 +317,7 @@ impl EnvironmentPass {
         }
 
         // Whichever render pass the executor opened around this call.
-        let pipeline = if subsurface {
-            &self.skybox_subsurface_pipeline
-        } else {
-            &self.skybox_pipeline
-        };
+        let pipeline = &self.skybox_pipelines[msaa as usize][subsurface as usize];
 
         let set = DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
@@ -350,28 +349,18 @@ impl EnvironmentPass {
         builder
             .set_viewport(
                 0,
-                [Viewport {
+                &[Viewport {
                     offset: [0.0, 0.0],
                     extent: [extent[0] as f32, extent[1] as f32],
                     depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
+                }],
             )
-            .unwrap()
-            .bind_pipeline_graphics(pipeline.clone())
-            .unwrap()
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                pipeline.layout().clone(),
-                0,
-                vec![set],
-            )
-            .unwrap()
+            .bind_pipeline_graphics(&pipeline)
+            .bind_descriptor_sets(PipelineBindPoint::Graphics, pipeline.layout(), 0, &[set])
             .push_constants(
-                pipeline.layout().clone(),
+                pipeline.layout(),
                 0,
-                SkyboxPush {
+                &SkyboxPush {
                     inv_view_rot_proj: matrix.to_cols_array_2d(),
                     params: [
                         settings.calibration(self.measured_sky),
@@ -380,9 +369,8 @@ impl EnvironmentPass {
                         0.0,
                     ],
                 },
-            )
-            .unwrap();
-        unsafe { builder.draw(3, 1, 0, 0).unwrap() };
+            );
+        builder.draw(3, 1, 0, 0);
     }
 }
 
@@ -418,16 +406,19 @@ fn upload_equirect(ctx: &VkContext, pixels: &[f32], extent: [u32; 2]) -> Arc<Ima
     )
     .expect("failed to create equirect image");
 
-    let mut builder = AutoCommandBufferBuilder::primary(
-        ctx.command_buffer_allocator.clone(),
-        ctx.queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
-    builder
-        .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging, image.clone()))
-        .unwrap();
-    submit_and_wait(ctx, builder);
+    let mut builder = Recorder::new(ctx);
+    builder.image_barrier(record::to_transfer_dst(
+        image.clone(),
+        record::whole_image(&image),
+        ImageLayout::Undefined,
+    ));
+    builder.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging, image.clone()));
+    builder.image_barrier(record::to_shader_read(
+        image.clone(),
+        record::whole_image(&image),
+        ImageLayout::TransferDstOptimal,
+    ));
+    builder.submit_and_wait(ctx);
 
     ImageView::new_default(image).expect("failed to create equirect view")
 }
@@ -487,8 +478,7 @@ fn cube_view(image: &Arc<Image>) -> Arc<ImageView> {
 
 /// Draw all six faces of one mip level, with per-face push constants.
 fn render_level<P: BufferContents>(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    render_pass: &Arc<RenderPass>,
+    builder: &mut Recorder,
     pipeline: &Arc<GraphicsPipeline>,
     set: &Arc<DescriptorSet>,
     image: &Arc<Image>,
@@ -497,56 +487,46 @@ fn render_level<P: BufferContents>(
 ) {
     let size = (FACE_SIZE >> mip).max(1);
 
-    for face in 0..6u32 {
-        let framebuffer = Framebuffer::new(
-            render_pass.clone(),
-            FramebufferCreateInfo {
-                attachments: vec![face_view(image, face, mip)],
-                // Stated, not derived: left to itself vulkano takes the extent
-                // from the image, which is level 0's, and every level below it
-                // is then smaller than the framebuffer claiming to hold it.
-                extent: [size, size],
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    // Fresh from `Image::new`, so this level is `Undefined` and there is
+    // nothing to preserve. All six faces at once: the loop below renders them
+    // one at a time, but they are one subresource range and one transition.
+    builder.image_barrier(record::to_color_attachment(
+        image.clone(),
+        record::levels(image, mip..mip + 1),
+    ));
 
+    for face in 0..6u32 {
         builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![None],
-                    ..RenderPassBeginInfo::framebuffer(framebuffer)
-                },
-                SubpassBeginInfo {
-                    contents: SubpassContents::Inline,
-                    ..Default::default()
-                },
-            )
-            .unwrap()
+            .begin_rendering(RenderingInfo {
+                color_attachments: vec![Some(RenderingAttachmentInfo {
+                    load_op: AttachmentLoadOp::DontCare,
+                    store_op: AttachmentStoreOp::Store,
+                    ..RenderingAttachmentInfo::image_view(face_view(image, face, mip))
+                })],
+                // Stated, not derived: left to itself this is taken from the
+                // view's image, which is level 0's, and every level below it is
+                // then smaller than the area claiming to cover it.
+                render_area_extent: [size, size],
+                ..Default::default()
+            })
             .set_viewport(
                 0,
-                [Viewport {
+                &[Viewport {
                     offset: [0.0, 0.0],
                     extent: [size as f32, size as f32],
                     depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
+                }],
             )
-            .unwrap()
-            .bind_pipeline_graphics(pipeline.clone())
-            .unwrap()
+            .bind_pipeline_graphics(&pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                pipeline.layout().clone(),
+                pipeline.layout(),
                 0,
-                vec![set.clone()],
+                &[set.clone()],
             )
-            .unwrap()
-            .push_constants(pipeline.layout().clone(), 0, push(face as usize))
-            .unwrap();
-        unsafe { builder.draw(3, 1, 0, 0).unwrap() };
-        builder.end_render_pass(Default::default()).unwrap();
+            .push_constants(pipeline.layout(), 0, &push(face as usize));
+        builder.draw(3, 1, 0, 0);
+        builder.end_rendering();
     }
 }
 
@@ -556,12 +536,22 @@ fn render_level<P: BufferContents>(
 /// exists so the prefilter can *read* from a level matched to how densely its
 /// samples land. `texture.rs` cannot be reused because its chain walks layer 0
 /// alone.
-fn generate_cube_mips(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    image: &Arc<Image>,
-) {
+fn generate_cube_mips(builder: &mut Recorder, image: &Arc<Image>) {
     let base = image.extent();
     let aspects = image.subresource_layers().aspects;
+
+    // Level 0 was rendered, not copied, so it enters as a colour attachment;
+    // every level below it has never been touched.
+    builder
+        .image_barrier(record::color_to_transfer_src(
+            image.clone(),
+            record::levels(image, 0..1),
+        ))
+        .image_barrier(record::to_transfer_dst(
+            image.clone(),
+            record::levels(image, 1..image.mip_levels()),
+            ImageLayout::Undefined,
+        ));
 
     for level in 1..image.mip_levels() {
         let region = ImageBlit {
@@ -580,14 +570,38 @@ fn generate_cube_mips(
             ..Default::default()
         };
 
-        builder
-            .blit_image(BlitImageInfo {
-                regions: vec![region].into(),
-                filter: Filter::Linear,
-                ..BlitImageInfo::images(image.clone(), image.clone())
-            })
-            .unwrap();
+        // Level `level - 1` must finish being written before it is read, and be
+        // in the source layout when it is. Level 0 already is, from the barrier
+        // above; the rest arrive here as this loop's previous destination.
+        if level > 1 {
+            builder.image_barrier(record::transfer_dst_to_src(
+                image.clone(),
+                record::levels(image, level - 1..level),
+            ));
+        }
+
+        builder.blit_image(BlitImageInfo {
+            regions: vec![region].into(),
+            filter: Filter::Linear,
+            ..BlitImageInfo::images(image.clone(), image.clone())
+        });
     }
+
+    // What the chain left behind: every level but the last was read as a blit
+    // source, the last was only ever written. The prefilter samples the whole
+    // pyramid as one cube, so both runs have to reach the same layout.
+    let last = image.mip_levels() - 1;
+    builder
+        .image_barrier(record::to_shader_read(
+            image.clone(),
+            record::levels(image, 0..last),
+            ImageLayout::TransferSrcOptimal,
+        ))
+        .image_barrier(record::to_shader_read(
+            image.clone(),
+            record::levels(image, last..image.mip_levels()),
+            ImageLayout::TransferDstOptimal,
+        ));
 }
 
 /// Project the equirect into a cubemap, then prefilter that into the specular
@@ -599,7 +613,6 @@ fn generate_cube_mips(
 /// dropped on return, so only the prefiltered chain is retained.
 fn bake(
     ctx: &VkContext,
-    render_pass: &Arc<RenderPass>,
     project: &Arc<GraphicsPipeline>,
     prefilter: &Arc<GraphicsPipeline>,
     equirect_sampler: &Arc<Sampler>,
@@ -632,36 +645,23 @@ fn bake(
     )
     .unwrap();
 
-    let mut builder = AutoCommandBufferBuilder::primary(
-        ctx.command_buffer_allocator.clone(),
-        ctx.queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
+    let mut builder = Recorder::new(ctx);
 
-    render_level(
-        &mut builder,
-        render_pass,
-        project,
-        &project_set,
-        &source,
-        0,
-        |face| {
-            let (forward, right, up) = FACES[face];
-            FacePush {
-                forward: [forward[0], forward[1], forward[2], 0.0],
-                right: [right[0], right[1], right[2], 0.0],
-                up: [up[0], up[1], up[2], 0.0],
-            }
-        },
-    );
+    render_level(&mut builder, project, &project_set, &source, 0, |face| {
+        let (forward, right, up) = FACES[face];
+        FacePush {
+            forward: [forward[0], forward[1], forward[2], 0.0],
+            right: [right[0], right[1], right[2], 0.0],
+            up: [up[0], up[1], up[2], 0.0],
+        }
+    });
     generate_cube_mips(&mut builder, &source);
 
     // Split so the pyramid is complete before anything reads it. Within one
     // command buffer the blits and the prefilter draws would be ordered, but
     // the prefilter samples the source as a *cube* while the blit chain writes
     // it level by level, and the two views want it in different layouts.
-    submit_and_wait(ctx, builder);
+    builder.submit_and_wait(ctx);
 
     let prefilter_set = DescriptorSet::new(
         ctx.descriptor_set_allocator.clone(),
@@ -674,12 +674,7 @@ fn bake(
     )
     .unwrap();
 
-    let mut builder = AutoCommandBufferBuilder::primary(
-        ctx.command_buffer_allocator.clone(),
-        ctx.queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
+    let mut builder = Recorder::new(ctx);
 
     for mip in 0..SPECULAR_MIPS {
         // Level 0 is roughness 0 and the rest walk up to 1. The shader samples
@@ -688,7 +683,6 @@ fn bake(
         let roughness = mip as f32 / (SPECULAR_MIPS - 1) as f32;
         render_level(
             &mut builder,
-            render_pass,
             prefilter,
             &prefilter_set,
             &specular,
@@ -705,7 +699,11 @@ fn bake(
         );
     }
 
-    submit_and_wait(ctx, builder);
+    builder.image_barrier(record::color_to_shader_read(
+        specular.clone(),
+        record::levels(&specular, 0..SPECULAR_MIPS),
+    ));
+    builder.submit_and_wait(ctx);
 
     cube_view(&specular)
 }
@@ -749,45 +747,15 @@ fn white_cube(ctx: &VkContext) -> Arc<ImageView> {
     )
     .expect("failed to create fallback cube");
 
-    let mut builder = AutoCommandBufferBuilder::primary(
-        ctx.command_buffer_allocator.clone(),
-        ctx.queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
-    builder
-        .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging, image.clone()))
-        .unwrap();
-    submit_and_wait(ctx, builder);
+    let mut builder = Recorder::new(ctx);
+    builder.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging, image.clone()));
+    builder.submit_and_wait(ctx);
 
     cube_view(&image)
 }
 
-fn submit_and_wait(ctx: &VkContext, builder: AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
-    sync::now(ctx.device.clone())
-        .then_execute(ctx.queue.clone(), builder.build().unwrap())
-        .unwrap()
-        .then_signal_fence_and_flush()
-        .unwrap()
-        .wait(None)
-        .unwrap();
-}
-
-fn bake_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
-    vulkano::single_pass_renderpass!(
-        device.clone(),
-        attachments: {
-            color: { format: CUBE_FORMAT, samples: 1, load_op: DontCare, store_op: Store },
-        },
-        pass: { color: [color], depth_stencil: {} },
-    )
-    .unwrap()
-}
-
-fn build_bake_pipeline(
-    device: &Arc<Device>,
-    render_pass: &Arc<RenderPass>,
-) -> Arc<GraphicsPipeline> {
+fn build_bake_pipeline(ctx: &VkContext) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = fullscreen_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -807,11 +775,9 @@ fn build_bake_pipeline(
             .unwrap(),
     )
     .unwrap();
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),
@@ -821,21 +787,19 @@ fn build_bake_pipeline(
             multisample_state: Some(MultisampleState::default()),
             depth_stencil_state: None,
             color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
+                1,
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(rendering::pipeline_info(&[CUBE_FORMAT], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
     .unwrap()
 }
 
-fn build_prefilter_pipeline(
-    device: &Arc<Device>,
-    render_pass: &Arc<RenderPass>,
-) -> Arc<GraphicsPipeline> {
+fn build_prefilter_pipeline(ctx: &VkContext) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = fullscreen_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -855,11 +819,9 @@ fn build_prefilter_pipeline(
             .unwrap(),
     )
     .unwrap();
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),
@@ -869,11 +831,11 @@ fn build_prefilter_pipeline(
             multisample_state: Some(MultisampleState::default()),
             depth_stencil_state: None,
             color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
+                1,
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(rendering::pipeline_info(&[CUBE_FORMAT], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
@@ -881,9 +843,11 @@ fn build_prefilter_pipeline(
 }
 
 fn build_skybox_pipeline(
-    device: &Arc<Device>,
-    render_pass: &Arc<RenderPass>,
+    ctx: &VkContext,
+    target: &PipelineRenderingCreateInfo,
+    samples: SampleCount,
 ) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = skybox_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -903,19 +867,22 @@ fn build_skybox_pipeline(
             .unwrap(),
     )
     .unwrap();
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),
             input_assembly_state: Some(InputAssemblyState::default()),
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState::default()),
+            // Passed in rather than read back off a render pass object: a
+            // description carries formats, not a sample count, and a pipeline
+            // whose count disagrees with the attachments it is used with is
+            // invalid. The two travel together from `ForwardTargets` for that
+            // reason.
             multisample_state: Some(MultisampleState {
-                rasterization_samples: MSAA_SAMPLES,
+                rasterization_samples: samples,
                 ..Default::default()
             }),
             // The triangle sits exactly on the far plane, so the test has to
@@ -931,13 +898,13 @@ fn build_skybox_pipeline(
                 ..Default::default()
             }),
             // Masked past the first attachment: this shader declares one output,
-            // and the subsurface render pass has two. The sky covers most of the
+            // and the subsurface target shape has two. The sky covers most of the
             // frame, so an undeclared output left unmasked would be undefined data
             // sitting under every blur tap near a silhouette — see
             // `co_tenant_blend_states`.
-            color_blend_state: Some(super::forward::co_tenant_blend_states(&subpass)),
+            color_blend_state: Some(super::forward::co_tenant_blend_states(target)),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(target.clone().into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )

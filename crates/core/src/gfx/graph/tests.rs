@@ -1,6 +1,6 @@
 use vulkano::format::Format;
 use vulkano::image::ImageLayout;
-use vulkano::sync::PipelineStages;
+use vulkano::sync::{AccessFlags, PipelineStages};
 
 use super::*;
 
@@ -610,4 +610,727 @@ fn an_upsample_cannot_accumulate_into_the_level_it_read() {
         passes.contains(&"down1") && passes.contains(&"up0"),
         "{passes:?}"
     );
+}
+
+/// The default, and what every test above compiles: one queue, one segment,
+/// covering the whole order. A frame that asked for nothing else must be
+/// planned exactly as it was before there was anything to ask for.
+#[test]
+fn a_frame_that_did_not_ask_for_a_second_queue_is_one_graphics_segment() {
+    let mut builder = GraphBuilder::new();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let scene = builder.create_image("scene", image());
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(scene, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("post", PassKind::Compute)
+        .access(scene, Access::Sampled)
+        .access(target, Access::StorageWrite)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    assert_eq!(graph.segments().len(), 1);
+    assert_eq!(graph.segments()[0].queue, Queue::Graphics);
+    assert_eq!(graph.segments()[0].passes, 0..2);
+}
+
+/// The shape the split exists to produce: the frame's graphics head, the
+/// compute tail behind it, and the one graphics pass that puts the result on
+/// the swapchain. Three segments and exactly one queue change in the middle,
+/// because every queue change costs a semaphore and an ownership transfer.
+#[test]
+fn the_compute_tail_is_split_onto_the_async_queue() {
+    let mut builder = GraphBuilder::new();
+    builder.request_async_compute();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let scene = builder.create_image("scene", image());
+    let blurred = builder.create_image("blurred", image());
+    let graded = builder.create_image("graded", image());
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(scene, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("blur", PassKind::Compute)
+        .access(scene, Access::Sampled)
+        .access(blurred, Access::StorageWrite)
+        .build();
+    builder
+        .pass("grade", PassKind::Compute)
+        .access(blurred, Access::Sampled)
+        .access(graded, Access::StorageWrite)
+        .build();
+    builder
+        .pass("tonemap", PassKind::Inline)
+        .access(graded, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    let queues: Vec<_> = graph.segments().iter().map(|s| s.queue).collect();
+    assert_eq!(
+        queues,
+        vec![Queue::Graphics, Queue::AsyncCompute, Queue::Graphics],
+    );
+    assert_eq!(graph.segments()[0].passes, 0..1);
+    assert_eq!(graph.segments()[1].passes, 1..3);
+    assert_eq!(graph.segments()[2].passes, 3..4);
+}
+
+/// A compute pass with graphics work still to come after it stays on the
+/// graphics queue.
+///
+/// The frame's interleaved dispatches — the depth pyramid, the fog grid, the
+/// transparency composite — are each one queue change out and one back for a
+/// pass the graphics queue would have run anyway. The tail is the only place
+/// where crossing pays, because it is the only place where what follows on the
+/// graphics queue belongs to the *next* frame.
+#[test]
+fn a_compute_pass_with_graphics_work_after_it_stays_on_the_graphics_queue() {
+    let mut builder = GraphBuilder::new();
+    builder.request_async_compute();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let depth = builder.create_image("depth", image());
+    let pyramid = builder.create_image("pyramid", image());
+    let scene = builder.create_image("scene", image());
+    let graded = builder.create_image("graded", image());
+    builder
+        .pass("prepass", PassKind::Inline)
+        .access(depth, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("pyramid", PassKind::Compute)
+        .access(depth, Access::Sampled)
+        .access(pyramid, Access::StorageWrite)
+        .build();
+    builder
+        .pass("forward", PassKind::Inline)
+        .access(pyramid, Access::Sampled)
+        .access(scene, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("grade", PassKind::Compute)
+        .access(scene, Access::Sampled)
+        .access(graded, Access::StorageWrite)
+        .build();
+    builder
+        .pass("tonemap", PassKind::Inline)
+        .access(graded, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    assert_eq!(
+        graph.segments().iter().map(|s| s.queue).collect::<Vec<_>>(),
+        vec![Queue::Graphics, Queue::AsyncCompute, Queue::Graphics],
+    );
+    // `pyramid` is inside the head, not a segment of its own.
+    assert_eq!(graph.segments()[0].passes, 0..3);
+    assert_eq!(graph.segments()[1].passes, 3..4);
+    assert_eq!(graph.segments()[2].passes, 4..5);
+}
+
+/// A resource written on one queue and read on the other has to be created
+/// able to be: an image in `SharingMode::Exclusive` belongs to one queue family
+/// at a time, and a read from the other is undefined without an ownership
+/// transfer nobody records. The compiler names them so the executor can create
+/// them concurrent.
+///
+/// Concurrent rather than a derived release/acquire pair, which is the more
+/// precise answer and was the first design: ownership is per resource *and*
+/// wraps across the frame boundary, so the pair only stays balanced if the
+/// frame also hands every resource back to whichever queue touches it first
+/// next frame — an invariant that fails silently, on contents rather than on a
+/// validation message, and fails on drivers this machine cannot run. What
+/// concurrent costs instead is colour compression, on these resources only, and
+/// that is a number rather than a risk.
+#[test]
+fn a_resource_read_from_a_second_queue_is_named_as_concurrent() {
+    let mut builder = GraphBuilder::new();
+    builder.request_async_compute();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let scene = builder.create_image("scene", image());
+    let scratch = builder.create_image("scratch", image());
+    let graded = builder.create_image("graded", image());
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(scene, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("blur", PassKind::Compute)
+        .access(scene, Access::Sampled)
+        .access(scratch, Access::StorageWrite)
+        .build();
+    builder
+        .pass("grade", PassKind::Compute)
+        .access(scratch, Access::Sampled)
+        .access(graded, Access::StorageWrite)
+        .build();
+    builder
+        .pass("tonemap", PassKind::Inline)
+        .access(graded, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    let shared: Vec<&str> = graph
+        .concurrent()
+        .map(|id| graph.resource_name(id))
+        .collect();
+    // `scene` is written on graphics and sampled on compute; `graded` is
+    // written on compute and sampled on graphics; `target` is graphics only.
+    assert!(shared.contains(&"scene"), "{shared:?}");
+    assert!(shared.contains(&"graded"), "{shared:?}");
+    assert!(!shared.contains(&"target"), "{shared:?}");
+    // `scratch` never leaves the async segment.
+    assert!(!shared.contains(&"scratch"), "{shared:?}");
+}
+
+/// The barriers the frame already derived are unchanged by the split.
+///
+/// A semaphore between two segments makes every write before the signal
+/// available to everything after the wait, so the only thing a queue boundary
+/// adds over an ordinary pass boundary is that execution dependency. The
+/// layout transition the reader needs is the one the compiler always emitted,
+/// in the place it always emitted it — which is also why the golden plan does
+/// not move when a frame gains a second queue.
+#[test]
+fn the_split_does_not_move_a_barrier() {
+    let build = |async_compute: bool| {
+        let mut builder = GraphBuilder::new();
+        if async_compute {
+            builder.request_async_compute();
+        }
+        let target = builder.import_image(
+            "target",
+            image(),
+            ImageLayout::Undefined,
+            ImageLayout::PresentSrc,
+        );
+        let scene = builder.create_image("scene", image());
+        let graded = builder.create_image("graded", image());
+        builder
+            .pass("draw", PassKind::Inline)
+            .access(scene, Access::ColorAttachment)
+            .build();
+        builder
+            .pass("grade", PassKind::Compute)
+            .access(scene, Access::Sampled)
+            .access(graded, Access::StorageWrite)
+            .build();
+        builder
+            .pass("tonemap", PassKind::Inline)
+            .access(graded, Access::Sampled)
+            .access(target, Access::ColorAttachment)
+            .build();
+        compile(builder).unwrap()
+    };
+
+    let one = build(false);
+    let two = build(true);
+    assert_eq!(one.order(), two.order());
+
+    // Same resources, same layouts, same place, whichever queue the pass landed
+    // on. Only the stage masks of the async segment differ.
+    let transitions =
+        |graph: &FrameGraph, slot: usize| -> Vec<(&'static str, ImageLayout, ImageLayout)> {
+            graph
+                .barriers_before(slot)
+                .iter()
+                .map(|barrier| {
+                    (
+                        graph.resource_name(barrier.resource),
+                        barrier.old_layout,
+                        barrier.new_layout,
+                    )
+                })
+                .collect()
+        };
+    for slot in 0..one.order().len() {
+        assert_eq!(transitions(&one, slot), transitions(&two, slot), "{slot}");
+        if two.slot_queue(slot) == Queue::Graphics {
+            assert_eq!(
+                one.barriers_before(slot),
+                two.barriers_before(slot),
+                "{slot}"
+            );
+        }
+    }
+    assert_eq!(one.final_barriers(), two.final_barriers());
+}
+
+/// Every slot is covered exactly once, in order — the same property the
+/// recording partition has, and for the same reason: a segment that dropped a
+/// slot would drop a pass.
+#[test]
+fn segments_cover_every_slot_in_order() {
+    let mut builder = GraphBuilder::new();
+    builder.request_async_compute();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let scene = builder.create_image("scene", image());
+    let graded = builder.create_image("graded", image());
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(scene, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("grade", PassKind::Compute)
+        .access(scene, Access::Sampled)
+        .access(graded, Access::StorageWrite)
+        .build();
+    builder
+        .pass("tonemap", PassKind::Inline)
+        .access(graded, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("overlay", PassKind::Raw)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    let mut next = 0;
+    for segment in graph.segments() {
+        assert_eq!(segment.passes.start, next);
+        next = segment.passes.end;
+    }
+    assert_eq!(next, graph.order().len());
+    // The raw pass belongs to the trailing graphics segment: it submits itself,
+    // and it submits on the queue the tonemap it draws over ran on.
+    assert_eq!(graph.segments().last().unwrap().queue, Queue::Graphics);
+}
+
+/// A frame with nothing to put on the second queue gets one segment, even
+/// having asked for one. The split is derived from the frame, not switched on.
+#[test]
+fn a_frame_with_no_compute_tail_is_not_split() {
+    let mut builder = GraphBuilder::new();
+    builder.request_async_compute();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let scene = builder.create_image("scene", image());
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(scene, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("tonemap", PassKind::Inline)
+        .access(scene, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    assert_eq!(graph.segments().len(), 1);
+    assert_eq!(graph.segments()[0].queue, Queue::Graphics);
+}
+
+/// A barrier recorded on the async queue may only name stages that queue
+/// supports.
+///
+/// `vkCmdPipelineBarrier2` on a compute-only family rejects
+/// `ColorAttachmentOutput` outright — VUID-vkCmdPipelineBarrier2-srcStageMask-03849
+/// — and the first barrier of the compute tail sources exactly that, because
+/// what it waits for is the forward pass's colour write. The semaphore between
+/// the two segments is what really carries that dependency: a wait makes every
+/// write submitted before the signal both available and visible, so the barrier
+/// is left with the layout transition and the visibility half, and sources
+/// itself at `TopOfPipe` with no access.
+///
+/// Narrowed here rather than where it is recorded, because it is a property of
+/// the plan — the golden file should show the frame the driver is actually
+/// told about.
+#[test]
+fn a_barrier_on_the_async_queue_names_only_stages_that_queue_has() {
+    let mut builder = GraphBuilder::new();
+    builder.request_async_compute();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let scene = builder.create_image("scene", image());
+    let graded = builder.create_image("graded", image());
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(scene, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("grade", PassKind::Compute)
+        .access(scene, Access::Sampled)
+        .access(graded, Access::StorageWrite)
+        .build();
+    builder
+        .pass("tonemap", PassKind::Inline)
+        .access(graded, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    let compute_only = PipelineStages::TOP_OF_PIPE
+        | PipelineStages::DRAW_INDIRECT
+        | PipelineStages::COMPUTE_SHADER
+        | PipelineStages::ALL_TRANSFER
+        | PipelineStages::BOTTOM_OF_PIPE
+        | PipelineStages::HOST
+        | PipelineStages::ALL_COMMANDS;
+
+    for slot in 0..graph.order().len() {
+        if graph.slot_queue(slot) != Queue::AsyncCompute {
+            continue;
+        }
+        for barrier in graph.barriers_before(slot) {
+            assert!(
+                compute_only.contains(barrier.src_stages),
+                "slot {slot}: {:?}",
+                barrier.src_stages,
+            );
+            assert!(
+                compute_only.contains(barrier.dst_stages),
+                "slot {slot}: {:?}",
+                barrier.dst_stages,
+            );
+        }
+    }
+
+    // And specifically: the one that used to source the colour write now
+    // sources nothing, because the semaphore already did.
+    let scene_barrier = graph
+        .barriers_before(1)
+        .iter()
+        .find(|barrier| graph.resource_name(barrier.resource) == "scene")
+        .expect("the tail still transitions the image it samples");
+    assert_eq!(scene_barrier.src_stages, PipelineStages::TOP_OF_PIPE);
+    assert_eq!(scene_barrier.src_access, AccessFlags::empty());
+    assert_eq!(
+        scene_barrier.old_layout,
+        ImageLayout::ColorAttachmentOptimal
+    );
+    assert_eq!(scene_barrier.new_layout, ImageLayout::ShaderReadOnlyOptimal);
+    assert_eq!(scene_barrier.dst_stages, PipelineStages::COMPUTE_SHADER);
+}
+
+/// The graphics segments keep every stage they had. Narrowing is for the queue
+/// that cannot express them, not a general loosening.
+#[test]
+fn a_barrier_on_the_graphics_queue_keeps_its_stages() {
+    let mut builder = GraphBuilder::new();
+    builder.request_async_compute();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let scene = builder.create_image("scene", image());
+    let graded = builder.create_image("graded", image());
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(scene, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("grade", PassKind::Compute)
+        .access(scene, Access::Sampled)
+        .access(graded, Access::StorageWrite)
+        .build();
+    builder
+        .pass("tonemap", PassKind::Inline)
+        .access(graded, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    let graded_barrier = graph
+        .barriers_before(2)
+        .iter()
+        .find(|barrier| graph.resource_name(barrier.resource) == "graded")
+        .expect("the tonemap transitions what it samples");
+    assert_eq!(graded_barrier.src_stages, Access::StorageWrite.stages());
+    assert_eq!(graded_barrier.dst_stages, Access::Sampled.stages());
+}
+
+/// A dependency between two dispatches inside the compute tail survives the
+/// narrowing.
+///
+/// The bloom chain is a run of these: each level reads the one before it, on
+/// the same queue, with nothing between them but the barrier. Nothing else
+/// expresses that ordering — there is no semaphore inside a segment — so
+/// dropping it is a race, and it is the exact race the first narrowing this
+/// module grew would have caused, because `Access::stages` widens every shader
+/// access to vertex | fragment | compute and every one of those barriers
+/// therefore names two stages the queue does not have.
+#[test]
+fn a_dependency_inside_the_async_tail_is_kept() {
+    let mut builder = GraphBuilder::new();
+    builder.request_async_compute();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let scene = builder.create_image("scene", image());
+    let down = builder.create_image("down", image());
+    let up = builder.create_image("up", image());
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(scene, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("downsample", PassKind::Compute)
+        .access(scene, Access::Sampled)
+        .access(down, Access::StorageWrite)
+        .build();
+    builder
+        .pass("upsample", PassKind::Compute)
+        .access(down, Access::Sampled)
+        .access(up, Access::StorageWrite)
+        .build();
+    builder
+        .pass("tonemap", PassKind::Inline)
+        .access(up, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    assert_eq!(graph.slot_queue(2), Queue::AsyncCompute);
+    let barrier = graph
+        .barriers_before(2)
+        .iter()
+        .find(|barrier| graph.resource_name(barrier.resource) == "down")
+        .expect("the upsample waits for the level it reads");
+
+    // Narrowed to the one stage this queue has, and not collapsed: the write it
+    // waits for happened here, so this barrier is the only thing that orders
+    // the two.
+    assert_eq!(barrier.src_stages, PipelineStages::COMPUTE_SHADER);
+    assert_eq!(
+        barrier.src_access,
+        Access::StorageWrite.flags(),
+        "the write must still be made available",
+    );
+    assert_eq!(barrier.dst_stages, PipelineStages::COMPUTE_SHADER);
+    assert_eq!(barrier.dst_access, Access::Sampled.flags());
+    assert_eq!(barrier.old_layout, ImageLayout::General);
+    assert_eq!(barrier.new_layout, ImageLayout::ShaderReadOnlyOptimal);
+}
+
+/// A four-pass chain where `first` is finished with before `second` is touched,
+/// so the two are never alive at once and one allocation can serve both.
+fn aliasable_chain(second: ImageDesc) -> FrameGraph {
+    let mut builder = GraphBuilder::new();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let first = builder.create_image("first", image());
+    let second = builder.create_image("second", second);
+
+    builder
+        .pass("write_first", PassKind::Inline)
+        .access(first, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("read_first", PassKind::Inline)
+        .access(first, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("write_second", PassKind::Inline)
+        .access(second, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("read_second", PassKind::Inline)
+        .access(second, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    compile(builder).unwrap()
+}
+
+fn group_names(graph: &FrameGraph) -> Vec<Vec<&'static str>> {
+    graph
+        .alias_groups()
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|&id| graph.resource_name(id))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The whole feature: two images the frame is never holding at the same time
+/// are one allocation, and the graph is the only thing that knows it.
+#[test]
+fn two_transients_that_are_never_alive_at_once_share_an_allocation() {
+    let graph = aliasable_chain(image());
+    assert_eq!(group_names(&graph), vec![vec!["first", "second"]]);
+    // In lifetime order, because that is the order the memory changes hands in.
+    let (_, second) = graph
+        .transient_images()
+        .find(|(id, _)| graph.resource_name(*id) == "second")
+        .unwrap();
+    assert_eq!(second.alias, Some(0));
+}
+
+/// A resource is live from the first slot that touches it to the last, and
+/// nothing outside that window may be handed its memory.
+#[test]
+fn a_lifetime_spans_the_slots_that_touch_the_resource() {
+    let graph = aliasable_chain(image());
+    let lifetime = |name: &str| {
+        let (id, _) = graph
+            .transient_images()
+            .find(|(id, _)| graph.resource_name(*id) == name)
+            .unwrap();
+        graph.lifetime(id).unwrap()
+    };
+    assert_eq!(lifetime("first"), 0..2);
+    assert_eq!(lifetime("second"), 2..4);
+}
+
+/// The reason the two halves of a ping-pong stay two allocations: `blur_x` is
+/// still being read in the slot `blur_y` is first written.
+#[test]
+fn transients_alive_in_the_same_slot_are_never_aliased() {
+    let mut builder = GraphBuilder::new();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let blur_x = builder.create_image("blur_x", image());
+    let blur_y = builder.create_image("blur_y", image());
+
+    builder
+        .pass("horizontal", PassKind::Inline)
+        .access(blur_x, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("vertical", PassKind::Inline)
+        .access(blur_x, Access::Sampled)
+        .access(blur_y, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("composite", PassKind::Inline)
+        .access(blur_y, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    assert!(group_names(&graph).is_empty());
+}
+
+/// Only images whose allocations are interchangeable share one, because
+/// "interchangeable" is the only thing the compiler can establish without a
+/// `Device` to ask for memory requirements.
+#[test]
+fn transients_of_different_shape_are_never_aliased() {
+    let graph = aliasable_chain(ImageDesc::new(Format::R16G16B16A16_SFLOAT));
+    assert!(group_names(&graph).is_empty());
+}
+
+/// A memoryless target asks for a memory type the aliased block would not be
+/// allocated from, and on the tiler it exists for it costs nothing to leave
+/// alone.
+#[test]
+fn a_memoryless_target_is_never_aliased() {
+    let mut builder = GraphBuilder::new();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let msaa = builder.create_image("msaa", image());
+    let later = builder.create_image("later", image());
+
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(msaa, Access::ColorAttachment)
+        .access(target, Access::ResolveAttachment)
+        .build();
+    builder
+        .pass("write_later", PassKind::Inline)
+        .access(later, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("read_later", PassKind::Inline)
+        .access(later, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    assert!(group_names(&graph).is_empty());
+}
+
+/// The dependency aliasing adds, and the only thing that makes it safe: the
+/// first pass to write the shared memory waits for the last pass that read what
+/// was in it, even though the two name different resources.
+#[test]
+fn the_first_write_of_an_aliased_image_waits_for_the_reader_before_it() {
+    let graph = aliasable_chain(image());
+    let [barrier] = graph.barriers_before(2) else {
+        panic!("expected one barrier before `write_second`");
+    };
+    assert_eq!(graph.resource_name(barrier.resource), "second");
+    // Its contents are gone, so it enters undefined — and the memory under it
+    // is still being sampled by `read_first` until that pass finishes.
+    assert_eq!(barrier.old_layout, ImageLayout::Undefined);
+    assert_eq!(barrier.new_layout, ImageLayout::ColorAttachmentOptimal);
+    // Both halves of what the memory was doing: the pass that wrote `first` and
+    // the pass that sampled it. A read of the old resource is a read of this
+    // memory, so it is part of what the new write waits for.
+    assert_eq!(
+        barrier.src_stages,
+        Access::ColorAttachment.stages() | Access::Sampled.stages()
+    );
+    assert_eq!(barrier.dst_stages, PipelineStages::COLOR_ATTACHMENT_OUTPUT);
+}
+
+/// Without aliasing that same barrier sources nothing, which is what makes the
+/// one above a dependency the graph added rather than one it already had.
+#[test]
+fn the_first_write_of_an_unaliased_image_waits_for_nothing() {
+    let graph = aliasable_chain(ImageDesc::new(Format::R16G16B16A16_SFLOAT));
+    let [barrier] = graph.barriers_before(2) else {
+        panic!("expected one barrier before `write_second`");
+    };
+    assert_eq!(barrier.src_stages, PipelineStages::TOP_OF_PIPE);
 }

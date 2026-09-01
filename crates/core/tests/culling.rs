@@ -76,6 +76,7 @@ fn visible(world: &mut World, camera: Camera) -> usize {
         ASPECT,
         &CascadeSet::default(),
         &ShadowAtlas::default(),
+        false,
         &mut geometry,
     );
     geometry.visible().len()

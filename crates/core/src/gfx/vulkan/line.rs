@@ -13,24 +13,27 @@ use std::sync::Arc;
 
 use crate::scene::DebugLine;
 
+use super::MSAA_SAMPLES;
+use super::context::VkContext;
+use super::forward::ForwardTargets;
+use super::record::{Arena, Recorder};
 use super::taa::FrameView;
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
-use vulkano::device::Device;
-use vulkano::memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::image::SampleCount;
+use vulkano::memory::allocator::MemoryTypeFilter;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
+use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
 use vulkano::pipeline::graphics::vertex_input::{Vertex as VertexTrait, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{RenderPass, Subpass};
 
 /// One endpoint of a debug line: world-space position + RGBA colour. Two of
 /// these make a segment, drawn with `PrimitiveTopology::LineList`.
@@ -44,26 +47,18 @@ pub struct LineVertex {
 }
 
 pub struct LinePass {
-    pipeline: Arc<GraphicsPipeline>,
-    /// The same pipeline against the forward pass's subsurface render pass, which
-    /// has a colour attachment more. A pipeline is tied to the render pass it was
-    /// built for, so sharing one across both is not available — see
-    /// [`ForwardPass::subsurface_render_pass`](super::forward::ForwardPass) for why
-    /// both exist for the whole session rather than being rebuilt on the toggle.
-    subsurface_pipeline: Arc<GraphicsPipeline>,
-    subbuffer_allocator: SubbufferAllocator,
+    /// Indexed `[msaa][subsurface]`, matching the four shapes of
+    /// [`ForwardTargets`]: two sample counts, each with and without the
+    /// diffusible colour target.
+    pipelines: [[Arc<GraphicsPipeline>; 2]; 2],
+    subbuffer_allocator: Arena,
 }
 
 impl LinePass {
-    /// Build the line pipelines against subpass 0 of each forward render pass.
-    pub fn new(
-        device: &Arc<Device>,
-        memory_allocator: &Arc<StandardMemoryAllocator>,
-        render_pass: &Arc<RenderPass>,
-        subsurface_render_pass: &Arc<RenderPass>,
-    ) -> Self {
-        let subbuffer_allocator = SubbufferAllocator::new(
-            memory_allocator.clone(),
+    /// Build one line pipeline per forward target shape.
+    pub fn new(ctx: &VkContext, targets: &ForwardTargets) -> Self {
+        let subbuffer_allocator = Arena::new(
+            ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::VERTEX_BUFFER,
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
@@ -73,8 +68,16 @@ impl LinePass {
         );
 
         Self {
-            pipeline: build_pipeline(device, render_pass),
-            subsurface_pipeline: build_pipeline(device, subsurface_render_pass),
+            pipelines: [
+                [
+                    build_pipeline(ctx, &targets.single, SampleCount::Sample1),
+                    build_pipeline(ctx, &targets.single_subsurface, SampleCount::Sample1),
+                ],
+                [
+                    build_pipeline(ctx, &targets.multisampled, MSAA_SAMPLES),
+                    build_pipeline(ctx, &targets.multisampled_subsurface, MSAA_SAMPLES),
+                ],
+            ],
             subbuffer_allocator,
         }
     }
@@ -82,23 +85,20 @@ impl LinePass {
     /// Record this frame's lines into `builder`. Must be called *inside* the
     /// forward render pass, after the scene geometry.
     pub fn record(
-        &mut self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        &self,
+        builder: &mut Recorder,
         lines: &[DebugLine],
         view: &FrameView,
         extent: [u32; 2],
         subsurface: bool,
+        msaa: bool,
     ) {
         if lines.is_empty() {
             return;
         }
 
-        // Whichever render pass the executor opened around this call.
-        let pipeline = if subsurface {
-            &self.subsurface_pipeline
-        } else {
-            &self.pipeline
-        };
+        // Whichever shape the executor opened the rendering instance with.
+        let pipeline = &self.pipelines[msaa as usize][subsurface as usize];
 
         // Flatten each segment into its two endpoints for `LineList` topology.
         let mut vertices: Vec<LineVertex> = Vec::with_capacity(lines.len() * 2);
@@ -115,8 +115,7 @@ impl LinePass {
 
         let buffer = self
             .subbuffer_allocator
-            .allocate_slice::<LineVertex>(vertices.len() as u64)
-            .unwrap();
+            .allocate_slice::<LineVertex>(vertices.len() as u64);
         buffer.write().unwrap().copy_from_slice(&vertices);
 
         // The frame's jittered view-projection, so a line lands on the same
@@ -126,33 +125,30 @@ impl LinePass {
         builder
             .set_viewport(
                 0,
-                [Viewport {
+                &[Viewport {
                     offset: [0.0, 0.0],
                     extent: [extent[0] as f32, extent[1] as f32],
                     depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
+                }],
             )
-            .unwrap()
-            .bind_pipeline_graphics(pipeline.clone())
-            .unwrap()
-            .push_constants(pipeline.layout().clone(), 0, view_proj)
-            .unwrap()
-            .bind_vertex_buffers(0, buffer)
-            .unwrap();
+            .bind_pipeline_graphics(&pipeline)
+            .push_constants(pipeline.layout(), 0, &view_proj)
+            .bind_vertex_buffers(0, buffer);
 
         let vertex_count = vertices.len() as u32;
 
         // SAFETY: the bound pipeline and vertex buffer cover [0, vertex_count); no
         // index buffer or instancing is used.
-        unsafe {
-            builder.draw(vertex_count, 1, 0, 0).unwrap();
-        }
+        builder.draw(vertex_count, 1, 0, 0);
     }
 }
 
-fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+fn build_pipeline(
+    ctx: &VkContext,
+    target: &PipelineRenderingCreateInfo,
+    samples: SampleCount,
+) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -177,11 +173,9 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
     )
     .unwrap();
 
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),
@@ -191,8 +185,13 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
             }),
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState::default()),
+            // Passed in rather than read back off a render pass object: a
+            // description carries formats, not a sample count, and a pipeline
+            // whose count disagrees with the attachments it is used with is
+            // invalid. The two travel together from `ForwardTargets` for that
+            // reason.
             multisample_state: Some(MultisampleState {
-                rasterization_samples: vulkano::image::SampleCount::Sample4,
+                rasterization_samples: samples,
                 ..Default::default()
             }),
             depth_stencil_state: Some(DepthStencilState {
@@ -204,10 +203,10 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
                 ..Default::default()
             }),
             // Masked past the first attachment: this shader declares one output,
-            // and the subsurface render pass has two. See `co_tenant_blend_states`.
-            color_blend_state: Some(super::forward::co_tenant_blend_states(&subpass)),
+            // and the subsurface target shape has two. See `co_tenant_blend_states`.
+            color_blend_state: Some(super::forward::co_tenant_blend_states(target)),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(target.clone().into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )

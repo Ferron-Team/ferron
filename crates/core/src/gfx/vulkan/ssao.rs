@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-use super::VulkanRenderer;
+use super::PassCtx;
 use super::context::VkContext;
 use super::prepass::{FrameUbo, NORMAL_FORMAT};
+use super::record::{Arena, Recorder};
+use super::rendering;
 use super::texture::MipPolicy;
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -25,7 +25,6 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{RenderPass, Subpass};
 use vulkano::shader::EntryPoint;
 
 pub(super) const AO_FORMAT: Format = Format::R8_UNORM;
@@ -90,23 +89,12 @@ fn build_noise(ctx: &VkContext) -> Arc<ImageView> {
     )
 }
 
-fn ao_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
-    vulkano::single_pass_renderpass!(
-        device.clone(),
-        attachments: {
-            ao: { format: AO_FORMAT, samples: 1, load_op: Clear, store_op: Store },
-        },
-        pass: { color: [ao], depth_stencil: {} },
-    )
-    .unwrap()
-}
-
 fn build_fullscreen_pipeline(
-    device: &Arc<Device>,
-    render_pass: &Arc<RenderPass>,
+    ctx: &VkContext,
     vs: EntryPoint,
     fs: EntryPoint,
 ) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let stages = [
         PipelineShaderStageCreateInfo::new(vs),
         PipelineShaderStageCreateInfo::new(fs),
@@ -118,10 +106,9 @@ fn build_fullscreen_pipeline(
             .unwrap(),
     )
     .unwrap();
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),
@@ -131,11 +118,11 @@ fn build_fullscreen_pipeline(
             multisample_state: Some(MultisampleState::default()),
             depth_stencil_state: None,
             color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
+                1,
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(rendering::pipeline_info(&[AO_FORMAT], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
@@ -153,11 +140,9 @@ pub(super) struct SsaoUniforms {
 }
 
 pub struct SsaoPass {
-    pub(super) ssao_rp: Arc<RenderPass>,
-    pub(super) blur_rp: Arc<RenderPass>,
     ssao_pipeline: Arc<GraphicsPipeline>,
     blur_pipeline: Arc<GraphicsPipeline>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
     nearest_clamp: Arc<Sampler>,
     nearest_repeat: Arc<Sampler>,
     noise_view: Arc<ImageView>,
@@ -175,9 +160,6 @@ pub struct SsaoPass {
 impl SsaoPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
-        let ssao_rp = ao_render_pass(device);
-        let blur_rp = ao_render_pass(device);
-
         let full_vs = fullscreen_vs::load(device.clone())
             .unwrap()
             .entry_point("main")
@@ -190,10 +172,13 @@ impl SsaoPass {
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let ssao_pipeline = build_fullscreen_pipeline(device, &ssao_rp, full_vs.clone(), ssao_fs);
-        let blur_pipeline = build_fullscreen_pipeline(device, &blur_rp, full_vs, blur_fs);
+        // One description for both, where there were two identical render pass
+        // objects: the resolve and the blur write the same format to the same
+        // shape of target, and that was always the only thing either declared.
+        let ssao_pipeline = build_fullscreen_pipeline(ctx, full_vs.clone(), ssao_fs);
+        let blur_pipeline = build_fullscreen_pipeline(ctx, full_vs, blur_fs);
 
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -225,8 +210,6 @@ impl SsaoPass {
         .unwrap();
 
         Self {
-            ssao_rp,
-            blur_rp,
             ssao_pipeline,
             blur_pipeline,
             uniform_allocator,
@@ -253,10 +236,7 @@ impl SsaoPass {
     }
 
     pub(super) fn begin_frame(&self, extent: [u32; 2], frame: Subbuffer<FrameUbo>) -> SsaoUniforms {
-        let params = self
-            .uniform_allocator
-            .allocate_sized::<SsaoParamsUbo>()
-            .unwrap();
+        let params = self.uniform_allocator.allocate_sized::<SsaoParamsUbo>();
         *params.write().unwrap() = SsaoParamsUbo {
             kernel: self.kernel,
             noise_scale: [
@@ -277,8 +257,8 @@ impl SsaoPass {
     /// as this pass's `Sampled` inputs.
     pub(super) fn record_ao(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        renderer: &VulkanRenderer,
+        builder: &mut Recorder,
+        renderer: &PassCtx<'_>,
         extent: [u32; 2],
         uniforms: &SsaoUniforms,
         depth_view: Arc<ImageView>,
@@ -312,64 +292,70 @@ impl SsaoPass {
 
         set_viewport(builder, extent);
         builder
-            .bind_pipeline_graphics(self.ssao_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_graphics(&self.ssao_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.ssao_pipeline.layout().clone(),
+                self.ssao_pipeline.layout(),
                 0,
-                vec![uniform_set, texture_set],
-            )
-            .unwrap();
-        unsafe { builder.draw(3, 1, 0, 0).unwrap() };
+                &[uniform_set, texture_set],
+            );
+        builder.draw(3, 1, 0, 0);
     }
 
+    /// The blur is also the upsample when the occlusion was resolved at half the
+    /// frame's extent, which is why it takes the prepass depth: it weights each
+    /// tap by how close that tap's surface is to the centre's, so the term stops
+    /// bleeding across silhouettes. See `ssao_blur.frag`.
     pub(super) fn record_blur(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        renderer: &VulkanRenderer,
+        builder: &mut Recorder,
+        renderer: &PassCtx<'_>,
         extent: [u32; 2],
         raw_ao_view: Arc<ImageView>,
+        depth_view: Arc<ImageView>,
+        uniforms: &SsaoUniforms,
     ) {
         let input = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.blur_pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::image_view_sampler(
-                0,
-                raw_ao_view,
-                self.nearest_clamp.clone(),
-            )],
+            [
+                WriteDescriptorSet::image_view_sampler(0, raw_ao_view, self.nearest_clamp.clone()),
+                // Nearest, like every other read of this depth: interpolating
+                // across a silhouette invents a surface, which is precisely what
+                // the weighting below exists to stop.
+                WriteDescriptorSet::image_view_sampler(1, depth_view, self.nearest_clamp.clone()),
+            ],
+            [],
+        )
+        .unwrap();
+        let frame_set = DescriptorSet::new(
+            renderer.ctx.descriptor_set_allocator.clone(),
+            self.blur_pipeline.layout().set_layouts()[1].clone(),
+            [WriteDescriptorSet::buffer(0, uniforms.frame.clone())],
             [],
         )
         .unwrap();
 
         set_viewport(builder, extent);
         builder
-            .bind_pipeline_graphics(self.blur_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_graphics(&self.blur_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.blur_pipeline.layout().clone(),
+                self.blur_pipeline.layout(),
                 0,
-                vec![input],
-            )
-            .unwrap();
-        unsafe { builder.draw(3, 1, 0, 0).unwrap() };
+                &[input, frame_set],
+            );
+        builder.draw(3, 1, 0, 0);
     }
 }
 
-fn set_viewport(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    extent: [u32; 2],
-) {
+fn set_viewport(builder: &mut Recorder, extent: [u32; 2]) {
     let viewport = Viewport {
         offset: [0.0, 0.0],
         extent: [extent[0] as f32, extent[1] as f32],
         depth_range: 0.0..=1.0,
     };
-    builder
-        .set_viewport(0, [viewport].into_iter().collect())
-        .unwrap();
+    builder.set_viewport(0, &[viewport]);
 }
 
 mod fullscreen_vs {

@@ -11,9 +11,7 @@
 use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -26,6 +24,7 @@ use vulkano::pipeline::{
 use crate::scene::HdrSettings;
 
 use super::context::VkContext;
+use super::record::Recorder;
 
 /// Bins in the luminance histogram. Also both shaders' workgroup size: the
 /// histogram pass is 16x16 so one invocation owns one bin when it flushes shared
@@ -95,14 +94,14 @@ impl ExposurePass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
         let histogram_pipeline = build_pipeline(
-            device,
+            ctx,
             histogram_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap(),
         );
         let average_pipeline = build_pipeline(
-            device,
+            ctx,
             average_cs::load(device.clone())
                 .unwrap()
                 .entry_point("main")
@@ -203,7 +202,7 @@ impl ExposurePass {
 
     pub fn record_histogram(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        builder: &mut Recorder,
         ctx: &VkContext,
         extent: [u32; 2],
         hdr_view: Arc<ImageView>,
@@ -220,44 +219,32 @@ impl ExposurePass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.histogram_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.histogram_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.histogram_pipeline.layout().clone(),
+                self.histogram_pipeline.layout(),
                 0,
-                vec![set],
+                &[set],
             )
-            .unwrap()
             .push_constants(
-                self.histogram_pipeline.layout().clone(),
+                self.histogram_pipeline.layout(),
                 0,
-                HistogramPush {
+                &HistogramPush {
                     min_log_luminance: self.settings.min_log_luminance,
                     inverse_log_luminance_range: 1.0 / self.log_luminance_range(),
                     extent,
                 },
-            )
-            .unwrap();
+            );
 
         // SAFETY: the dispatch covers every pixel of `extent` and the shader
         // bounds-checks the tail invocations of a partial tile against the same
         // extent, so no invocation reads outside the image. The descriptors bound
         // above match the shader's layout, and the graph declared both resources
         // for this pass, so their barriers precede it.
-        unsafe {
-            builder
-                .dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1])
-                .unwrap()
-        };
+        builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
     }
 
-    pub fn record_average(
-        &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        ctx: &VkContext,
-        extent: [u32; 2],
-    ) {
+    pub fn record_average(&self, builder: &mut Recorder, ctx: &VkContext, extent: [u32; 2]) {
         let set = DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
             self.average_pipeline.layout().set_layouts()[0].clone(),
@@ -270,19 +257,17 @@ impl ExposurePass {
         .unwrap();
 
         builder
-            .bind_pipeline_compute(self.average_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(&self.average_pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.average_pipeline.layout().clone(),
+                self.average_pipeline.layout(),
                 0,
-                vec![set],
+                &[set],
             )
-            .unwrap()
             .push_constants(
-                self.average_pipeline.layout().clone(),
+                self.average_pipeline.layout(),
                 0,
-                AveragePush {
+                &AveragePush {
                     min_log_luminance: self.settings.min_log_luminance,
                     log_luminance_range: self.log_luminance_range(),
                     brighten: HdrSettings::adaptation_rate(
@@ -295,21 +280,21 @@ impl ExposurePass {
                     // per invocation inside the extent and skips the rest.
                     pixel_count: extent[0] * extent[1],
                 },
-            )
-            .unwrap();
+            );
 
         // SAFETY: one workgroup, sized in the shader to the bin count, so every
         // invocation indexes a bin that exists. The descriptors match the
         // shader's layout, and the graph ordered this pass behind the histogram
         // that fills what it reads.
-        unsafe { builder.dispatch([1, 1, 1]).unwrap() };
+        builder.dispatch([1, 1, 1]);
     }
 }
 
 fn build_pipeline(
-    device: &Arc<Device>,
+    ctx: &VkContext,
     entry_point: vulkano::shader::EntryPoint,
 ) -> Arc<ComputePipeline> {
+    let device = &ctx.device;
     let stage = PipelineShaderStageCreateInfo::new(entry_point);
     let layout = PipelineLayout::new(
         device.clone(),
@@ -320,7 +305,7 @@ fn build_pipeline(
     .unwrap();
     ComputePipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .unwrap()

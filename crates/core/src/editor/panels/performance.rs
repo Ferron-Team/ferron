@@ -40,12 +40,13 @@ pub fn body(ui: &mut egui::Ui, world: &World) {
     }
 
     if let Some(mut culling) = world.get_resource_mut::<Culling>() {
-        ui.label(figures(format!(
-            "Draws: {} / {} ({} culled)",
-            culling.visible(),
-            culling.total(),
-            culling.culled(),
-        )));
+        ui.label(figures(match (culling.visible(), culling.culled()) {
+            (Some(visible), Some(culled)) => {
+                format!("Draws: {visible} / {} ({culled} culled)", culling.total())
+            }
+            // The GPU decided, and did not say. See `Culling::visible`.
+            _ => format!("Draws: {} offered (culled on the GPU)", culling.total()),
+        }));
         ui.checkbox(&mut culling.enabled, "Frustum culling")
             .on_hover_text("Off draws everything — the A/B for a suspected culling bug.");
     }
@@ -108,13 +109,19 @@ fn measurement(ui: &mut egui::Ui, world: &World) {
             if let Some(mut present) = world.get_resource_mut::<PresentSettings>() {
                 let label = |mode: VsyncMode| match mode {
                     VsyncMode::Fifo => "Fifo (vsync)",
+                    VsyncMode::FifoRelaxed => "Fifo relaxed (vsync, tears when late)",
                     VsyncMode::Mailbox => "Mailbox (uncapped)",
                     VsyncMode::Immediate => "Immediate (uncapped, tears)",
                 };
                 egui::ComboBox::from_label("Present mode")
                     .selected_text(label(present.vsync))
                     .show_ui(ui, |ui| {
-                        for mode in [VsyncMode::Fifo, VsyncMode::Mailbox, VsyncMode::Immediate] {
+                        for mode in [
+                            VsyncMode::Fifo,
+                            VsyncMode::FifoRelaxed,
+                            VsyncMode::Mailbox,
+                            VsyncMode::Immediate,
+                        ] {
                             ui.selectable_value(&mut present.vsync, mode, label(mode));
                         }
                     })

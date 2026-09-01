@@ -19,11 +19,9 @@
 use std::sync::Arc;
 
 use glam::Vec3;
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -40,13 +38,14 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{RenderPass, Subpass};
 
 use crate::scene::ContactShadowSettings;
 
-use super::VulkanRenderer;
+use super::PassCtx;
 use super::context::VkContext;
 use super::prepass::FrameUbo;
+use super::record::{Arena, Recorder};
+use super::rendering;
 use super::taa::FrameView;
 use super::texture::MipPolicy;
 
@@ -86,9 +85,8 @@ pub(super) struct ContactShadowUniforms {
 }
 
 pub struct ContactShadowPass {
-    pub(super) render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
-    uniform_allocator: SubbufferAllocator,
+    uniform_allocator: Arena,
     /// Nearest, because depth and normals are fetched at exact texels: filtering
     /// either invents a surface between two that are really there, and the march
     /// would stop on it.
@@ -106,10 +104,9 @@ pub struct ContactShadowPass {
 impl ContactShadowPass {
     pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
-        let render_pass = build_render_pass(device);
-        let pipeline = build_pipeline(device, &render_pass);
+        let pipeline = build_pipeline(ctx);
 
-        let uniform_allocator = SubbufferAllocator::new(
+        let uniform_allocator = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -131,7 +128,6 @@ impl ContactShadowPass {
         .unwrap();
 
         Self {
-            render_pass,
             pipeline,
             uniform_allocator,
             nearest_clamp,
@@ -175,10 +171,7 @@ impl ContactShadowPass {
         let fade_end = settings.fade_distance.max(1e-4);
         let fade_start = fade_end * 0.75;
 
-        let params = self
-            .uniform_allocator
-            .allocate_sized::<ContactShadowUbo>()
-            .unwrap();
+        let params = self.uniform_allocator.allocate_sized::<ContactShadowUbo>();
         *params.write().unwrap() = ContactShadowUbo {
             light_direction: [light_direction.x, light_direction.y, light_direction.z, 0.0],
             march: [
@@ -208,8 +201,8 @@ impl ContactShadowPass {
     /// as this pass's `Sampled` inputs.
     pub(super) fn record(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        renderer: &VulkanRenderer,
+        builder: &mut Recorder,
+        renderer: &PassCtx<'_>,
         extent: [u32; 2],
         uniforms: &ContactShadowUniforms,
         depth_view: Arc<ImageView>,
@@ -239,40 +232,25 @@ impl ContactShadowPass {
         builder
             .set_viewport(
                 0,
-                [Viewport {
+                &[Viewport {
                     offset: [0.0, 0.0],
                     extent: [extent[0] as f32, extent[1] as f32],
                     depth_range: 0.0..=1.0,
-                }]
-                .into_iter()
-                .collect(),
+                }],
             )
-            .unwrap()
-            .bind_pipeline_graphics(self.pipeline.clone())
-            .unwrap()
+            .bind_pipeline_graphics(&self.pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.pipeline.layout().clone(),
+                self.pipeline.layout(),
                 0,
-                vec![uniform_set, texture_set],
-            )
-            .unwrap();
-        unsafe { builder.draw(3, 1, 0, 0).unwrap() };
+                &[uniform_set, texture_set],
+            );
+        builder.draw(3, 1, 0, 0);
     }
 }
 
-fn build_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
-    vulkano::single_pass_renderpass!(
-        device.clone(),
-        attachments: {
-            shadow: { format: MASK_FORMAT, samples: 1, load_op: Clear, store_op: Store },
-        },
-        pass: { color: [shadow], depth_stencil: {} },
-    )
-    .unwrap()
-}
-
-fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
+fn build_pipeline(ctx: &VkContext) -> Arc<GraphicsPipeline> {
+    let device = &ctx.device;
     let vs = fullscreen_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
@@ -292,10 +270,9 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
             .unwrap(),
     )
     .unwrap();
-    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
     GraphicsPipeline::new(
         device.clone(),
-        None,
+        ctx.pipeline_cache(),
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),
@@ -305,11 +282,11 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
             multisample_state: Some(MultisampleState::default()),
             depth_stencil_state: None,
             color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
+                1,
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
+            subpass: Some(rendering::pipeline_info(&[MASK_FORMAT], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )

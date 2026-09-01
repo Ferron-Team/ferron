@@ -11,6 +11,9 @@ categories = ["game-development", "data-structures"]
 # Intentionally empty: the ECS is the *mechanism* only. It must not depend on
 # the renderer, math, or windowing crates. Components live in the engine.
 [dependencies]
+# Declared ahead of its first use: the ECS is where parallel query iteration
+# will land, and the pool it will dispatch into is built in `orrin-core`.
+rayon = { workspace = true }
 
 [dev-dependencies]
 # Property tests for sparse-set / generational-handle invariants (test-only,

@@ -64,6 +64,12 @@ pub(super) struct PassDecl {
 pub struct GraphBuilder {
     pub(super) resources: Vec<ResourceDecl>,
     pub(super) passes: Vec<PassDecl>,
+    /// Whether the device has a queue to put a compute tail on.
+    ///
+    /// The renderer's answer, not a preference: a graph is device-free, so it
+    /// cannot ask, and a plan that split a frame the device cannot split would
+    /// be a plan nothing could execute.
+    pub(super) async_compute: bool,
 }
 
 impl GraphBuilder {
@@ -100,6 +106,15 @@ impl GraphBuilder {
         let id = ResourceId(self.resources.len() as u32);
         self.resources.push(ResourceDecl { name, kind });
         id
+    }
+
+    /// Allow the compiler to put this frame's compute tail on a second queue.
+    ///
+    /// Whether it *does* is derived from the frame — a configuration with no
+    /// tail to move is planned exactly as it was before this existed. See
+    /// [`schedule`](super::schedule).
+    pub fn request_async_compute(&mut self) {
+        self.async_compute = true;
     }
 
     pub fn pass(&mut self, name: &'static str, kind: PassKind) -> PassBuilder<'_> {

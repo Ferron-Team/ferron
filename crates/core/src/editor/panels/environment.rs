@@ -64,6 +64,13 @@ fn screen_space_column(ui: &mut egui::Ui, world: &World) {
         ui.add(egui::Slider::new(&mut s.radius, 0.0..=4.0).text("Radius"));
         ui.add(egui::Slider::new(&mut s.bias, 0.0..=0.1).text("Bias"));
         ui.add(egui::Slider::new(&mut s.power, 0.1..=4.0).text("Power"));
+        ui.checkbox(&mut s.half_resolution, "Half resolution")
+            .on_hover_text(
+                "Resolve the occlusion at half the frame's extent and let the \
+                 bilateral blur upsample it: a quarter of the pixels through the \
+                 frame's most expensive loop, for a term that is low-frequency \
+                 and blurred either way",
+            );
     }
     ui.add_space(6.0);
     ui.strong("Temporal AA")
@@ -77,6 +84,12 @@ fn screen_space_column(ui: &mut egui::Ui, world: &World) {
             .on_hover_text("How much of the reprojected history each frame keeps");
         ui.add(egui::Slider::new(&mut taa.jitter_scale, 0.0..=1.5).text("Jitter"))
             .on_hover_text("Fraction of a pixel the camera samples across");
+        ui.checkbox(&mut taa.msaa, "4x MSAA").on_hover_text(
+            "Rasterise the forward pass at four samples instead of one. The \
+             alternative to the temporal resolve above, not a companion to it: \
+             it costs roughly a quarter of the frame, and at one sample the \
+             forward pass borrows the prepass depth and shades each pixel once",
+        );
     }
     ui.add_space(6.0);
     ui.strong("Reflections").on_hover_text(
@@ -379,6 +392,37 @@ fn lighting_column(ui: &mut egui::Ui, world: &World) {
                 .desired_width(f32::INFINITY),
         );
         ui.checkbox(&mut env.show_skybox, "Show skybox");
+        // Only reachable with the skybox off or nothing baked, so it sits right
+        // under the toggle that makes it visible. Drag values rather than a
+        // colour picker because the number is a luminance in cd/m² and a picker
+        // would quietly clamp it to the 0–1 the rest of the frame is not in.
+        // Bound out of the resource guard once: three `&mut env.background.x`
+        // would each go through `DerefMut` and count as three whole-resource
+        // borrows, where three fields of one `Vec3` are disjoint.
+        let background = &mut env.background;
+        ui.horizontal(|ui| {
+            ui.label("Background");
+            for (channel, label) in [
+                (&mut background.x, "R"),
+                (&mut background.y, "G"),
+                (&mut background.z, "B"),
+            ] {
+                ui.add(
+                    egui::DragValue::new(channel)
+                        .speed(0.01)
+                        .range(0.0..=f32::INFINITY)
+                        .prefix(format!("{label} ")),
+                );
+            }
+        })
+        .response
+        .on_hover_text(
+            "What the frame clears to where nothing was drawn, in cd/m². Visible \
+             only with no environment baked or the skybox off. Black is the one \
+             value AMD documents on the compressed fast-clear path, though the \
+             difference did not show up in a frame time on RADV — so treat it as \
+             free rather than as a saving.",
+        );
         // Logarithmic over five orders of magnitude, because that is the range
         // real skies cover and because a downloaded `.hdr` needs a factor in the
         // thousands to reach any of it. The old control was a raw multiplier

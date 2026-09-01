@@ -17,5 +17,17 @@ void main() {
     // so on the plain pipeline the value is ignored and one is what a fully
     // covered pixel means; on the `Masked` pipeline alpha to coverage is on and
     // this is what carves the cutout out of the four samples.
-    f_color = vec4(shaded.color + shaded.diffusible, mask_coverage(shaded.alpha));
+    float coverage = mask_coverage(shaded.alpha);
+#ifdef ORRIN_ALPHA_TEST
+    // One sample, so there is no coverage to spend and the ramp above collapses
+    // to the hard test it is a smoothing of. Half coverage is alpha exactly at
+    // the material's cutoff, so cutting here cuts along the same line
+    // `prepass.frag` cut along -- and that is not a nicety but the requirement:
+    // this pipeline depth-tests `EQUAL` against the depth that pass wrote, and a
+    // fragment the prepass discarded has no depth here for anything to match.
+    if (coverage < 0.5) {
+        discard;
+    }
+#endif
+    f_color = vec4(shaded.color + shaded.diffusible, coverage);
 }

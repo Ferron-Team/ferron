@@ -31,6 +31,18 @@ vec3 view_pos(vec2 uv) {
 }
 
 void main() {
+    // The sky occludes nothing, and the kernel below is the most expensive loop
+    // in the frame: 32 taps, each a dependent, effectively random depth fetch.
+    // At the clear value there is no geometry to be occluded by anything, so the
+    // result is a guaranteed 1.0 -- worth one coherent branch to skip. The
+    // branch is taken by whole waves across open sky and costs nothing where it
+    // is not, since a wave straddling the horizon runs the loop either way.
+    float d = texture(u_depth, v_uv).r;
+    if (d >= 1.0) {
+        f_ao = 1.0;
+        return;
+    }
+
     vec3 P = view_pos(v_uv);
     vec3 N = normalize(texture(u_normal, v_uv).xyz * 2.0 - 1.0);
     vec3 rnd = vec3(texture(u_noise, v_uv * p.noise_scale).xy * 2.0 - 1.0, 0.0);

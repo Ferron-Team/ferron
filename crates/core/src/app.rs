@@ -104,6 +104,10 @@ struct Scripts {
 
 impl App {
     pub fn run() {
+        // Before anything that might dispatch into it — the scene build decodes
+        // textures across it, and that happens on the first `resumed`.
+        crate::threads::init();
+
         let event_loop = EventLoop::new().unwrap();
         event_loop.set_control_flow(ControlFlow::Poll);
 
@@ -628,6 +632,7 @@ impl ApplicationHandler for App {
                         aspect,
                         &self.cascades,
                         &self.atlas,
+                        active.renderer.gpu_culling(),
                         &mut self.geometry,
                     );
                     // Copy this frame's debug lines out (they're Copy) so the render
@@ -822,7 +827,7 @@ fn print_run_banner(world: &World, renderer: &VulkanRenderer, scene: SceneChoice
 
     println!(
         "Run config: {} build | debug assertions {} | validation {} | present {} | \
-         {}x{} | MSAA {:?} | overlay {} | GPU pass timings {} | scene {}",
+         {}x{} | MSAA {} | overlay {} | GPU pass timings {} | scene {}",
         if cfg!(debug_assertions) {
             "unoptimised"
         } else {
@@ -833,7 +838,14 @@ fn print_run_banner(world: &World, renderer: &VulkanRenderer, scene: SceneChoice
         present,
         extent[0],
         extent[1],
-        crate::gfx::vulkan::MSAA_SAMPLES,
+        // What the frame actually rasterises at, not the constant it *would*
+        // use: MSAA is off by default now, and a banner quoting `Sample4` on a
+        // one-sample run would misdescribe the number beside it.
+        if world.resource::<TaaSettings>().msaa {
+            format!("{:?}", crate::gfx::vulkan::MSAA_SAMPLES)
+        } else {
+            "off".to_string()
+        },
         on_off(world.resource::<Diagnostics>().overlay),
         on_off(crate::profile::gpu_passes_enabled()),
         scene.label(),

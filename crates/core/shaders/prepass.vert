@@ -35,13 +35,11 @@ layout(location = 7) out vec3 v_view_pos;
 // space and the forward pass tests against it there, so testing here in any
 // other space would mean two descriptions of one box.
 layout(location = 8) out vec3 v_world_pos;
-
-layout(push_constant) uniform Push {
-    // First object row of this instanced run; gl_InstanceIndex counts from it.
-    uint object_base;
-    // Row of the material table this run draws with; read by the fragment stage.
-    uint material_index;
-} push;
+// Which material row to alpha-test and write parameters for, read out of this
+// instance's entry rather than pushed: a multi-draw covers every batch of a
+// pipeline variant, so there is no per-draw push to put it in. `flat` because it
+// is a number, not a quantity to interpolate.
+layout(location = 9) flat out uint v_material;
 
 layout(set = 0, binding = 0) uniform Frame {
     mat4 view;
@@ -50,7 +48,18 @@ layout(set = 0, binding = 0) uniform Frame {
     mat4 prev_view_proj;
     // xy = the NDC offset baked into `proj`.
     vec4 jitter;
+    // `proj * view`, premultiplied CPU-side. See the FrameUbo doc comment.
+    mat4 view_proj;
 } frame;
+
+// The forward pass tests `EQUAL` against the depth this pass writes, so the two
+// shaders have to agree on `gl_Position` to the last bit. `invariant` is the
+// guarantee that they do: it holds for the same expression over the same
+// inputs, which is why the line below multiplies by the premultiplied
+// `view_proj` rather than by `proj` and `view` in turn -- `forward.vert` has
+// only the product, and `proj * (view * world)` is not `(proj * view) * world`
+// in floating point.
+invariant gl_Position;
 
 // The same per-object buffer the forward pass reads, uploaded once per frame.
 // Mirrors GpuObject in forward.rs.
@@ -63,8 +72,20 @@ layout(set = 1, binding = 0, std430) readonly buffer Objects {
     Object objects[];
 };
 
+// This pass's slice of the frame's draw order: for each entry, the row into
+// `objects` and the material to draw it with. The indirection is what lets a row
+// be shared — an object the camera sees and four cascades also draw occupies one
+// row named five times, rather than five copies of the same three matrices.
+// `gl_InstanceIndex` already counts from the draw's `firstInstance`, which is
+// where its slice starts. See `vulkan::instances`.
+layout(set = 1, binding = 1, std430) readonly buffer Instances {
+    uvec2 instances[];
+};
+
 void main() {
-    uint object = push.object_base + uint(gl_InstanceIndex);
+    uvec2 entry = instances[uint(gl_InstanceIndex)];
+    uint object = entry.x;
+    v_material = entry.y;
     mat4 model = objects[object].model;
 
     // Same construction as forward.vert, one space along: Gram-Schmidt against
@@ -86,8 +107,12 @@ void main() {
     v_world_pos = world_pos.xyz;
     vec4 view_pos = frame.view * world_pos;
     v_view_pos = view_pos.xyz;
+    gl_Position = frame.view_proj * world_pos;
+
+    // Still by way of view space, unlike the position above: this feeds the
+    // jitter removal below rather than the rasteriser, so it is not the value
+    // the depth test compares and nothing downstream needs it bit-exact.
     vec4 clip = frame.proj * view_pos;
-    gl_Position = clip;
 
     // `proj` carries the jitter as a translation of clip.xy by jitter * w, so
     // subtracting exactly that recovers the unjittered position.

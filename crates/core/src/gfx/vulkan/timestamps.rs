@@ -25,11 +25,11 @@
 
 use std::sync::Arc;
 
-use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType};
 use vulkano::sync::PipelineStage;
 
 use super::context::VkContext;
+use super::record::Recorder;
 use crate::profile::{Profiler, Span};
 
 /// Passes timed per frame, including the reserved whole-frame pair. Costs
@@ -51,18 +51,38 @@ use crate::profile::{Profiler, Span};
 /// passes at the end of the chain.
 const MAX_PASSES: usize = 64;
 
-/// Frame slots in rotation. Two would be correct only while `previous_frame_end`
-/// is a single fence that retires frame N-1 before N records; three removes that
-/// coupling, so growing frames-in-flight later can't silently corrupt timings.
-const SLOTS: usize = 3;
+/// Frame slots in rotation: one more than the frames the CPU may be ahead by.
+///
+/// Two constraints, and the second is the binding one.
+///
+/// A slot is reset before the frame that writes it records, so it must belong to
+/// a frame the GPU has finished. Slot `N % SLOTS` last belonged to `N - SLOTS`,
+/// which `RunAhead` has waited on whenever `SLOTS` is at least
+/// [`FRAMES_IN_FLIGHT`].
+///
+/// But a slot must also be *read* before it is reused, and `drain_completed`
+/// declines two: the slot being written, and any slot whose frame the profiler
+/// has not closed yet. Frame `N`'s slot is therefore first eligible on frame
+/// `N + 1`, when the write cursor sits at `N + 2` — the same slot when `SLOTS`
+/// is two, which is why two silently files no GPU spans at all rather than
+/// filing wrong ones. One spare slot is what buys the readback its window.
+///
+/// Derived from the run-ahead rather than written down beside it, because the
+/// two disagreeing costs timings rather than frames, and nothing about a frame
+/// looks wrong while it happens.
+const SLOTS: usize = super::FRAMES_IN_FLIGHT + 1;
 
 /// Name of the reserved pair covering the whole frame. Always query 0/1, which
 /// also makes query 0 a guaranteed-written origin for the anchor below.
 const WHOLE_FRAME_PASS: &str = "frame";
 
-/// A pass whose opening timestamp has been recorded. Consumed by
-/// [`GpuTimestamps::end_pass`]; dropping one without ending it leaves a query
-/// that never gets written, which the pair guard in `drain_completed` discards.
+/// A query pair reserved for one pass. Dropping one without stamping it leaves
+/// queries that never get written, which the pair guard in `drain_completed`
+/// discards.
+///
+/// Copied rather than consumed because both halves are stamped from it, and the
+/// two may be recorded by different calls on the same worker.
+#[derive(Clone, Copy)]
 pub struct PassToken {
     base: u32,
 }
@@ -171,21 +191,16 @@ impl GpuTimestamps {
 
     /// Reset this frame's queries and open the reserved whole-frame pair.
     ///
-    /// Must be recorded before the first `begin_render_pass`: a reset inside a
-    /// render pass is invalid, and which passes will run isn't known yet, so the
-    /// entire pool is reset in one go.
-    pub fn record_resets(
-        &mut self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) {
+    /// Must be recorded before the first `begin_rendering`: a reset inside a
+    /// render pass instance is invalid, and which passes will run isn't known
+    /// yet, so the entire pool is reset in one go.
+    pub fn record_resets(&mut self, builder: &mut Recorder) {
         let pool = self.slots[self.write].pool.clone();
         // SAFETY: outside any render pass, and this slot is not in flight —
-        // `end_frame` only rotates onto a slot that `drain_completed` retired.
-        unsafe {
-            builder
-                .reset_query_pool(pool, 0..(2 * MAX_PASSES as u32))
-                .unwrap();
-        }
+        // there are more slots than frames the CPU may be ahead by, so the frame
+        // that last wrote this one has been waited on by
+        // `RunAhead::wait_for_room`.
+        builder.reset_query_pool(pool, 0..(2 * MAX_PASSES as u32));
         // Reserved first, so it is always query 0/1 and query 0 is guaranteed
         // written — `drain_completed` uses it as the frame's tick origin. Its
         // closing stamp comes from `end_frame`, which knows that fixed position.
@@ -195,32 +210,30 @@ impl GpuTimestamps {
         // that has to survive turning per-pass timing off, since comparing the
         // two is the entire point of being able to.
         if crate::profile::is_enabled() {
-            drop(self.stamp(builder, WHOLE_FRAME_PASS));
+            let whole_frame = self.take_pair(WHOLE_FRAME_PASS);
+            self.open(builder, whole_frame);
         }
     }
 
-    /// Stamp the opening timestamp for `name` and reserve its pair.
+    /// Reserve a query pair for `name`, for the pass to stamp when it records.
+    ///
+    /// Reserving and stamping are separate because a pass may record on a
+    /// worker: taking the pair mutates the frame's slot and so belongs to the
+    /// thread that owns the frame, while the two writes are commands like any
+    /// other and go wherever the pass goes.
     ///
     /// `None` when profiling is off, when per-pass timing is off, or when
     /// `MAX_PASSES` is exhausted — so call sites stay `if let Some(..)` and never
     /// test for support themselves.
-    pub fn begin_pass(
-        &mut self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        name: &'static str,
-    ) -> Option<PassToken> {
+    pub fn reserve(&mut self, name: &'static str) -> Option<PassToken> {
         if !crate::profile::is_enabled() || !crate::profile::gpu_passes_enabled() {
             return None;
         }
-        self.stamp(builder, name)
+        self.take_pair(name)
     }
 
-    /// The half of [`begin_pass`](Self::begin_pass) past the switches.
-    fn stamp(
-        &mut self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        name: &'static str,
-    ) -> Option<PassToken> {
+    /// The half of [`reserve`](Self::reserve) past the switches.
+    fn take_pair(&mut self, name: &'static str) -> Option<PassToken> {
         let slot = &mut self.slots[self.write];
         if slot.passes.len() >= MAX_PASSES {
             debug_assert!(false, "more than {MAX_PASSES} timed passes in one frame");
@@ -230,42 +243,37 @@ impl GpuTimestamps {
         let base = slot.next_query;
         slot.next_query += 2;
         slot.passes.push(RecordedPass { name, base });
-
-        let pool = slot.pool.clone();
-        // SAFETY: `base` was just reserved from this slot's pool, which was reset
-        // this frame and is not in flight.
-        unsafe {
-            builder
-                .write_timestamp(pool, base, PipelineStage::BottomOfPipe)
-                .unwrap();
-        }
         Some(PassToken { base })
     }
 
-    pub fn end_pass(
-        &mut self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        token: Option<PassToken>,
-    ) {
+    /// Stamp the opening half of a reserved pair.
+    pub fn open(&self, builder: &mut Recorder, token: Option<PassToken>) {
+        let Some(token) = token else {
+            return;
+        };
+        let pool = self.slots[self.write].pool.clone();
+        // SAFETY: `base` was reserved from this slot's pool, which was reset
+        // this frame and is not in flight.
+        builder.write_timestamp(pool, token.base, PipelineStage::BottomOfPipe);
+    }
+
+    /// Stamp the closing half of a reserved pair.
+    pub fn close(&self, builder: &mut Recorder, token: Option<PassToken>) {
         let Some(token) = token else {
             return;
         };
         let pool = self.slots[self.write].pool.clone();
         // SAFETY: `base + 1` is the closing half of a pair reserved by
-        // `begin_pass` on this slot, reset this frame.
-        unsafe {
-            builder
-                .write_timestamp(pool, token.base + 1, PipelineStage::BottomOfPipe)
-                .unwrap();
-        }
+        // `reserve` on this slot, reset this frame.
+        builder.write_timestamp(pool, token.base + 1, PipelineStage::BottomOfPipe);
     }
 
     /// Close the reserved whole-frame pair, mark the slot for readback, rotate.
-    pub fn end_frame(&mut self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    pub fn end_frame(&mut self, builder: &mut Recorder) {
         // Empty means profiling was off when the frame opened, so nothing was
         // stamped and there is no pair to close.
         if !self.slots[self.write].passes.is_empty() {
-            self.end_pass(builder, Some(PassToken { base: 0 }));
+            self.close(builder, Some(PassToken { base: 0 }));
         }
         self.slots[self.write].state = SlotState::Pending;
         self.write = (self.write + 1) % SLOTS;
@@ -284,6 +292,17 @@ impl GpuTimestamps {
             }
             let slot = &mut self.slots[index];
             if slot.state != SlotState::Pending || slot.passes.is_empty() {
+                continue;
+            }
+            // A frame reaches the profiler's ring when `end_frame` closes it, and
+            // `push_gpu_span` files by matching that index — so a slot recorded
+            // in the frame still open has nothing to attach to yet. Leave it
+            // pending and take it on the next drain.
+            //
+            // Never reached while the frame was slower than the readback, which
+            // is why it went unnoticed: this only matters once results are
+            // available in the same frame that recorded them.
+            if slot.frame_index >= profiler.frame_index() {
                 continue;
             }
 
@@ -364,7 +383,9 @@ mod tests {
     fn the_busiest_frame_fits_the_query_pool() {
         let config = FrameConfig {
             color_format: vulkano::format::Format::B8G8R8A8_SRGB,
+            msaa: false,
             ssao: true,
+            ssao_half_res: false,
             contact_shadows: true,
             ssr: true,
             subsurface: true,
@@ -380,6 +401,9 @@ mod tests {
             shadow_cascades: MAX_CASCADES as u8,
             shadow_resolution: 2048,
             shadow_atlas: 4096,
+            async_compute: false,
+            gpu_culling: false,
+            occlusion_culling: false,
         };
         let frame = declare(config).expect("the busiest frame must compile");
 
@@ -395,6 +419,26 @@ mod tests {
         assert!(
             timed <= MAX_PASSES,
             "the busiest frame times {timed} passes but the pool holds {MAX_PASSES}",
+        );
+    }
+
+    /// The coupling [`SLOTS`] documents, asserted rather than trusted. Too few
+    /// slots resets a pool the GPU is still writing; exactly as many leaves the
+    /// readback no frame to happen on, which is how three slots behind two
+    /// frames in flight became two slots that filed no GPU span at all. Both
+    /// failures are silent — the frame renders, the profiler is just wrong.
+    #[test]
+    fn a_spare_timestamp_slot_beyond_the_frames_in_flight() {
+        assert!(
+            SLOTS > super::super::FRAMES_IN_FLIGHT,
+            "{SLOTS} query slots for {} frames in flight leaves no slot to read \
+             back from",
+            super::super::FRAMES_IN_FLIGHT,
+        );
+        assert!(
+            SLOTS >= 3,
+            "a slot is only eligible to drain a frame after the \
+             one it was written in, and never while the cursor sits on it"
         );
     }
 
