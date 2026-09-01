@@ -26,6 +26,7 @@ use super::dof::COC_TILE_SHIFT;
 use super::fog::{FOG_FORMAT, FROXEL_SHIFT, FROXEL_SLICES};
 use super::hdr::{HDR_FORMAT, HDR_WIDE_FORMAT};
 use super::motion_blur::TILE_SHIFT;
+use super::occlusion::{OCCLUSION_FORMAT, OCCLUSION_LEVELS};
 use super::oit::{ACCUM_FORMAT, REVEAL_FORMAT};
 use super::prepass::{MATERIAL_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT};
 use super::refraction::{ACCUM_FORMAT as REFRACTION_ACCUM_FORMAT, SCENE_LEVELS};
@@ -170,6 +171,20 @@ pub struct FrameConfig {
     /// two can be measured against each other on one binary — the CPU sweep is
     /// the control, and `ORRIN_GPU_CULL=0` selects it.
     pub gpu_culling: bool,
+    /// Whether the compute cull also drops what the previous frame's depth
+    /// already covered.
+    ///
+    /// Structural: it registers the pyramid build and gives the cull a texture
+    /// to read, and it is one more thing that keeps the geometry prepass alive
+    /// — the pyramid is reduced from the depth that pass writes, and a frame
+    /// with no prepass has no depth to reduce.
+    ///
+    /// Only meaningful with [`gpu_culling`](Self::gpu_culling), because the
+    /// test lives in `cull.comp`. Kept as a flag of its own rather than folded
+    /// into it for the reason that one is a flag: the visible set it produces
+    /// is *smaller* than the frustum's, so the two have to be comparable on one
+    /// binary to say what the difference cost and what it drew.
+    pub occlusion_culling: bool,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -186,6 +201,9 @@ pub enum PassBody {
     /// survive to their batch's slice of that view's instance list.
     Cull,
     GeometryPrepass,
+    /// Reduces the depth this frame rasterised to a max pyramid, for the *next*
+    /// frame's cull to test against.
+    OcclusionHiz,
     SsaoResolve,
     SsaoBlur,
     /// The sun's visibility over the short range a cascade texel cannot resolve.
@@ -293,6 +311,9 @@ pub struct FrameIds {
     /// SSAO, TAA, motion blur, depth of field, or any combination of them.
     pub prepass: Option<PrepassIds>,
     pub ssao: Option<SsaoIds>,
+    /// The two pyramids occlusion culling carries across the frame boundary.
+    /// `None` when the frame does not test against depth, along with the build.
+    pub occlusion: Option<OcclusionIds>,
     /// The sun-visibility mask, when the frame marches for one. One image and no
     /// struct: the pass reads the prepass and writes this, and there is nothing
     /// else to name.
@@ -488,6 +509,28 @@ pub struct RefractionIds {
     pub output: ResourceId,
 }
 
+/// The two depth pyramids occlusion culling carries across the frame boundary.
+///
+/// Both are **imported** and ping-ponged, for the reason the TAA history is —
+/// a transient is `Undefined` at every frame's start by contract, and what the
+/// cull tests against is precisely a survivor of the last one.
+///
+/// Two resources rather than one, and this is the whole shape of the feature.
+/// The cull decides what the prepass draws; the prepass writes the depth; the
+/// pyramid reduces that depth. A cull that read a pyramid of *this* frame's
+/// depth would close that ring, and `compile` orders every reader after every
+/// writer precisely so that it would say so — the cull after the build, the
+/// build after the prepass, the prepass after the cull, and a cycle. So the
+/// cull reads `history`, which no pass in this frame writes, and the build
+/// writes `hiz`, which no pass in this frame reads. The allocations swap.
+#[derive(Clone, Copy, Debug)]
+pub struct OcclusionIds {
+    /// Last frame's pyramid: what the cull samples.
+    pub history: ResourceId,
+    /// This frame's: what the build writes, and what `history` names next frame.
+    pub hiz: ResourceId,
+}
+
 /// The two images TAA carries across the frame boundary.
 ///
 /// Both are **imported**, for the reason the exposure buffer is: a transient is
@@ -605,6 +648,38 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         instance_index
     };
 
+    // Only with the compute cull, because the test is a branch in `cull.comp`
+    // and there is nowhere else to put it: the CPU sweep would have to read
+    // back a pyramid the GPU wrote, a frame late, to answer a question it is
+    // already answering per entity.
+    let occlusion = config.gpu_culling && config.occlusion_culling;
+    let occlusion_ids = occlusion.then(|| {
+        // Entry `ShaderReadOnlyOptimal` states the steady state the ping-pong
+        // guarantees: `hiz` leaves every frame in exactly that layout and is
+        // the allocation `history` names next frame. The one frame where it is
+        // not true — the first after an allocation — is the frame the cull is
+        // told to test nothing anyway.
+        let history = builder.import_image(
+            "occlusion_history",
+            ImageDesc::new(OCCLUSION_FORMAT)
+                .extent(Extent::FrameDiv(1))
+                .mip_levels(OCCLUSION_LEVELS),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        // Entered `Undefined` because every texel is written, and left where
+        // the next frame wants to find it.
+        let hiz = builder.import_image(
+            "occlusion_hiz",
+            ImageDesc::new(OCCLUSION_FORMAT)
+                .extent(Extent::FrameDiv(1))
+                .mip_levels(OCCLUSION_LEVELS),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        OcclusionIds { history, hiz }
+    });
+
     let draw_commands = config.gpu_culling.then(|| {
         // Which rows the dispatch is offered, and which batch each belongs to.
         // Written afresh every frame, like the draw orders under CPU culling
@@ -627,14 +702,17 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .build();
         record(id, PassBody::CullReset, &mut bodies);
 
-        let id = builder
+        let mut cull = builder
             .pass("cull", PassKind::Compute)
             .access(object_transforms, Access::StorageRead)
             .access(instance_table, Access::StorageRead)
             .access(batch_table, Access::StorageRead)
             .access(draw_commands, Access::StorageWrite)
-            .access(instance_index, Access::StorageWrite)
-            .build();
+            .access(instance_index, Access::StorageWrite);
+        if let Some(ids) = occlusion_ids {
+            cull = cull.access(ids.history, Access::Sampled);
+        }
+        let id = cull.build();
         record(id, PassBody::Cull, &mut bodies);
 
         draw_commands
@@ -756,7 +834,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         || config.dof
         || config.ssr
         || config.transparency
-        || config.refraction)
+        || config.refraction
+        || occlusion)
         .then(|| PrepassIds {
             normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
             velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
@@ -814,6 +893,25 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .access(prepass.depth, Access::DepthAttachment)
         .build();
         record(id, PassBody::GeometryPrepass, &mut bodies);
+    }
+
+    // Registered here because this is where the depth it reduces becomes
+    // complete, and scheduled here for the same reason — nothing downstream
+    // waits on it, so the earliest slot after the prepass is also the one with
+    // the most of the frame left to hide it behind.
+    //
+    // One dispatch writes every level, which is not a choice: a pass per level,
+    // each reading the level above out of the same image, is the cycle
+    // `ImageDesc::mip_levels` documents. See `hiz_occlusion.comp` for the tile
+    // that buys.
+    if let Some(ids) = occlusion_ids {
+        let prepass = prepass.expect("occlusion culling reduces the geometry prepass's depth");
+        let id = builder
+            .pass("occlusion_hiz", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(ids.hiz, Access::StorageWrite)
+            .build();
+        record(id, PassBody::OcclusionHiz, &mut bodies);
     }
 
     if let Some(ssao) = ssao {
@@ -1637,6 +1735,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             bloom,
             prepass,
             ssao,
+            occlusion: occlusion_ids,
             contact_shadows,
             fog,
             ssr,

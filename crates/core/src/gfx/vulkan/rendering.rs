@@ -325,6 +325,7 @@ pub(super) fn rendering_info(
         PassBody::Tonemap => color_only(overwritten(swapchain.clone())),
         // Dispatches, and the overlay, which records its own command buffer.
         PassBody::Overlay
+        | PassBody::OcclusionHiz
         | PassBody::SsrHiz
         | PassBody::SsrSource
         | PassBody::SsrTrace

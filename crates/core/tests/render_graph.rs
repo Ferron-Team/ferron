@@ -75,6 +75,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // MSAA with the diffusion on, which is the five-attachment forward pass:
@@ -106,6 +107,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         (
@@ -132,6 +134,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // Four cascades write four layers of one image, which the graph tracks
@@ -164,6 +167,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // SSAO off is a different graph, not a flag read at record time: the
@@ -195,6 +199,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // The shape that proves the prepass belongs to the frame rather than to
@@ -224,6 +229,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // Metering off is the other shape that ships. Worth baselining for one
@@ -255,6 +261,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // A window too small for a real chain still gets one level, and that
@@ -285,6 +292,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // The froxel fog, with the cascades it exists to read. Worth baselining
@@ -319,6 +327,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // The whole optical chain at once: lens, then shutter, then sensor.
@@ -350,6 +359,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // The other shape that proves the prepass belongs to the frame rather
@@ -381,6 +391,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // Reflections are the first thing to sit *between* shading and the
@@ -412,6 +423,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // And the same without a resolve behind it, which is the shape where
@@ -441,6 +453,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // What actually ships in the editor: the march sits between the prepass
@@ -472,6 +485,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // And the march on its own, which is the shape that proves it keeps the
@@ -501,6 +515,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // The punctual atlas: one pass however many lights cast, because a tile
@@ -531,6 +546,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 4096,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // And the atlas with no cascades, which is an ordinary scene: an indoor
@@ -561,6 +577,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 2048,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // What ships: transparency accumulates after the reflections and before
@@ -593,6 +610,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // And transparency on its own, which is the shape that proves it keeps
@@ -623,6 +641,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // Both non-opaque queues at once, which is the shape that pins the
@@ -654,6 +673,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // And refraction on its own, which proves it keeps the geometry prepass
@@ -683,6 +703,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // Subsurface scattering is the first thing to change the *forward pass's
@@ -717,6 +738,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // And on its own, which is the shape that proves the diffusion keeps the
@@ -747,6 +769,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         (
@@ -773,6 +796,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: false,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // The split, on the frame the editor actually runs. Every configuration
@@ -810,6 +834,41 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 4096,
                 async_compute: false,
                 gpu_culling: true,
+                occlusion_culling: false,
+            },
+        ),
+        // The same frame with the depth test on, because what it adds is a
+        // second reader of the prepass depth and a *texture the cull samples* —
+        // and the pyramid the cull samples is last frame's, so the plan has to
+        // show the build after the cull rather than before it. A plan that put
+        // them the other way round would be reading a pyramid of this frame's
+        // depth to decide what this frame draws, which is the cycle the two
+        // resources exist to avoid.
+        (
+            "editor frame, GPU culling with occlusion",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                msaa: false,
+                ssao: true,
+                ssao_half_res: true,
+                contact_shadows: false,
+                ssr: false,
+                subsurface: false,
+                transparency: true,
+                refraction: false,
+                taa: true,
+                auto_exposure: true,
+                motion_blur: false,
+                dof: false,
+                volumetric_fog: false,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 4,
+                shadow_resolution: SHADOW_RESOLUTION,
+                shadow_atlas: 4096,
+                async_compute: false,
+                gpu_culling: true,
+                occlusion_culling: true,
             },
         ),
         (
@@ -836,6 +895,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 0,
                 async_compute: true,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
         // And the frame the split is *for*: every optical stage on, which is
@@ -867,6 +927,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_atlas: 2048,
                 async_compute: true,
                 gpu_culling: false,
+                occlusion_culling: false,
             },
         ),
     ]
@@ -974,6 +1035,7 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             shadow_atlas: 0,
             async_compute: false,
             gpu_culling: false,
+            occlusion_culling: false,
         })
         .unwrap();
 
@@ -1024,6 +1086,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         shadow_atlas: 0,
         async_compute: false,
         gpu_culling: false,
+        occlusion_culling: false,
     })
     .unwrap();
 
@@ -1080,6 +1143,7 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         shadow_atlas: 0,
         async_compute: false,
         gpu_culling: false,
+        occlusion_culling: false,
     })
     .unwrap();
 
@@ -1132,6 +1196,7 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         shadow_atlas: 0,
         async_compute: false,
         gpu_culling: false,
+        occlusion_culling: false,
     })
     .unwrap();
 
@@ -1193,6 +1258,7 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         shadow_atlas: 0,
         async_compute: false,
         gpu_culling: false,
+        occlusion_culling: false,
     })
     .unwrap();
 
@@ -1251,6 +1317,7 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         shadow_atlas: 0,
         async_compute: false,
         gpu_culling: false,
+        occlusion_culling: false,
     })
     .unwrap();
 
@@ -1311,6 +1378,7 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         shadow_atlas: 0,
         async_compute: false,
         gpu_culling: false,
+        occlusion_culling: false,
     };
 
     let plan = format!("{}", declare(base).unwrap().graph);
@@ -1409,6 +1477,7 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         shadow_atlas: 0,
         async_compute: false,
         gpu_culling: false,
+        occlusion_culling: false,
     })
     .unwrap();
 
@@ -1470,6 +1539,7 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         shadow_atlas: 0,
         async_compute: false,
         gpu_culling: false,
+        occlusion_culling: false,
     })
     .unwrap();
 
@@ -1522,6 +1592,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         shadow_atlas: 0,
         async_compute: false,
         gpu_culling: false,
+        occlusion_culling: false,
     })
     .unwrap();
 
@@ -1596,6 +1667,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         shadow_atlas: 0,
         async_compute: false,
         gpu_culling: false,
+        occlusion_culling: false,
     };
 
     let consumers: [(&str, fn(&mut FrameConfig)); 10] = [
@@ -1691,6 +1763,7 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         shadow_atlas: 4096,
         async_compute: false,
         gpu_culling: true,
+        occlusion_culling: false,
     })
     .unwrap();
 
@@ -1741,4 +1814,129 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         1,
         "the cull must be the only writer of the instance list:\n{plan}",
     );
+}
+
+/// Occlusion culling reads a depth pyramid the frame has not built yet, and the
+/// whole of its soundness is that this is deliberate: the pyramid the cull
+/// samples is the *previous* frame's, because the one over this frame's depth
+/// cannot exist until after the passes whose contents the cull decides.
+///
+/// So the two are separate resources, ping-ponged by the pass that owns them,
+/// and the plan has to show it — the build after the cull, and the image the
+/// cull samples never written inside the frame at all. Declared as one resource
+/// it would be a write-after-read, which this compiler makes impossible by
+/// ordering every reader after every writer: `compile` would put the cull after
+/// the build, the build after the prepass, and the prepass after the cull, and
+/// report the cycle.
+#[test]
+fn the_occlusion_pyramid_the_cull_reads_is_not_the_one_the_frame_builds() {
+    let frame = declare(FrameConfig {
+        occlusion_culling: true,
+        ..occlusion_base()
+    })
+    .unwrap();
+
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&pass| frame.graph.pass_name(pass))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} was not scheduled:\n{order:?}"))
+    };
+
+    // Last frame's pyramid, so the cull does not wait for anything this frame
+    // rasterises.
+    assert!(at("cull") < at("occlusion_hiz"), "{order:?}");
+    // And this frame's is reduced from the depth once that depth is complete.
+    assert!(at("geometry_prepass") < at("occlusion_hiz"), "{order:?}");
+
+    let plan = format!("{}", frame.graph);
+    // Read by the cull and by nothing else, and — the part that matters —
+    // written by nothing. A frame that wrote it would be overwriting the
+    // pyramid it is in the middle of reading.
+    assert_eq!(
+        plan.matches("occlusion_history Sampled\n").count(),
+        1,
+        "the cull must be the only reader of last frame's pyramid:\n{plan}",
+    );
+    assert_eq!(
+        plan.matches("occlusion_history StorageWrite\n").count(),
+        0,
+        "last frame's pyramid must not be written this frame:\n{plan}",
+    );
+    assert_eq!(
+        plan.matches("occlusion_hiz StorageWrite\n").count(),
+        1,
+        "the build must be the only writer of this frame's pyramid:\n{plan}",
+    );
+}
+
+/// Switching the test off declares neither the build nor the read, rather than
+/// building a pyramid nothing samples. The flag is structural, and this is what
+/// that word buys.
+#[test]
+fn a_frame_without_occlusion_culling_builds_no_pyramid() {
+    let frame = declare(occlusion_base()).unwrap();
+
+    let plan = format!("{}", frame.graph);
+    assert!(!plan.contains("occlusion"), "{plan}");
+}
+
+/// The pyramid is reduced from the geometry prepass's depth, so a frame that
+/// asks for the test needs that pass whatever else it has switched off — the
+/// same claim SSAO, TAA and reflections each make on it.
+#[test]
+fn occlusion_culling_keeps_the_prepass_alive_on_its_own() {
+    let frame = declare(FrameConfig {
+        msaa: true,
+        ssao: false,
+        taa: false,
+        transparency: false,
+        auto_exposure: false,
+        occlusion_culling: true,
+        ..occlusion_base()
+    })
+    .unwrap();
+
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&pass| frame.graph.pass_name(pass))
+        .collect();
+    assert!(order.contains(&"geometry_prepass"), "{order:?}");
+    assert!(order.contains(&"occlusion_hiz"), "{order:?}");
+}
+
+/// The frame the three tests above vary one field of.
+fn occlusion_base() -> FrameConfig {
+    FrameConfig {
+        color_format: COLOR_FORMAT,
+        msaa: false,
+        ssao: true,
+        ssao_half_res: false,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: true,
+        refraction: false,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        shadow_cascades: 4,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 4096,
+        async_compute: false,
+        gpu_culling: true,
+        occlusion_culling: false,
+    }
 }

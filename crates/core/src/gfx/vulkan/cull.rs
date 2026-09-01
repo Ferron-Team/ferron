@@ -60,6 +60,7 @@ use crate::geom::{Aabb, Frustum};
 use super::context::VkContext;
 use super::instances::InstanceEntry;
 use super::mesh::MeshSpan;
+use super::occlusion::OcclusionTest;
 use super::record::{Arena, Recorder};
 
 /// Invocations per workgroup, in both shaders. The cull dispatch is
@@ -148,6 +149,14 @@ struct CullPush {
     /// Where the masked batches begin, which is what turns the class and index
     /// an instance carries into the batch's slot. See [`slot`].
     plain_count: u32,
+    /// The camera the bound pyramid was rasterised through — the *previous*
+    /// frame's, because that is the frame whose depth survived to be reduced.
+    /// See [`occlusion`](super::occlusion).
+    prev_view_proj: [[f32; 4]; 4],
+    /// Whether the depth test runs at all. A push rather than a second pipeline
+    /// because the branch is uniform across the dispatch, so what it would buy
+    /// is a shader compile.
+    occlusion: u32,
 }
 
 /// One batch as the passes need it: which geometry it draws, beside where its
@@ -586,6 +595,8 @@ impl CullPass {
         rows: &Subbuffer<[super::instances::GpuObject]>,
         frame: &CullFrame,
         views: &[CullView],
+        occlusion: &OcclusionTest,
+        prev_view_proj: Mat4,
     ) {
         let set = DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
@@ -597,6 +608,11 @@ impl CullPass {
                 WriteDescriptorSet::buffer(3, self.upload_views(frame, views)),
                 WriteDescriptorSet::buffer(4, self.commands.clone()),
                 WriteDescriptorSet::buffer(5, self.indices.clone()),
+                WriteDescriptorSet::image_view_sampler(
+                    6,
+                    occlusion.pyramid.clone(),
+                    occlusion.sampler.clone(),
+                ),
             ],
             [],
         )
@@ -618,6 +634,8 @@ impl CullPass {
                     view_count: frame.views,
                     batch_count: frame.batches.len() as u32,
                     plain_count: frame.plain as u32,
+                    prev_view_proj: prev_view_proj.to_cols_array_2d(),
+                    occlusion: u32::from(occlusion.live),
                 },
             )
             .dispatch([

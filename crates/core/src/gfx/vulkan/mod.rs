@@ -13,6 +13,7 @@ mod instances;
 mod line;
 mod mesh;
 mod motion_blur;
+mod occlusion;
 mod oit;
 mod parallel;
 mod pipeline_cache;
@@ -68,6 +69,7 @@ use self::environment::EnvironmentPass;
 use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
 use self::instances::InstanceStore;
 use self::mesh::MeshArena;
+use self::occlusion::OcclusionPass;
 use self::oit::OitPass;
 use self::refraction::RefractionPass;
 use crate::gfx::graph::{PassKind, Queue as GraphQueue, ResourceId};
@@ -196,10 +198,18 @@ pub struct VulkanRenderer {
     /// set — the pipelines cost a compile at startup and nothing per frame, and
     /// the flag is meant to be switched without a rebuild.
     cull: CullPass,
+    /// Owns the ping-ponged depth pyramid the graph imports, and records the
+    /// dispatch that fills it. Built whether or not the frame tests, for the
+    /// reason `cull` is built whether or not it culls.
+    occlusion: OcclusionPass,
     /// Read once. The graph is compiled against it, so a mid-run change would
     /// leave the passes and the plan disagreeing about who writes
     /// `instance_index`.
     gpu_culling: bool,
+    /// Read once, for the reason `gpu_culling` is: the graph is compiled
+    /// against it, and the pass that samples last frame's pyramid has to be the
+    /// pass the plan says samples it.
+    occlusion_culling: bool,
     hdr: HdrPass,
     /// Owns the histogram and exposure buffers the graph imports, and records
     /// the two dispatches that fill them.
@@ -412,6 +422,7 @@ impl VulkanRenderer {
         // Compiled for the editor's frame, which is what all but the headless
         // path uses; anything else recompiles on its first render.
         let gpu_culling = read_gpu_culling(&ctx);
+        let occlusion_culling = gpu_culling && read_occlusion_culling();
         let config = FrameConfig {
             color_format: format,
             msaa: false,
@@ -434,6 +445,7 @@ impl VulkanRenderer {
             shadow_atlas: 0,
             async_compute: ctx.compute_queue.is_some(),
             gpu_culling,
+            occlusion_culling,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -443,7 +455,9 @@ impl VulkanRenderer {
         Self {
             instances: InstanceStore::new(&ctx),
             cull: CullPass::new(&ctx),
+            occlusion: OcclusionPass::new(&ctx),
             gpu_culling,
+            occlusion_culling,
             ctx,
             swapchain,
             forward,
@@ -727,6 +741,17 @@ impl VulkanRenderer {
             // same reason: the scatter pass reads its own previous frame.
             return self.fog.scatter_view();
         }
+        if let Some(ids) = self.frame.ids.occlusion {
+            // Imported and ping-ponged like the TAA history, and for a stronger
+            // version of the same reason: what the cull reads is not merely a
+            // history, it is the only thing that keeps the frame acyclic.
+            if id == ids.hiz {
+                return self.occlusion.hiz_view();
+            }
+            if id == ids.history {
+                return self.occlusion.history_view();
+            }
+        }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.taa.output_view(),
             _ => self.images.view(id),
@@ -762,6 +787,18 @@ impl VulkanRenderer {
             return Some(record::Target::Image(
                 self.fog.scatter_view().image().clone(),
             ));
+        }
+        if let Some(occlusion) = ids.occlusion {
+            if id == occlusion.hiz {
+                return Some(record::Target::Image(
+                    self.occlusion.hiz_view().image().clone(),
+                ));
+            }
+            if id == occlusion.history {
+                return Some(record::Target::Image(
+                    self.occlusion.history_view().image().clone(),
+                ));
+            }
         }
         if let Some(taa) = ids.taa {
             if id == taa.output {
@@ -1161,6 +1198,7 @@ impl VulkanRenderer {
             // had, on a device with two queues as much as on one.
             async_compute: self.ctx.compute_queue.is_some(),
             gpu_culling: self.gpu_culling,
+            occlusion_culling: self.occlusion_culling,
         });
 
         // Release what the GPU has already finished and block only if the CPU
@@ -1264,6 +1302,16 @@ impl VulkanRenderer {
         // Both resolve their optics against this frame's camera: the lens takes
         // its focal length from the field of view, and the shutter takes the
         // depth range it linearises with.
+        // Beside the jitter and for the same reason: this decides which half of
+        // the pyramid pair the cull reads and which the build writes, and every
+        // pass that touches either has to agree. It also answers whether the
+        // half being read holds anything — a freshly allocated pair does not,
+        // and the cull is told to test nothing that frame.
+        let occlusion_live = self.occlusion.begin_frame(
+            &self.ctx,
+            self.gpu_culling && self.occlusion_culling,
+            self.swapchain.extent,
+        );
         self.dof.begin_frame(dof, camera, self.swapchain.extent);
         // Resolved against the camera for the reason the lens is: the kernel's
         // width in pixels is a world length divided by a view depth, so both
@@ -1678,6 +1726,8 @@ impl VulkanRenderer {
             object_rows: object_rows.clone(),
             cull_frame,
             cull_views: &cull_views,
+            occlusion_test: self.occlusion.test(occlusion_live),
+            occlusion: &self.occlusion,
             caster_sets,
             blended_sets,
             forward_sets,
@@ -2021,6 +2071,12 @@ struct FrameRecord<'a> {
     /// indirect commands, so the two cannot half-switch.
     cull_frame: Option<cull::CullFrame>,
     cull_views: &'a [CullView],
+    /// The previous frame's pyramid, and whether the cull may conclude anything
+    /// from it. Assembled here rather than reached for through `self` because
+    /// what the cull binds when the frame does not test is a fallback the pass
+    /// owns — see [`occlusion::OcclusionTest`].
+    occlusion_test: occlusion::OcclusionTest,
+    occlusion: &'a OcclusionPass,
     caster_sets: Option<shadow::CasterSets>,
     forward_sets: forward::ForwardSets,
     /// The same sets with the blended queues' own instance buffer bound. Equal
@@ -2082,6 +2138,17 @@ fn read_gpu_culling(ctx: &VkContext) -> bool {
         );
     }
     asked && ctx.multi_draw
+}
+
+/// Whether the cull also drops what the previous frame's depth already covered.
+///
+/// A second variable rather than a level of the first, because the two answer
+/// different questions: `ORRIN_GPU_CULL` asks whether the visible set is decided
+/// on the GPU at all, and this asks whether that decision is allowed to be
+/// *smaller* than the frustum's. It has no effect without the first, which is
+/// where it is anded.
+fn read_occlusion_culling() -> bool {
+    std::env::var("ORRIN_OCCLUSION").is_ok_and(|value| value.trim() == "1")
 }
 
 /// How many sets of the graph's transient images the compiled frame needs.
@@ -2259,6 +2326,18 @@ impl FrameRecord<'_> {
             return Some(record::Target::Image(
                 self.fog.scatter_view().image().clone(),
             ));
+        }
+        if let Some(occlusion) = ids.occlusion {
+            if id == occlusion.hiz {
+                return Some(record::Target::Image(
+                    self.occlusion.hiz_view().image().clone(),
+                ));
+            }
+            if id == occlusion.history {
+                return Some(record::Target::Image(
+                    self.occlusion.history_view().image().clone(),
+                ));
+            }
         }
         if let Some(taa) = ids.taa {
             if id == taa.output {
@@ -2652,6 +2731,21 @@ impl FrameRecord<'_> {
                         &self.object_rows,
                         frame,
                         self.cull_views,
+                        &self.occlusion_test,
+                        self.view.prev_view_proj,
+                    );
+                }
+                PassBody::OcclusionHiz => {
+                    let prepass = self
+                        .frame
+                        .ids
+                        .prepass
+                        .expect("the graph scheduled the occlusion pyramid with no prepass");
+                    self.occlusion.record(
+                        builder,
+                        &self.ctx,
+                        self.images.view(prepass.depth),
+                        self.extent,
                     );
                 }
                 PassBody::LuminanceHistogram => self.exposure.record_histogram(
@@ -2937,7 +3031,8 @@ impl FrameRecord<'_> {
             | PassBody::BloomDownsample(_)
             | PassBody::BloomUpsample(_)
             | PassBody::CullReset
-            | PassBody::Cull => unreachable!("handled above"),
+            | PassBody::Cull
+            | PassBody::OcclusionHiz => unreachable!("handled above"),
         }
 
         builder.end_rendering();
