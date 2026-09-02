@@ -21,12 +21,16 @@ pub mod config;
 pub mod gamepad;
 pub mod keys;
 mod state;
+#[cfg(feature = "scripting")]
+pub mod watch;
 
 pub use actions::{ActionId, Actions, Axis, Definition, Spec};
 pub use binding::Binding;
 pub use config::ConfigError;
 pub use gamepad::Gamepads;
 pub use state::InputState;
+#[cfg(feature = "scripting")]
+pub use watch::ConfigWatcher;
 
 /// How many players an input config can address.
 ///

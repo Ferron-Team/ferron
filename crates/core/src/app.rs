@@ -80,6 +80,10 @@ pub struct App {
     /// — see `BuildWatcher::for_game_assembly`.
     #[cfg(feature = "scripting")]
     build_watcher: Option<crate::build_watcher::BuildWatcher>,
+    /// Reload-on-save for the project's binding file. `None` without a project,
+    /// without the file, or in a build with no `notify`.
+    #[cfg(feature = "scripting")]
+    input_watcher: Option<crate::scene::input::ConfigWatcher>,
     /// The gamepad backend. `None` when the machine has no gamepad subsystem
     /// to open, which is a session on keyboard and mouse rather than a failure.
     gamepads: Option<crate::scene::input::Gamepads>,
@@ -202,6 +206,8 @@ impl App {
             scripting: None,
             #[cfg(feature = "scripting")]
             build_watcher: None,
+            #[cfg(feature = "scripting")]
+            input_watcher: None,
             gamepads,
             project,
             scene: SceneChoice::from_env(),
@@ -289,6 +295,19 @@ impl App {
         match crate::scene::input::config::load(&path) {
             Ok(specs) => self.world.resource_mut::<Actions>().apply(specs),
             Err(error) => eprintln!("orrin: {error}"),
+        }
+
+        // Watched even when the first read failed: the file is on disk, and
+        // fixing it is exactly the save the watcher exists to notice.
+        #[cfg(feature = "scripting")]
+        {
+            self.input_watcher = match crate::scene::input::ConfigWatcher::new(&path) {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    eprintln!("orrin: {error}");
+                    None
+                }
+            };
         }
     }
 
@@ -544,6 +563,15 @@ impl ApplicationHandler for App {
                 };
                 self.world.resource_mut::<Time>().update(delta);
                 self.world.resource_mut::<FrameStats>().record(delta);
+
+                // Before the resolve, so a binding saved this frame is the one
+                // the frame runs on. `Actions::apply` seeds the previous frame
+                // from the current one, so the swap itself fires no edges.
+                #[cfg(feature = "scripting")]
+                if let Some(watcher) = &mut self.input_watcher {
+                    profile_scope!("input watcher");
+                    watcher.service(&self.world);
+                }
 
                 // Pads are polled, so their frame starts here — before the
                 // resolve that reads them, and gated on focus so a stick held
