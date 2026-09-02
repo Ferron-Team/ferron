@@ -25,11 +25,11 @@ use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
 use crate::scene::{
-    AmbientLight, BloomSettings, Camera, ContactShadowSettings, Culling, DebugLine, DebugLines,
-    DecalSettings, Diagnostics, DofSettings, EnvironmentSettings, FogSettings, HdrSettings,
-    InputState, LogBuffer, LogLevel, MotionBlurSettings, PresentSettings, RefractionSettings,
-    ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings, Time,
-    TransparencySettings, load_hdri,
+    Actions, AmbientLight, BloomSettings, Camera, ContactShadowSettings, Culling, DebugLine,
+    DebugLines, DecalSettings, Diagnostics, DofSettings, EnvironmentSettings, FogSettings,
+    HdrSettings, InputState, LogBuffer, LogLevel, MotionBlurSettings, PresentSettings,
+    RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
+    Time, TransparencySettings, load_hdri,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -80,6 +80,9 @@ pub struct App {
     /// — see `BuildWatcher::for_game_assembly`.
     #[cfg(feature = "scripting")]
     build_watcher: Option<crate::build_watcher::BuildWatcher>,
+    /// The gamepad backend. `None` when the machine has no gamepad subsystem
+    /// to open, which is a session on keyboard and mouse rather than a failure.
+    gamepads: Option<crate::scene::input::Gamepads>,
     /// The Orrin project this run was launched inside, if any. `None` means
     /// the engine is running standalone on its built-in demo scene — and, for
     /// the editor, that there is nowhere to keep themes or a layout.
@@ -170,6 +173,18 @@ impl App {
             );
         }
 
+        // Opened here rather than with the world's resources, because
+        // enumerating input devices is an OS scan and the cold-start gate
+        // measures `install_default_resources`. Its cost belongs to the run,
+        // not to the number that guards scene construction.
+        let gamepads = match crate::scene::input::Gamepads::new() {
+            Ok(gamepads) => Some(gamepads),
+            Err(error) => {
+                eprintln!("orrin: {error}");
+                None
+            }
+        };
+
         let mut app = App {
             instance,
             active: None,
@@ -187,6 +202,7 @@ impl App {
             scripting: None,
             #[cfg(feature = "scripting")]
             build_watcher: None,
+            gamepads,
             project,
             scene: SceneChoice::from_env(),
             stress: StressSpec::from_env().filter(|spec| !spec.is_empty()),
@@ -195,6 +211,7 @@ impl App {
 
         crate::scene::register_components(&mut app.registry);
         Self::install_default_resources(&mut app.world);
+        app.load_input_config();
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -242,6 +259,7 @@ impl App {
         world.insert_resource(FrameStats::new());
         world.insert_resource(Profiler::default());
         world.insert_resource(InputState::new());
+        world.insert_resource(Actions::new());
         world.insert_resource(crate::collision::CollisionState::default());
         world.insert_resource(LogBuffer::default());
         world.insert_resource(DebugLines::default());
@@ -250,6 +268,28 @@ impl App {
         // it either way, and `Off` is how it explains itself.
         #[cfg(feature = "scripting")]
         world.insert_resource(crate::build_watcher::BuildStatus::default());
+    }
+
+    /// Read the project's `input.toml`, if it has one.
+    ///
+    /// A project without the file is normal and silent: bindings are optional,
+    /// and an unbound action already reports itself the first time a script
+    /// asks for one. A file that exists and does not parse is loud but not
+    /// fatal — the session runs with nothing bound rather than refusing to
+    /// start, because the fix is a text edit away and the editor is where it
+    /// will be made.
+    fn load_input_config(&mut self) {
+        let Some(root) = self.project.as_ref().map(|project| project.root()) else {
+            return;
+        };
+        let path = root.join(crate::scene::input::config::FILE_NAME);
+        if !path.exists() {
+            return;
+        }
+        match crate::scene::input::config::load(&path) {
+            Ok(specs) => self.world.resource_mut::<Actions>().apply(specs),
+            Err(error) => eprintln!("orrin: {error}"),
+        }
     }
 
     /// Boot the script host and attach the project's entry Behaviour.
@@ -504,6 +544,34 @@ impl ApplicationHandler for App {
                 };
                 self.world.resource_mut::<Time>().update(delta);
                 self.world.resource_mut::<FrameStats>().record(delta);
+
+                // Pads are polled, so their frame starts here — before the
+                // resolve that reads them, and gated on focus so a stick held
+                // in a background window drives nothing.
+                if let Some(gamepads) = &mut self.gamepads {
+                    profile_scope!("gamepads");
+                    let mut input = self.world.resource_mut::<InputState>();
+                    let focused = input.focused();
+                    gamepads.pump(&mut input, focused);
+                }
+
+                // Actions resolve here and nowhere else: after this frame's
+                // events have landed, before anything reads an action. Not
+                // gated on an event arriving or on scripts running, because an
+                // action's edges are derived by comparing this frame against
+                // the last one — a frame that skipped the resolve would leave
+                // the previous frame's press standing for a second frame.
+                {
+                    profile_scope!("input actions");
+                    let input = self.world.resource::<InputState>();
+                    self.world.resource_mut::<Actions>().resolve(&input);
+                }
+                let frame = self.world.resource::<Time>().frame_count();
+                for warning in self.world.resource_mut::<Actions>().take_warnings() {
+                    self.world
+                        .resource_mut::<LogBuffer>()
+                        .push(LogLevel::Warning, warning, frame);
+                }
 
                 {
                     profile_scope!("spin");

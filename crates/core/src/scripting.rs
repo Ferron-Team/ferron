@@ -18,9 +18,9 @@ use orrin_script::{CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi
 
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::{
-    Assets, Collider, ColliderShape, DebugLines, InputState, LocalTransform, LogBuffer, LogLevel,
-    MaterialHandle, MeshHandle, Name, Parent, ScriptComponent, Tag, Time, Transform,
-    WorldTransform,
+    ActionId, Actions, Assets, Collider, ColliderShape, DebugLines, InputState, LocalTransform,
+    LogBuffer, LogLevel, MaterialHandle, MeshHandle, Name, Parent, ScriptComponent, Tag, Time,
+    Transform, WorldTransform,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -209,6 +209,47 @@ extern "C" fn key_released(code: u32) -> bool {
 
 extern "C" fn mouse_button_down(button: u32) -> bool {
     with_input(|input| input.mouse_button_down(button))
+}
+
+// Named input. `action_id` needs `&mut Actions` to intern, which is why it is
+// the one input entry point that takes the resource mutably; the queries below
+// only read.
+
+extern "C" fn action_id(name: *const c_char) -> u32 {
+    if name.is_null() {
+        return orrin_script::NO_ACTION;
+    }
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    orrin_script::with_world(orrin_script::NO_ACTION, |world| {
+        world
+            .get_resource_mut::<Actions>()
+            .map_or(orrin_script::NO_ACTION, |mut actions| actions.id(&name).0)
+    })
+}
+
+fn with_actions<R: Default>(query: impl FnOnce(&Actions) -> R) -> R {
+    orrin_script::with_world(R::default(), |world| {
+        world
+            .get_resource::<Actions>()
+            .map_or_else(R::default, |actions| query(&actions))
+    })
+}
+
+extern "C" fn action_held(id: u32, player: u32) -> bool {
+    with_actions(|actions| actions.held(ActionId(id), player as usize))
+}
+
+extern "C" fn action_pressed(id: u32, player: u32) -> bool {
+    with_actions(|actions| actions.pressed(ActionId(id), player as usize))
+}
+
+extern "C" fn action_released(id: u32, player: u32) -> bool {
+    with_actions(|actions| actions.released(ActionId(id), player as usize))
+}
+
+extern "C" fn axis_value(id: u32, player: u32) -> f32 {
+    with_actions(|actions| actions.axis(ActionId(id), player as usize))
 }
 
 extern "C" fn cursor_pos(x: *mut f32, y: *mut f32) {
@@ -815,6 +856,11 @@ fn build_api() -> OrrinApi {
         set_world_transform,
         get_parent,
         set_parent,
+        action_id,
+        action_held,
+        action_pressed,
+        action_released,
+        axis_value,
         ..orrin_script::default_api()
     }
 }

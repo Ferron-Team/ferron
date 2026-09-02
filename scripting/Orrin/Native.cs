@@ -45,6 +45,14 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<Entity, Transform*, byte> SetWorldTransform;
     public delegate* unmanaged<Entity, Entity> GetParent;
     public delegate* unmanaged<Entity, Entity, byte, byte> SetParent;
+    // Named input. Appended after SetParent, matching the Rust struct; never
+    // reordered above it. The name crosses once, at ActionId; every query after
+    // that passes the handle it returned.
+    public delegate* unmanaged<byte*, uint> ActionId;
+    public delegate* unmanaged<uint, uint, byte> ActionHeld;
+    public delegate* unmanaged<uint, uint, byte> ActionPressed;
+    public delegate* unmanaged<uint, uint, byte> ActionReleased;
+    public delegate* unmanaged<uint, uint, float> AxisValue;
 }
 
 public static unsafe class Native
@@ -155,6 +163,24 @@ public static unsafe class Native
     public static float TimeTotal() => _api.TimeTotal();
 
     public static ulong TimeFrameCount() => _api.TimeFrameCount();
+
+    /// The handle for an action name, interning it on first use. Stable for the
+    /// life of the process: a binding reload changes what it points at, never
+    /// what it is.
+    public static uint ActionId(string name)
+    {
+        var nameBytes = NulTerminated(name);
+        fixed (byte* namePtr = nameBytes)
+            return _api.ActionId(namePtr);
+    }
+
+    public static bool ActionHeld(uint id, uint player) => _api.ActionHeld(id, player) != 0;
+
+    public static bool ActionPressed(uint id, uint player) => _api.ActionPressed(id, player) != 0;
+
+    public static bool ActionReleased(uint id, uint player) => _api.ActionReleased(id, player) != 0;
+
+    public static float AxisValue(uint id, uint player) => _api.AxisValue(id, player);
 
     public static Entity? FindByTag(string tag)
     {

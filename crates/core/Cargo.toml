@@ -33,6 +33,7 @@ notify = { version = "8", optional = true }
 ash = "0.38"
 egui_dock = { version = "0.16", features = ["serde"] }
 rayon = { workspace = true }
+gilrs = "0.11.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

@@ -13,7 +13,7 @@ mod environment;
 mod fog;
 mod hdr;
 mod hierarchy;
-mod input;
+pub mod input;
 mod material;
 mod mesh;
 pub mod model;
@@ -52,7 +52,7 @@ pub use hierarchy::{
     Hierarchy, HierarchyError, can_reparent, despawn_recursive, ensure_current, is_transform_root,
     parent_world_matrix, propagate_transforms, reparent,
 };
-pub use input::InputState;
+pub use input::{ActionId, Actions, Binding, InputState, MAX_PLAYERS};
 pub use material::MaterialBlends;
 pub use mesh::{CpuMesh, MeshBounds};
 pub use motion_blur::MotionBlurSettings;
