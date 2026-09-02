@@ -4,6 +4,7 @@
 // non-zero on any failure. Dependency-free on purpose — convert to xunit when
 // the scripting side grows a real test suite.
 
+using Orrin;
 using Orrin.Math;
 
 using SN = System.Numerics;
@@ -193,5 +194,110 @@ unsafe
     Check(sizeof(Orrin.Transform) == 40, "Transform is 10 floats");
 }
 
+// --- property bag ABI ----------------------------------------------------------
+//
+// The other frozen layout, and the one with no `sizeof` to lean on: this file
+// and `orrin-registry`'s `wire` module are two implementations of one grammar,
+// so the check is that they produce and accept the same bytes. Both constants
+// below are asserted on the Rust side too (`wire::tests::the_golden_vector_*`);
+// changing the format means changing four places, which is the point.
+
+string Hex(ReadOnlySpan<byte> bytes) => Convert.ToHexStringLower(bytes);
+
+// What a Behaviour with one field of every representable type encodes to.
+const string BagGolden =
+    "0808000000"
+    + "020000004f6e0001"
+    + "05000000436f756e7401feffffff"
+    + "05000000496e6465780207000000"
+    + "050000005370656564030000c03f"
+    + "050000004c6162656c0402000000" + "6869"
+    + "08000000506f736974696f6e050000803f0000004000004040"
+    + "08000000526f746174696f6e060000000000000000000000000000803f"
+    + "040000004d6f6465090400000053706f7400000000";
+
+// Every variant, including the two a Behaviour cannot express. Written by Rust;
+// the decoder must step over what it cannot represent and still land the rest.
+const string FullGolden =
+    "080a000000"
+    + "020000006f6e0001"
+    + "05000000636f756e7401feffffff"
+    + "05000000696e6465780207000000"
+    + "050000007370656564030000c03f"
+    + "050000006c6162656c04020000006869"
+    + "08000000706f736974696f6e050000803f0000004000004040"
+    + "08000000726f746174696f6e060000000000000000000000000000803f"
+    + "060000007461726765740700000000000000000000000000000000"
+    + "06000000706f696e74730a01000000030000003f"
+    + "040000006d6f6465090400000053706f7401000000020000006f6e0000";
+
+var bag = new BagProbe();
+Check(Hex(PropertyBag.Encode(bag)) == BagGolden, "property bag encodes to the golden bytes");
+
+// Round trip through the format rather than through the object: a field that
+// encoded but did not decode would otherwise pass by having never moved.
+var restored = new BagProbe
+{
+    On = false, Count = 0, Index = 0, Speed = 0f, Label = "",
+    Position = Vector3.zero, Rotation = new Quaternion(1, 0, 0, 0), Mode = BagMode.Point,
+};
+PropertyBag.Decode(restored, Convert.FromHexString(BagGolden));
+Check(restored.On && restored.Count == -2 && restored.Index == 7u, "bag round trip: integers");
+Check(restored.Speed == 1.5f && restored.Label == "hi", "bag round trip: float and string");
+Check(restored.Position == new Vector3(1, 2, 3), "bag round trip: Vector3");
+Check(restored.Rotation == Quaternion.identity, "bag round trip: Quaternion");
+Check(restored.Mode == BagMode.Spot, "bag round trip: enum by member name");
+
+// `Transient` and `readonly` are the two ways out of the registry, and a field
+// of an unrepresentable type is simply not in it.
+Check(
+    PropertyBag.VisibleFields(typeof(BagProbe)).Select(f => f.Name).SequenceEqual(
+        ["On", "Count", "Index", "Speed", "Label", "Position", "Rotation", "Mode"]),
+    "only representable, non-transient, writable fields are visible");
+
+// The lenient half. A buffer whose fields this build does not have must be
+// stepped over rather than throwing or desynchronizing — including the `Entity`
+// and `List` values no Behaviour can express, which is the case `FullGolden`
+// exists for. Field names are matched ordinally, so none of its lower-case names
+// land on BagProbe's.
+var untouched = new BagProbe { Speed = 99f };
+PropertyBag.Decode(untouched, Convert.FromHexString(FullGolden));
+Check(untouched.Speed == 99f, "a bag of entirely unknown fields changes nothing");
+
+// Mixed: one field this build has, one it does not, in that order — so a failure
+// to step over the unknown one would land the wrong bytes on `Speed`.
+var mixed = new BagProbe { Speed = 99f };
+PropertyBag.Decode(mixed, Convert.FromHexString(
+    "0802000000"
+    + "05000000" + Hex("Ghost"u8) + "030000803f"
+    + "05000000" + Hex("Speed"u8) + "0300002040"));
+Check(mixed.Speed == 2.5f, "an unknown field is stepped over, not misread");
+
+var renamed = new BagProbe { Mode = BagMode.Point };
+PropertyBag.Decode(renamed, Convert.FromHexString(
+    "080100000004000000" + Hex("Mode"u8) + "09040000004172656100000000"));
+Check(renamed.Mode == BagMode.Point, "an enum member this build lost leaves the field alone");
+
 Console.WriteLine($"{passed} passed, {failures} failed");
 return failures == 0 ? 0 : 1;
+
+enum BagMode { Point, Spot }
+
+/// Field order is the order the bag is written in, so this declaration is part
+/// of the golden above.
+sealed class BagProbe : Behaviour
+{
+    public bool On = true;
+    public int Count = -2;
+    public uint Index = 7;
+    public float Speed = 1.5f;
+    public string Label = "hi";
+    public Vector3 Position = new(1, 2, 3);
+    public Quaternion Rotation = Quaternion.identity;
+    public BagMode Mode = BagMode.Spot;
+
+    [Transient]
+    public float Cache = 3f;
+    public readonly int Constant = 5;
+    public Vector2 Unrepresentable = new(1, 2);
+}

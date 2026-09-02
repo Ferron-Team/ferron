@@ -210,7 +210,7 @@ public static unsafe class BehaviourState
     /// Instance fields of `type` that a reload should carry, most-derived first
     /// so that a base field shadowed with `new` loses to the derived one when
     /// keyed by name downstream.
-    static IEnumerable<FieldInfo> CapturableFields(Type type)
+    internal static IEnumerable<FieldInfo> CapturableFields(Type type)
     {
         // DeclaredOnly is required, not an optimization: asked for a leaf type,
         // reflection returns inherited public and protected fields but *not*

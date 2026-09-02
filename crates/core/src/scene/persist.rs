@@ -55,7 +55,7 @@ pub fn to_document(world: &mut World, registry: &orrin_registry::Registry) -> Sc
 
             let mut components: Vec<(ComponentId, orrin_registry::Value)> = registry
                 .components()
-                .filter_map(|c| (c.read)(world, entity).map(|value| (c.id.clone(), value)))
+                .filter_map(|c| c.read(world, entity).map(|value| (c.id.clone(), value)))
                 .collect();
 
             components.extend(asset_refs(world, entity));
@@ -206,7 +206,7 @@ pub fn instantiate(
             }
             match registry.get(id) {
                 Some(vtable) => {
-                    if let Err(error) = (vtable.write)(world, entity, value) {
+                    if let Err(error) = vtable.write(world, entity, value) {
                         // Kept as well as reported: a field the current build
                         // rejects is exactly the data a save must not silently
                         // drop.

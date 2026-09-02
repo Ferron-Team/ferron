@@ -119,6 +119,19 @@ impl Value {
         };
         fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
     }
+
+    /// [`field`](Self::field) for a caller that is about to overwrite what it
+    /// finds. Cannot add a field: a name that is not already there is a value
+    /// the type would not read back, so [`diff::apply`](crate::apply) reports it
+    /// rather than inventing a slot.
+    pub fn field_mut(&mut self, name: &str) -> Option<&mut Value> {
+        let fields = match self {
+            Value::Struct(fields) => fields,
+            Value::Enum { fields, .. } => fields,
+            _ => return None,
+        };
+        fields.iter_mut().find(|(n, _)| n == name).map(|(_, v)| v)
+    }
 }
 
 impl FieldPath {
@@ -139,10 +152,22 @@ impl FieldPath {
     }
 
     /// Private so that only [`ValueError::at_field`] / [`ValueError::at_index`]
-    /// can extend a path: paths are built while an error unwinds, never
+    /// can *prepend*: an error's path is built while the error unwinds, never
     /// threaded down into the read itself.
     fn push_front(&mut self, segment: PathSegment) {
         self.0.insert(0, segment);
+    }
+
+    /// Descend one level. The diff walks top-down, so it appends where an error
+    /// prepends; the two directions must not be confused, hence separate names
+    /// rather than one `push`.
+    pub fn push(&mut self, segment: PathSegment) {
+        self.0.push(segment);
+    }
+
+    /// Ascend one level, undoing the matching [`push`](Self::push).
+    pub fn pop(&mut self) {
+        self.0.pop();
     }
 }
 

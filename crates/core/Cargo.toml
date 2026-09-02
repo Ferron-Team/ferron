@@ -8,7 +8,9 @@ orrin-project.workspace =  true
 orrin-script = { workspace = true, optional = true }
 orrin-build = { workspace = true, optional = true }
 orrin-ecs.workspace = true
-orrin-registry.workspace = true
+# `egui` turns on the registry's inspector vtable entry. No new dependency:
+# egui is already below.
+orrin-registry = { workspace = true, features = ["egui"] }
 vulkano.workspace = true
 vulkano-shaders.workspace = true
 winit.workspace = true

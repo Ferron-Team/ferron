@@ -3,8 +3,17 @@ name = "orrin-registry"
 version.workspace = true
 edition.workspace = true
 
+# The inspector half of the vtable is optional so that the crate stays a
+# data-only dependency for anything with no UI — the collaboration server of
+# architecture §4.2 consumes the same diffs and must not link a UI toolkit to do
+# it. `orrin-core` turns it on and pays nothing extra: egui is already in its
+# tree.
+[features]
+egui = ["dep:egui"]
+
 [dependencies]
 orrin-ecs.workspace=true
 orrin-macros.workspace = true
 glam.workspace = true
 uuid.workspace = true
+egui = { workspace = true, optional = true }

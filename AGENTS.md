@@ -21,13 +21,13 @@ Rust edition 2024, resolver 3. Cargo workspace, `members = ["crates/*"]`.
 | --- | --- |
 | `crates/core` (`orrin-core`) | The engine and editor binary: renderer, render graph, scene, systems, editor panels, scripting FFI |
 | `crates/orrin-ecs` | Entities, sparse-set storage, queries. `#![forbid(unsafe_code)]`. No renderer/math/window deps — mechanism only |
-| `crates/orrin-registry` | Per-component reflection: read, write, default, keyed by a stable string id. Scene save/load, inspector, and later undo and sync are all written once against it |
+| `crates/orrin-registry` | Per-component reflection: read, write, remove, diff, apply, inspect, default, keyed by a stable string id. Scene save/load, the inspector, and later undo and sync are all written once against it. A C# Behaviour registers here too, through a property bag (`wire`) rather than a Rust type |
 | `crates/orrin-macros` | `#[derive(Reflect)]` for the registry |
 | `crates/orrin-script` | Boots CoreCLR via netcorehost; the C ABI over the engine |
 | `crates/orrin-build` | `dotnet build` for a project's C# |
 | `crates/orrin-project` | The `orrin.toml` project manifest |
 | `crates/orrin-cli` (binary `orrin`) | `orrin new` / `build` / `run` |
-| `scripting/Orrin` | The C# bindings assembly. `scripting/DemoGame` is a game assembly like any project's |
+| `scripting/Orrin` | The C# bindings assembly. `scripting/DemoGame` is a game assembly like any project's; `scripting/Orrin.Analyzers` is the Roslyn analyzer holding Behaviour fields to the registry-visible / `[Transient]` split |
 
 Inside `crates/core/src`:
 
@@ -65,7 +65,8 @@ cargo check -p orrin-core --no-default-features --all-targets
 # A project through the CLI
 cargo build -p orrin-cli && ./target/debug/orrin new my-game && ./target/debug/orrin run
 
-# The C# half (math conventions + blittable struct layout — no Rust test sees this)
+# The C# half (math conventions, blittable struct layout, and the property-bag
+# wire format — no Rust test sees any of it)
 dotnet run --project scripting/Orrin.MathTests
 ```
 
@@ -222,7 +223,13 @@ Rules of thumb:
 - **Adding a component**: define it, `#[derive(Reflect)]`, register it in
   `scene/registry.rs::register_components` under a stable id. Registration is
   explicit and re-runnable — linker-based auto-registration does not survive the
-  dynamic library boundary hot reload creates.
+  dynamic library boundary hot reload creates. A C# component is the same rule
+  from the other side: `[Component("game.thing")]` on the Behaviour, and its id
+  is likewise never derived from the type's name.
+- **Editing a component** goes through `diff` and `apply`, never a bare `write`.
+  Undo, prefab overrides and (later) collaboration sync are all consumers of that
+  one change stream (architecture §4.4), and an edit that skips it is invisible
+  to all three.
 - **Adding a field to an existing component**: `#[reflect(default)]`, or every
   scene saved before today fails to load. Removing or repurposing a field is a
   breaking change and is taken loudly (see the `intensity` → physical-units

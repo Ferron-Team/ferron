@@ -329,6 +329,11 @@ impl App {
 
         let scripting = Scripting::boot(&bindings_dir, &game_dll)?;
 
+        // The game assembly's half of `register_components`, run at the same
+        // point in the load as the engine's own — before anything can attach a
+        // Behaviour, so the first scene to be saved already knows about them.
+        scripting.register_components(&mut self.registry);
+
         // One entry Behaviour; it finds or spawns everything else itself
         // through the script API.
         let entity = self
@@ -548,6 +553,11 @@ impl ApplicationHandler for App {
                             // running what was built; a rejected one leaves the
                             // compiled code still ahead of the live code.
                             if matches!(outcome, crate::scripting::ReloadOutcome::Swapped { .. }) {
+                                // Only after a swap that actually happened: a
+                                // rejected reload leaves the previous assembly
+                                // live, and its registry entries with it.
+                                self.registry.clear_game();
+                                scripting.register_components(&mut self.registry);
                                 self.world
                                     .resource_mut::<crate::build_watcher::BuildStatus>()
                                     .reloaded();

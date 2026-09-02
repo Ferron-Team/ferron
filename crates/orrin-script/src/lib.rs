@@ -346,6 +346,126 @@ pub fn destroy_handle(handle: u64) {
     }
 }
 
+/// The four `Orrin.PropertyBag` entry points, held as process globals for the
+/// same reason [`destroy_handle`] is: the component registry's script entries
+/// are bare `fn` pointers reached from a `ComponentVtable`, with no `&ScriptHost`
+/// anywhere in scope. A registry that had to borrow the host would have to be
+/// owned by it, and the registry deliberately outlives the world *and* the
+/// scripting layer — a scene loads before either exists.
+///
+/// Every one takes a caller-owned buffer and returns the size the value needs:
+/// non-negative means "this many bytes", written only if they fit, so a caller
+/// that guessed too small retries with the number it got back. Negative is a
+/// failure the managed side has already logged.
+mod bag {
+    use super::*;
+
+    pub type ReadFn = extern "system" fn(u64, *mut u8, i32) -> i32;
+    pub type WriteFn = extern "system" fn(u64, *const u8, i32) -> i32;
+    pub type DefaultFn = extern "system" fn(*const c_char, *mut u8, i32) -> i32;
+    pub type ComponentsFn = extern "system" fn(*mut u8, i32) -> i32;
+
+    pub static READ: AtomicUsize = AtomicUsize::new(0);
+    pub static WRITE: AtomicUsize = AtomicUsize::new(0);
+    pub static DEFAULT: AtomicUsize = AtomicUsize::new(0);
+    pub static COMPONENTS: AtomicUsize = AtomicUsize::new(0);
+}
+
+/// What most property bags fit in, so the common path is one managed call.
+///
+/// A component is a handful of scalars; 512 bytes is roughly forty of them.
+/// Overshooting costs a second call and an exact-sized allocation, which is
+/// still correct — this number only decides how often that happens.
+const BAG_HINT: usize = 512;
+
+/// Install the managed property-bag entry points (called once by
+/// [`ScriptHost::boot`]).
+fn set_bag_entry_points(
+    read: bag::ReadFn,
+    write: bag::WriteFn,
+    default: bag::DefaultFn,
+    components: bag::ComponentsFn,
+) {
+    bag::READ.store(read as usize, Ordering::Release);
+    bag::WRITE.store(write as usize, Ordering::Release);
+    bag::DEFAULT.store(default as usize, Ordering::Release);
+    bag::COMPONENTS.store(components as usize, Ordering::Release);
+}
+
+/// Run the size-then-fill protocol against one managed entry point.
+///
+/// `None` when the entry point is not installed (no host booted) or the managed
+/// side reported a failure — which it has already logged, naming the type.
+fn fetch_bag(call: impl Fn(*mut u8, i32) -> i32) -> Option<Vec<u8>> {
+    let mut buffer = vec![0u8; BAG_HINT];
+    let needed = call(buffer.as_mut_ptr(), BAG_HINT as i32);
+    if needed < 0 {
+        return None;
+    }
+    let needed = needed as usize;
+    if needed > buffer.len() {
+        buffer.resize(needed, 0);
+        // The second call must agree with the first about the size. It cannot
+        // disagree unless the behaviour mutated itself between them, which
+        // nothing on this path does — but a shrinking answer would leave the
+        // tail of the buffer as stale bytes, so it is refused rather than
+        // trusted.
+        if call(buffer.as_mut_ptr(), needed as i32) != needed as i32 {
+            return None;
+        }
+    }
+    buffer.truncate(needed);
+    Some(buffer)
+}
+
+/// Encode the fields of the behaviour behind `handle` as one property bag.
+pub fn read_bag(handle: u64) -> Option<Vec<u8>> {
+    let ptr = bag::READ.load(Ordering::Acquire);
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: only ever set by `set_bag_entry_points` from a valid C# `ReadFn`.
+    let read: bag::ReadFn = unsafe { std::mem::transmute::<usize, bag::ReadFn>(ptr) };
+    fetch_bag(|buffer, capacity| read(handle, buffer, capacity))
+}
+
+/// Overwrite that behaviour's fields from `bytes`. Fields the buffer does not
+/// name keep their current values.
+pub fn write_bag(handle: u64, bytes: &[u8]) -> bool {
+    let ptr = bag::WRITE.load(Ordering::Acquire);
+    if ptr == 0 {
+        return false;
+    }
+    // SAFETY: only ever set by `set_bag_entry_points` from a valid C# `WriteFn`.
+    let write: bag::WriteFn = unsafe { std::mem::transmute::<usize, bag::WriteFn>(ptr) };
+    write(handle, bytes.as_ptr(), bytes.len() as i32) >= 0
+}
+
+/// The bag a freshly constructed `type_name` produces — the component's default.
+pub fn default_bag(type_name: &CStr) -> Option<Vec<u8>> {
+    let ptr = bag::DEFAULT.load(Ordering::Acquire);
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: only ever set by `set_bag_entry_points` from a valid C# `DefaultFn`.
+    let default: bag::DefaultFn = unsafe { std::mem::transmute::<usize, bag::DefaultFn>(ptr) };
+    fetch_bag(|buffer, capacity| default(type_name.as_ptr(), buffer, capacity))
+}
+
+/// Every registry-visible Behaviour in the live game assemblies, encoded as a
+/// list of `{ id, type, name }`. The game assembly's half of
+/// `register_components`, re-read after each swap.
+pub fn component_bags() -> Option<Vec<u8>> {
+    let ptr = bag::COMPONENTS.load(Ordering::Acquire);
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: only ever set by `set_bag_entry_points` from a valid C# `ComponentsFn`.
+    let components: bag::ComponentsFn =
+        unsafe { std::mem::transmute::<usize, bag::ComponentsFn>(ptr) };
+    fetch_bag(|buffer, capacity| components(buffer, capacity))
+}
+
 /// C ABI mirror of `orrin_ecs::Entity` (blittable: two `u32`s).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -515,6 +635,7 @@ impl ScriptHost {
             collision_enter_fn, collision_exit_fn, destroy,
             game_load_fn, game_commit_fn, game_rollback_fn, game_unload_fn,
             state_capture_fn, state_apply_fn, state_discard_fn,
+            bag_read, bag_write, bag_default, bag_components,
         ) = {
             let loader = context.get_delegate_loader_for_assembly(pdcstr!("Orrin.dll"))?;
             (
@@ -585,6 +706,24 @@ impl ScriptHost {
                     pdcstr!("Orrin.BehaviourState, Orrin"),
                     pdcstr!("Discard"),
                 )?,
+                // The property bag. Like `Destroy`, these become process
+                // globals rather than `ScriptHost` methods — see `mod bag`.
+                *loader.get_function_with_unmanaged_callers_only::<bag::ReadFn>(
+                    pdcstr!("Orrin.PropertyBag, Orrin"),
+                    pdcstr!("Read"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<bag::WriteFn>(
+                    pdcstr!("Orrin.PropertyBag, Orrin"),
+                    pdcstr!("Write"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<bag::DefaultFn>(
+                    pdcstr!("Orrin.PropertyBag, Orrin"),
+                    pdcstr!("Default"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<bag::ComponentsFn>(
+                    pdcstr!("Orrin.PropertyBag, Orrin"),
+                    pdcstr!("Components"),
+                )?,
             )
         };
 
@@ -601,6 +740,7 @@ impl ScriptHost {
             .into());
         }
         set_destroy_handle(destroy);
+        set_bag_entry_points(bag_read, bag_write, bag_default, bag_components);
 
         Ok(Self {
             _context: context,

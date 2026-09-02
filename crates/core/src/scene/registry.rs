@@ -288,7 +288,7 @@ entity #1
             translation: Vec3::new(4.0, 0.0, 0.0),
             ..Default::default()
         };
-        (vtable.write)(&mut world, entity, &moved.to_value()).unwrap();
+        vtable.write(&mut world, entity, &moved.to_value()).unwrap();
 
         assert_eq!(
             world.get::<LocalTransform>(entity).unwrap().translation,
@@ -307,8 +307,11 @@ entity #1
             ("rotation", Quat::IDENTITY.to_value()),
             ("scale", Vec3::ONE.to_value()),
         ]);
-        let err =
-            (registry.get(&TRANSFORM).unwrap().write)(&mut world, entity, &broken).unwrap_err();
+        let err = registry
+            .get(&TRANSFORM)
+            .unwrap()
+            .write(&mut world, entity, &broken)
+            .unwrap_err();
         assert_eq!(
             err.to_string(),
             "field `translation`: expected vec3, found bool"

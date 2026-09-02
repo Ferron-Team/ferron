@@ -2822,6 +2822,7 @@ dependencies = [
 name = "orrin-registry"
 version = "0.1.0"
 dependencies = [
+ "egui",
  "glam",
  "orrin-ecs",
  "orrin-macros",
