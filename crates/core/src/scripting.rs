@@ -7,11 +7,13 @@
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use glam::{Mat4, Quat, Vec3};
 
 use orrin_ecs::{Entity, FxHashMap, World};
+use orrin_registry::{ComponentId, Registry, ScriptBridge, Value, ValueError};
 use orrin_script::{CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost};
 
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
@@ -683,6 +685,105 @@ extern "C" fn debug_draw_line(
     });
 }
 
+/// Answers the component registry's questions about a C# Behaviour by crossing
+/// into `Orrin.PropertyBag`.
+///
+/// Zero-sized: the managed entry points are process globals (see
+/// `orrin_script::read_bag` for why), so one of these serves every Behaviour
+/// type and carries nothing but the impl.
+///
+/// Every method takes the handle out of the `ScriptComponent` and drops the
+/// world borrow before calling managed code. The bag entry points do not
+/// re-enter the engine, but the rule that no world borrow is held across the
+/// boundary is worth keeping unconditionally — it is the one that stops being
+/// true silently.
+struct PropertyBags;
+
+impl PropertyBags {
+    /// The GCHandle for `entity`'s behaviour, if it is the type this vtable
+    /// entry belongs to. An entity carries at most one `ScriptComponent`, so
+    /// two script components on one entity is simply not a state that exists.
+    fn handle(world: &World, entity: Entity, type_name: &str) -> Option<u64> {
+        world
+            .get::<ScriptComponent>(entity)
+            .filter(|script| script.type_name == type_name)
+            .map(|script| script.handle)
+    }
+}
+
+impl ScriptBridge for PropertyBags {
+    fn has(&self, world: &World, entity: Entity, type_name: &str) -> bool {
+        Self::handle(world, entity, type_name).is_some()
+    }
+
+    fn read(&self, world: &World, entity: Entity, type_name: &str) -> Option<Value> {
+        let bytes = orrin_script::read_bag(Self::handle(world, entity, type_name)?)?;
+        match orrin_registry::wire::decode(&bytes) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                eprintln!("[script] {type_name}'s property bag did not decode: {error}");
+                None
+            }
+        }
+    }
+
+    fn write(
+        &self,
+        world: &mut World,
+        entity: Entity,
+        type_name: &str,
+        value: &Value,
+    ) -> Result<(), ValueError> {
+        let Some(handle) = Self::handle(world, entity, type_name) else {
+            return Err(ValueError::invalid(
+                "a live script component",
+                type_name.to_owned(),
+            ));
+        };
+        let mut bytes = Vec::new();
+        orrin_registry::wire::encode(value, &mut bytes);
+        if orrin_script::write_bag(handle, &bytes) {
+            Ok(())
+        } else {
+            // The managed side has already logged what went wrong, naming the
+            // field; this only says the write did not land.
+            Err(ValueError::invalid(
+                "fields the behaviour accepted",
+                type_name.to_owned(),
+            ))
+        }
+    }
+
+    fn remove(&self, world: &mut World, entity: Entity, type_name: &str) {
+        if Self::handle(world, entity, type_name).is_some() {
+            // Dropping the component is what tears the managed object down; see
+            // `ScriptComponent`'s `Drop`.
+            let _ = world.remove::<ScriptComponent>(entity);
+        }
+    }
+
+    /// An empty struct rather than a panic when the managed side cannot answer:
+    /// a default is asked for while building a prefab or an inspector row, and
+    /// a game assembly that failed to load should leave those blank rather than
+    /// take the editor with it.
+    fn default(&self, type_name: &str) -> Value {
+        let empty = Value::Struct(Vec::new());
+        let Ok(name) = CString::new(type_name) else {
+            return empty;
+        };
+        let Some(bytes) = orrin_script::default_bag(&name) else {
+            return empty;
+        };
+        match orrin_registry::wire::decode(&bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("[script] {type_name}'s defaults did not decode: {error}");
+                empty
+            }
+        }
+    }
+}
+
 fn build_api() -> OrrinApi {
     OrrinApi {
         get_transform,
@@ -1113,6 +1214,74 @@ impl Scripting {
     /// (state capture, the context commit).
     pub fn host(&self) -> &ScriptHost {
         &self.host
+    }
+
+    /// Describe every `[Component]`-attributed Behaviour in the live game
+    /// assembly to `registry`, so its fields save, load and inspect exactly as a
+    /// Rust component's do.
+    ///
+    /// The game assembly's half of `register_components`, and the counterpart to
+    /// [`Registry::clear_game`]: call `clear_game` before the swap and this
+    /// after it, or the previous build's entries keep a retired type reachable
+    /// and its load context never unloads.
+    ///
+    /// Returns how many were registered. A managed failure is already logged by
+    /// the C# side and leaves the registry as it was — the engine runs on with
+    /// script components uninspectable rather than not at all.
+    pub fn register_components(&self, registry: &mut Registry) -> usize {
+        let Some(bytes) = orrin_script::component_bags() else {
+            return 0;
+        };
+        let listing = match orrin_registry::wire::decode(&bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("[script] the component listing did not decode: {error}");
+                return 0;
+            }
+        };
+        let Value::List(entries) = listing else {
+            eprintln!("[script] the component listing was not a list");
+            return 0;
+        };
+
+        let bridge: Arc<dyn ScriptBridge> = Arc::new(PropertyBags);
+        let mut registered = 0;
+        for entry in entries {
+            let (
+                Some(Value::String(id)),
+                Some(Value::String(type_name)),
+                Some(Value::String(name)),
+            ) = (
+                entry.field("id").cloned(),
+                entry.field("type").cloned(),
+                entry.field("name").cloned(),
+            )
+            else {
+                eprintln!("[script] a component listing entry was missing id, type or name");
+                continue;
+            };
+            // The `orrin.` namespace is the engine's, and a game claiming one of
+            // its ids would shadow a component in every scene it saved. Refused
+            // by name rather than by the duplicate-id panic below, which would
+            // take the editor down over a typo in someone's game code.
+            if id.starts_with("orrin.") {
+                eprintln!(
+                    "[script] `{type_name}` claims the reserved id `{id}`; \
+                     the `orrin.` prefix belongs to the engine's own components"
+                );
+                continue;
+            }
+            let component_id = ComponentId::owned(id);
+            if registry.get(&component_id).is_some() {
+                eprintln!(
+                    "[script] `{type_name}` claims `{component_id}`, which is already registered"
+                );
+                continue;
+            }
+            registry.register_script(component_id, name, type_name, Arc::clone(&bridge));
+            registered += 1;
+        }
+        registered
     }
 
     /// Request an activation change; the transition (OnEnable/OnDisable) is

@@ -210,7 +210,7 @@ public static unsafe class Behaviours
     /// context, which pins those types for the life of the process and quietly
     /// defeats hot reload. Only the fallback, for engine-owned types such as
     /// the lifecycle probes, may go through the default ALC.
-    static Type? ResolveType(string name)
+    internal static Type? ResolveType(string name)
     {
         // Behaviours are instantiated with a parameterless constructor, so they
         // are never generic and the first comma always separates the type from

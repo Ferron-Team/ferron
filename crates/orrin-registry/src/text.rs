@@ -68,7 +68,7 @@ pub fn write_entity(out: &mut String, registry: &Registry, world: &World, entity
 
     let mut components: Vec<(&str, Value)> = registry
         .components()
-        .filter_map(|c| (c.read)(world, entity).map(|value| (c.id.as_str(), value)))
+        .filter_map(|c| c.read(world, entity).map(|value| (c.id.as_str(), value)))
         .collect();
     components.sort_by_key(|(id, _)| *id);
 

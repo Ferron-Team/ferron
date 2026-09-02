@@ -4,6 +4,9 @@ using Quaternion = Orrin.Math.Quaternion;
 
 namespace DemoGame;
 
+// Registry-visible: `DegreesPerSecond` is saved with the scene and editable in
+// the inspector, because the class carries a stable id.
+[Component("demo.spinner")]
 public class Spinner : Behaviour
 {
     public float DegreesPerSecond = 90f;

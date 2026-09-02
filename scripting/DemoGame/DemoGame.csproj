@@ -29,4 +29,13 @@
     <ProjectReference Include="../Orrin/Orrin.csproj" Private="false" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- ORRIN001: a Behaviour field that is neither registry-visible nor
+         [Transient]. `OutputItemType="Analyzer"` is what makes the compiler load
+         it rather than link it; `ReferenceOutputAssembly="false"` keeps Roslyn
+         out of the game assembly's own dependency set. -->
+    <ProjectReference Include="../Orrin.Analyzers/Orrin.Analyzers.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
 </Project>

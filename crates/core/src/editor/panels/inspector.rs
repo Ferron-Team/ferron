@@ -33,7 +33,63 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState, regis
     light_section(ui, world, entity);
     #[cfg(feature = "scripting")]
     script_section(ui, world, entity);
+    registered_sections(ui, world, registry, entity);
     actions_section(ui, world, registry, state, entity);
+}
+
+/// The components above name a Rust type each and draw widgets tuned to it.
+/// Anything else the registry knows about is drawn from its vtable instead —
+/// which is what makes a component the engine has never heard of, registered by
+/// a game assembly after a hot reload, inspectable without a panel being written
+/// for it.
+const HAND_DRAWN: [orrin_registry::ComponentId; 3] = [
+    crate::scene::registry::TRANSFORM,
+    crate::scene::registry::NAME,
+    crate::scene::registry::LIGHT,
+];
+
+/// Draw every registered component that has no section of its own.
+///
+/// The edit is made on a detached copy and posted back as the [`diff`] between
+/// the two, rather than written straight into storage. That is the discipline
+/// architecture §4.4 asks for: one mutation stream, so undo, prefab overrides
+/// and eventually sync all see the same changes an inspector drag produced,
+/// rather than each having to observe the world for them.
+///
+/// [`diff`]: orrin_registry::diff
+fn registered_sections(ui: &mut egui::Ui, world: &mut World, registry: &Registry, entity: Entity) {
+    for vtable in registry.components() {
+        if HAND_DRAWN.contains(&vtable.id) {
+            continue;
+        }
+        let Some(before) = vtable.read(world, entity) else {
+            continue;
+        };
+
+        let mut after = before.clone();
+        let touched = egui::CollapsingHeader::new(vtable.name.as_ref())
+            .default_open(true)
+            .show(ui, |ui| (vtable.inspect)(ui, &mut after))
+            .body_returned
+            .unwrap_or(false);
+        if !touched {
+            continue;
+        }
+
+        let changes = orrin_registry::diff(&before, &after);
+        if let Err(error) = vtable.apply(world, entity, &changes) {
+            let frame = world
+                .get_resource::<Time>()
+                .map_or(0, |time| time.frame_count());
+            if let Some(mut log) = world.get_resource_mut::<LogBuffer>() {
+                log.push(
+                    LogLevel::Error,
+                    format!("{} on entity {}: {error}", vtable.id, entity.index()),
+                    frame,
+                );
+            }
+        }
+    }
 }
 
 /// What can be done to the selected entity as a whole, rather than to one of
@@ -257,6 +313,133 @@ fn script_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
                 });
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::{Collider, ColliderShape, Spin, Tag, register_components};
+    use glam::Vec3;
+    use orrin_registry::Value;
+
+    fn registry() -> Registry {
+        let mut registry = Registry::new();
+        register_components(&mut registry);
+        registry
+    }
+
+    /// A hand-written section skips its component here by id. Rename the id and
+    /// the skip stops matching, so the component is drawn twice — once tuned and
+    /// once generic — which looks like a duplicated panel and reads as a
+    /// rendering bug rather than as the rename it is.
+    #[test]
+    fn every_hand_drawn_component_is_registered_under_the_id_it_is_skipped_by() {
+        let registry = registry();
+        for id in &HAND_DRAWN {
+            assert!(
+                registry.get(id).is_some(),
+                "`{id}` is skipped by the inspector but not registered"
+            );
+        }
+    }
+
+    /// The other side of the same coin: every component the registry knows and
+    /// no section draws must reach the generic inspector. Named here so that
+    /// adding a component without a section is visibly a decision.
+    #[test]
+    fn everything_else_is_drawn_from_its_vtable() {
+        let registry = registry();
+        let generic: Vec<&str> = registry
+            .components()
+            .filter(|c| !HAND_DRAWN.contains(&c.id))
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(
+            generic,
+            ["orrin.tag", "orrin.collider", "orrin.spin"],
+            "registration order changed, or a component gained/lost a section"
+        );
+    }
+
+    /// The path an inspector drag takes: read the component, edit the detached
+    /// value, diff, apply. Driven here without egui, because what is worth
+    /// asserting is that the change survives the round trip onto a real
+    /// component — including one whose shape is an enum.
+    #[test]
+    fn an_edit_travels_as_a_diff_and_lands_on_the_component() {
+        let registry = registry();
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(
+            entity,
+            Collider {
+                shape: ColliderShape::Sphere { radius: 1.0 },
+                is_trigger: false,
+            },
+        );
+
+        let vtable = registry.get(&crate::scene::registry::COLLIDER).unwrap();
+        let before = vtable.read(&world, entity).unwrap();
+        let mut after = before.clone();
+        *after.field_mut("is_trigger").unwrap() = Value::Bool(true);
+        *after
+            .field_mut("shape")
+            .unwrap()
+            .field_mut("radius")
+            .unwrap() = Value::F32(2.5);
+
+        let changes = orrin_registry::diff(&before, &after);
+        assert_eq!(changes.len(), 2);
+        vtable.apply(&mut world, entity, &changes).unwrap();
+
+        let collider = world.get::<Collider>(entity).unwrap();
+        assert!(collider.is_trigger);
+        assert!(matches!(collider.shape, ColliderShape::Sphere { radius } if radius == 2.5));
+    }
+
+    /// `Spin::from_value` refuses an axis it cannot normalize. That refusal has
+    /// to survive the diff route as well, or an inspector drag becomes the one
+    /// way into the world that skips a component's own validation.
+    #[test]
+    fn a_component_still_refuses_a_value_its_constructor_rejects() {
+        let registry = registry();
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, Spin::new(Vec3::Y, 1.0));
+
+        let vtable = registry.get(&crate::scene::registry::SPIN).unwrap();
+        let before = vtable.read(&world, entity).unwrap();
+        let mut after = before.clone();
+        *after.field_mut("axis").unwrap() = Value::Vec3(Vec3::ZERO);
+
+        let error = vtable
+            .apply(&mut world, entity, &orrin_registry::diff(&before, &after))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "field `axis`: expected a non-zero axis, found Vec3(0.0, 0.0, 0.0)"
+        );
+        assert_eq!(vtable.read(&world, entity), Some(before));
+    }
+
+    /// A hand-written section is the exception, so the generic one has to handle
+    /// a component it has never been told about — the case every game assembly
+    /// component is in.
+    #[test]
+    fn a_component_with_no_section_reads_back_what_the_inspector_drew() {
+        let registry = registry();
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, Tag::new("player"));
+
+        let vtable = registry.get(&crate::scene::registry::TAG).unwrap();
+        let before = vtable.read(&world, entity).unwrap();
+        let drawn = std::cell::RefCell::new(before.clone());
+        egui::__run_test_ui(|ui| {
+            assert!(!(vtable.inspect)(ui, &mut drawn.borrow_mut()));
+        });
+        assert_eq!(drawn.into_inner(), before);
+    }
 }
 
 /// Range is where the light is cut off, not how far it carries — inverse-square

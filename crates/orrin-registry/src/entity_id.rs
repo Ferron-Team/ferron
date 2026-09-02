@@ -33,6 +33,18 @@ impl EntityId {
     pub fn is_nil(self) -> bool {
         self.0.is_nil()
     }
+
+    /// The 16 bytes in canonical UUID order — the same order the hyphenated
+    /// form prints and the same one .NET's `Guid` constructor from a byte array
+    /// reads, so the two halves of the script boundary agree without either
+    /// having to know the other's endianness.
+    pub const fn to_bytes(self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
+
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
 }
 
 impl fmt::Display for EntityId {

@@ -5,6 +5,7 @@ namespace DemoGame;
 
 // Transform-only "alive" animation: the cube drifts in a gentle figure-8, bobs,
 // breathes (squash & stretch synced to the bob), and tumbles on a tilted axis.
+[Component("demo.hover", Name = "Hover")]
 public class Hover : Behaviour
 {
     public float BobHeight = 0.5f;

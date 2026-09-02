@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- netstandard2.0 is not a choice: the compiler loads an analyzer into its
+         own process, and that host is netstandard2.0. Targeting anything newer
+         builds fine and is then silently ignored at every call site. -->
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+    <IsPackable>false</IsPackable>
+    <!-- RS2008 wants an AnalyzerReleases manifest so downstream consumers can
+         see which rules a version added. This analyzer is never published: it
+         ships in this repository with the code it checks, so its "release" and
+         the engine's are the same commit. -->
+    <NoWarn>$(NoWarn);RS2008</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The only dependency the C# side has, and it is a *build-time* one:
+         `PrivateAssets="all"` keeps it out of anything that references this
+         project, so a game assembly never ships Roslyn. It is restored by the
+         `dotnet build scripting/DemoGame` CI already runs, so the analyzer costs
+         no new step — only the restore, once. Pinned well below the SDK's own
+         Roslyn so the compiler that loads it is never the older of the two. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0"
+                      PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>

@@ -13,13 +13,18 @@
 //! (`inventory`, `ctor`) does not survive a dynamic library boundary, which is
 //! exactly the configuration hot reload creates.
 
+mod diff;
 mod entity_id;
+#[cfg(feature = "egui")]
+pub mod inspect;
 mod reflect;
 mod registry;
 mod scene;
 mod text;
 mod value;
+pub mod wire;
 
+pub use diff::{FieldChange, apply, diff};
 pub use entity_id::EntityId;
 pub use scene::{FORMAT_VERSION, ParseError, SceneDocument, SceneEntity, parse};
 
@@ -28,6 +33,8 @@ pub use scene::{FORMAT_VERSION, ParseError, SceneDocument, SceneEntity, parse};
 /// trait in the type namespace, so one import brings both.
 pub use orrin_macros::Reflect;
 pub use reflect::{Reflect, take, take_or};
-pub use registry::{ComponentId, ComponentVtable, Registry};
+pub use registry::{
+    ApplyError, ComponentId, ComponentVtable, Registry, ScriptBinding, ScriptBridge,
+};
 pub use text::{write_document, write_entity, write_world};
 pub use value::{FieldPath, PathSegment, Value, ValueError};
