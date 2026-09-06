@@ -191,11 +191,13 @@ pub(super) struct CullFrame {
 impl CullFrame {
     /// Where batch `batch` of view `view` starts in `instance_index`, which is
     /// the `firstInstance` its command carries.
+    #[allow(dead_code, reason = "states the layout the culling shaders index by")]
     pub fn object_base(&self, view: u32, batch: usize) -> u32 {
         view * self.stride + self.batches[batch].instance_base
     }
 
     /// Where that batch's draw command sits in `draw_commands`.
+    #[allow(dead_code, reason = "states the layout the culling shaders index by")]
     fn command_index(&self, view: u32, batch: usize) -> u64 {
         view as u64 * self.batches.len() as u64 + batch as u64
     }
@@ -368,7 +370,9 @@ fn index(packed: u32) -> usize {
 }
 
 /// The row of `draw_commands` a packed batch number owns this frame, given
-/// where the masked batches begin.
+/// where the masked batches begin. The shaders do this arithmetic themselves;
+/// this is the CPU-side statement of it the tests check against.
+#[cfg(test)]
 fn slot(packed: u32, plain: usize) -> usize {
     index(packed) + class(packed) * plain
 }
@@ -588,6 +592,10 @@ impl CullPass {
     /// so that a workgroup stays within one view — every invocation in it then
     /// takes the same branch through the two view kinds and reads the same
     /// `View`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a pass records from the frame's bindings; a params struct only renames the list"
+    )]
     pub(super) fn record_cull(
         &self,
         builder: &mut Recorder,

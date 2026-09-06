@@ -838,7 +838,7 @@ impl ApplicationHandler for App {
                         // and the punctual lights are independent, and a scene
                         // with cascades off and a lamp casting is an ordinary
                         // thing to want.
-                        (self.cascades.count > 0 || !self.atlas.faces.is_empty()).then(|| {
+                        (self.cascades.count > 0 || !self.atlas.faces.is_empty()).then_some({
                             ShadowFrame {
                                 cascades: &self.cascades,
                                 casters: &caster_lists,
@@ -1010,21 +1010,18 @@ fn attach_debug_messenger(instance: &Arc<Instance>) -> DebugUtilsMessenger {
         })
     };
 
-    // SAFETY: `ext_debug_utils` was enabled on the instance above, which is the
-    // only precondition beyond the callback's.
-    unsafe {
-        DebugUtilsMessenger::new(
-            instance.clone(),
-            DebugUtilsMessengerCreateInfo {
-                message_severity: DebugUtilsMessageSeverity::ERROR
-                    | DebugUtilsMessageSeverity::WARNING,
-                message_type: DebugUtilsMessageType::GENERAL
-                    | DebugUtilsMessageType::VALIDATION
-                    | DebugUtilsMessageType::PERFORMANCE,
-                ..DebugUtilsMessengerCreateInfo::user_callback(callback)
-            },
-        )
-    }
+    // `ext_debug_utils` was enabled on the instance above, which is the only
+    // precondition beyond the callback's.
+    DebugUtilsMessenger::new(
+        instance.clone(),
+        DebugUtilsMessengerCreateInfo {
+            message_severity: DebugUtilsMessageSeverity::ERROR | DebugUtilsMessageSeverity::WARNING,
+            message_type: DebugUtilsMessageType::GENERAL
+                | DebugUtilsMessageType::VALIDATION
+                | DebugUtilsMessageType::PERFORMANCE,
+            ..DebugUtilsMessengerCreateInfo::user_callback(callback)
+        },
+    )
     .expect("failed to create the validation messenger")
 }
 

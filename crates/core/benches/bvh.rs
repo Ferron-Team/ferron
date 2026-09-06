@@ -7,7 +7,7 @@
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use glam::{Vec3, Vec3A};
+use glam::Vec3A;
 use orrin_core::collision::{Aabb, Bvh};
 
 const COUNTS: [usize; 3] = [100, 1_000, 10_000];
@@ -29,7 +29,7 @@ impl Rng {
 /// `spread` sets density: the same count in a smaller volume overlaps more, so
 /// the broadphase reports more candidate pairs.
 fn bounds(count: usize, spread: f32) -> Vec<Aabb> {
-    let mut rng = Rng(0x0DDB_A11_0_C0FF_EE00);
+    let mut rng = Rng(0x0DDB_A110_C0FF_EE00);
     (0..count)
         .map(|_| {
             let center = Vec3A::new(

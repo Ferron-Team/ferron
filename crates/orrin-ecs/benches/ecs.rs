@@ -5,6 +5,10 @@
 //! runs, and it currently re-resolves the driving parameter's entity through the
 //! sparse array even though iteration already knows its dense index.
 
+// `criterion_group!` expands to an undocumented `benches` function, and the
+// crate warns on missing docs. A bench harness is not the crate's API.
+#![allow(missing_docs)]
+
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
 use orrin_ecs::{Entity, World};

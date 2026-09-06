@@ -119,11 +119,10 @@ impl EntityAllocator {
         self.alive
             .iter()
             .enumerate()
-            .filter_map(move |(i, &alive)| {
-                alive.then(|| Entity {
-                    index: i as u32,
-                    generation: self.generations[i],
-                })
+            .filter(|&(_i, &alive)| alive)
+            .map(|(i, &_alive)| Entity {
+                index: i as u32,
+                generation: self.generations[i],
             })
     }
 }
@@ -773,19 +772,19 @@ impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
                 for i in 0..count {
                     let entity = Q::driver_entity_at(&fetch, i)
                         .expect("query driver lost between driver_len and driver_entity_at");
-                    if let Some(item) = Q::get_at(&mut fetch, i, entity) {
-                        if visit(entity, item) {
-                            return Some(entity);
-                        }
+                    if let Some(item) = Q::get_at(&mut fetch, i, entity)
+                        && visit(entity, item)
+                    {
+                        return Some(entity);
                     }
                 }
             }
             None => {
                 for entity in self.world.entities.iter_alive() {
-                    if let Some(item) = Q::get(&mut fetch, entity) {
-                        if visit(entity, item) {
-                            return Some(entity);
-                        }
+                    if let Some(item) = Q::get(&mut fetch, entity)
+                        && visit(entity, item)
+                    {
+                        return Some(entity);
                     }
                 }
             }

@@ -89,8 +89,7 @@ pub(super) fn segments(order: &[PassId], passes: &[PassDecl], async_compute: boo
     // trailing draw, which is the shape the module docs argue for.
     let last_draw_before_a_dispatch = (0..order.len())
         .filter(|&slot| kind(slot) == PassKind::Inline)
-        .filter(|&slot| (slot + 1..order.len()).any(|later| kind(later) == PassKind::Compute))
-        .next_back();
+        .rfind(|&slot| (slot + 1..order.len()).any(|later| kind(later) == PassKind::Compute));
     let tail_start = last_draw_before_a_dispatch.map_or(0, |slot| slot + 1);
 
     // How far the dispatches run. By construction no draw inside the tail has a

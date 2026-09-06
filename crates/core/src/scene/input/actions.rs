@@ -160,9 +160,7 @@ impl Actions {
     /// edit-to-play transition, where the same stale comparison would fire a
     /// press for every key already held when play began.
     pub fn apply(&mut self, specs: Vec<(String, Spec)>) {
-        for def in &mut self.defs {
-            *def = Definition::Unbound;
-        }
+        self.defs.fill(Definition::Unbound);
         for (name, spec) in specs {
             let id = self.intern(&name);
             let def = match spec {

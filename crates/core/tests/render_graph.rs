@@ -1640,6 +1640,9 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
 /// was never allocated, a reflection trace reading a material target no pass
 /// wrote, or the subsurface blur weighting its taps by a depth that does not
 /// exist.
+/// A named feature and the flag that turns it on.
+type Consumer = (&'static str, fn(&mut FrameConfig));
+
 #[test]
 fn any_single_consumer_keeps_the_geometry_prepass() {
     let base = FrameConfig {
@@ -1670,7 +1673,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         occlusion_culling: false,
     };
 
-    let consumers: [(&str, fn(&mut FrameConfig)); 10] = [
+    let consumers: [Consumer; 10] = [
         ("ssao", |c| c.ssao = true),
         ("contact shadows", |c| c.contact_shadows = true),
         ("taa", |c| c.taa = true),

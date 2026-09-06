@@ -11,7 +11,7 @@
 //! Everything here is device-free and runs on the equirectangular source before
 //! it is ever uploaded, so there is no GPU readback anywhere in the path.
 
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::{FRAC_2_PI, PI, TAU};
 
 use glam::Vec3;
 
@@ -37,7 +37,9 @@ const COSINE_LOBE: [f32; 3] = [1.0, 2.0 / 3.0, 0.25];
 /// trades ringing against directionality: narrower is smoother and flatter,
 /// wider keeps more of the environment's shape and more of the overshoot. Four
 /// is gentle enough to keep a sky reading as a sky.
-const WINDOW: [f32; 3] = [1.0, 0.900_316_3, 0.636_619_8];
+/// `sinc(pi/2)` is `2/pi` exactly, so the last factor is the named constant
+/// rather than a rounded literal — it is the closer of the two in `f32`.
+const WINDOW: [f32; 3] = [1.0, 0.900_316_3, FRAC_2_PI];
 
 /// Radiance above this multiple of the environment's mean is left out of the
 /// *diffuse* projection.

@@ -428,6 +428,10 @@ mod tests {
     /// frames in flight became two slots that filed no GPU span at all. Both
     /// failures are silent — the frame renders, the profiler is just wrong.
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "constant by design: this states a coupling between two consts"
+    )]
     fn a_spare_timestamp_slot_beyond_the_frames_in_flight() {
         assert!(
             SLOTS > super::super::FRAMES_IN_FLIGHT,

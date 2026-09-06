@@ -91,7 +91,7 @@ impl Theme {
     }
 
     pub fn hover_stroke(&self) -> Stroke {
-        Stroke::new(1.0, self.accent().linear_multiply(0.60))
+        Stroke::new(1.0_f32, self.accent().linear_multiply(0.60))
     }
 
     pub fn visuals(&self) -> Visuals {
@@ -111,7 +111,7 @@ impl Theme {
         v.menu_corner_radius = CornerRadius::same(6);
 
         v.selection.bg_fill = self.select_fill();
-        v.selection.stroke = Stroke::new(1.0, self.accent());
+        v.selection.stroke = Stroke::new(1.0_f32, self.accent());
 
         let radius = CornerRadius::same(5);
 
@@ -119,7 +119,7 @@ impl Theme {
         // `inactive` = idle interactive controls (the two are easy to confuse).
         v.widgets.noninteractive.bg_fill = rgb(self.panel);
         v.widgets.noninteractive.weak_bg_fill = rgb(self.panel);
-        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, rgb(self.outline));
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, rgb(self.outline));
         v.widgets.noninteractive.corner_radius = radius;
 
         v.widgets.inactive.bg_fill = rgb(self.widget);
@@ -134,7 +134,7 @@ impl Theme {
 
         v.widgets.active.bg_fill = self.widget_active();
         v.widgets.active.weak_bg_fill = self.widget_active();
-        v.widgets.active.bg_stroke = Stroke::new(1.0, self.accent());
+        v.widgets.active.bg_stroke = Stroke::new(1.0_f32, self.accent());
         v.widgets.active.corner_radius = radius;
 
         v.widgets.open.bg_fill = rgb(self.widget);

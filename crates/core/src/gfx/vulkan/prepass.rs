@@ -247,6 +247,10 @@ impl GeometryPrepass {
         .unwrap()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a pass records from the frame's bindings; a params struct only renames the list"
+    )]
     pub(super) fn record(
         &self,
         builder: &mut Recorder,
@@ -313,7 +317,7 @@ impl GeometryPrepass {
             };
             if bound != Some(wants_masked) {
                 builder
-                    .bind_pipeline_graphics(&pipeline)
+                    .bind_pipeline_graphics(pipeline)
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
                         pipeline.layout(),

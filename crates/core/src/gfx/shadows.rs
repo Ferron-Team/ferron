@@ -71,11 +71,11 @@ pub fn split_distances(near: f32, config: &CascadeConfig) -> [f32; MAX_CASCADES]
     // inert, while a zero would be picked and index a cascade with no matrix.
     let mut splits = [far; MAX_CASCADES];
 
-    for i in 0..count {
+    for (i, split) in splits.iter_mut().take(count).enumerate() {
         let t = (i + 1) as f32 / count as f32;
         let log_split = near * (far / near).powf(t);
         let uniform_split = near + t * (far - near);
-        splits[i] = lambda * log_split + (1.0 - lambda) * uniform_split;
+        *split = lambda * log_split + (1.0 - lambda) * uniform_split;
     }
 
     // Exact, not what `powf` returns at t = 1: the fit uses this as the last
@@ -318,13 +318,12 @@ mod tests {
         };
         let (near, far) = (0.1, config.max_distance);
         let splits = split_distances(near, &config);
-        for i in 0..config.count - 1 {
+        for (i, &split) in splits.iter().take(config.count - 1).enumerate() {
             let t = (i + 1) as f32 / config.count as f32;
             let expected = near + t * (far - near);
             assert!(
-                (splits[i] - expected).abs() < 1e-3,
-                "cascade {i}: {} != {expected}",
-                splits[i],
+                (split - expected).abs() < 1e-3,
+                "cascade {i}: {split} != {expected}",
             );
         }
     }
@@ -337,13 +336,12 @@ mod tests {
         };
         let (near, far) = (0.1, config.max_distance);
         let splits = split_distances(near, &config);
-        for i in 0..config.count - 1 {
+        for (i, &split) in splits.iter().take(config.count - 1).enumerate() {
             let t = (i + 1) as f32 / config.count as f32;
             let expected = near * (far / near).powf(t);
             assert!(
-                (splits[i] - expected).abs() < 1e-3,
-                "cascade {i}: {} != {expected}",
-                splits[i],
+                (split - expected).abs() < 1e-3,
+                "cascade {i}: {split} != {expected}",
             );
         }
     }
@@ -689,9 +687,9 @@ mod tests {
     fn a_zero_light_direction_produces_finite_matrices() {
         let camera = Camera::default();
         let set = cascades(&camera, ASPECT, Vec3::ZERO, &config());
-        for i in 0..set.count {
-            assert!(set.cascades[i].view_proj.is_finite(), "cascade {i}");
-            assert!(set.cascades[i].light_view.is_finite(), "cascade {i}");
+        for (i, cascade) in set.cascades.iter().take(set.count).enumerate() {
+            assert!(cascade.view_proj.is_finite(), "cascade {i}");
+            assert!(cascade.light_view.is_finite(), "cascade {i}");
         }
     }
 }

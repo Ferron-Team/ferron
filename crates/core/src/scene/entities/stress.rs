@@ -27,7 +27,7 @@ use super::spawn_mesh;
 use crate::scene::{Assets, Camera, Collider, ColliderShape, LocalTransform, Name, Transform};
 
 /// Fixed so the same spec lays out identically everywhere, forever.
-const SEED: u64 = 0x0DDB_A11_0_C0FF_EE00;
+const SEED: u64 = 0x0DDB_A110_C0FF_EE00;
 
 /// How much load to add. Zero in a field means that kind is skipped entirely.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

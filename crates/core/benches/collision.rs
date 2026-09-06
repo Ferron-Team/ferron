@@ -47,7 +47,7 @@ fn world_with_colliders(count: usize) -> World {
     let mut world = World::new();
     world.insert_resource(CollisionState::default());
 
-    let mut rng = Rng(0x0DDB_A11_0_C0FF_EE00);
+    let mut rng = Rng(0x0DDB_A110_C0FF_EE00);
     let spread = (count.max(1) as f32).cbrt() * 1.2;
     for index in 0..count {
         let position = Vec3::new(

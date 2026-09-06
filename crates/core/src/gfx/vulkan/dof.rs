@@ -55,6 +55,9 @@ const MAX_COC_RADIUS: f32 = 24.0;
 pub(super) const COC_TILE_SHIFT: u32 = 6;
 
 /// Side of a tile in half-resolution texels, which is what the shaders declare.
+/// Only the tests read it — the pipeline works in `COC_TILE_SHIFT` — and they
+/// are what holds it to the number in the shader source.
+#[cfg(test)]
 const COC_TILE: u32 = 1 << (COC_TILE_SHIFT - 1);
 
 #[derive(BufferContents, Clone, Copy)]
@@ -282,6 +285,10 @@ impl DofPass {
         dispatch_over(builder, &near);
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a pass records from the frame's bindings; a params struct only renames the list"
+    )]
     pub fn record_composite(
         &self,
         builder: &mut Recorder,

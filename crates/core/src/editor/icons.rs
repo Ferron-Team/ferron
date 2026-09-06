@@ -22,6 +22,7 @@ pub fn install(ctx: &egui::Context) {
 macro_rules! icons {
     ($($name:ident => $file:literal,)*) => {
         $(
+            #[allow(dead_code, reason = "the icon set is a palette, not a use list")]
             pub fn $name() -> ImageSource<'static> {
                 egui::include_image!(concat!("../../assets/icons/", $file, ".svg"))
             }

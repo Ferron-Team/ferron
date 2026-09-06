@@ -328,7 +328,7 @@ fn frame_cost() {
                 1.0 / 60.0,
                 &[],
                 profiler.frame_index(),
-                (cascade_set.count > 0).then(|| ShadowFrame {
+                (cascade_set.count > 0).then_some(ShadowFrame {
                     cascades: &cascade_set,
                     casters: &caster_lists,
                     atlas: &atlas,

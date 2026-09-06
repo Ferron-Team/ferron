@@ -179,7 +179,6 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
     // evidence. A capture that wants one grows it the way `app.rs` does.
     let atlas = ShadowAtlas::default();
     let shadow_settings = ShadowSettings::default();
-    let mut cascade_set = CascadeSet::default();
     let aspect = settings.extent[0] as f32 / settings.extent[1] as f32;
 
     for _ in 0..settings.frames.max(1) {
@@ -193,7 +192,7 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
         // Fitted before extraction and after the lighting, exactly as `app.rs`
         // orders it: the boxes are built around the sun that extraction just
         // found, and the caster lists are culled against those boxes.
-        cascade_set = if settings.shadows {
+        let cascade_set = if settings.shadows {
             cascades(
                 &camera,
                 aspect,
@@ -247,7 +246,7 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
             // existed.
             &[],
             0,
-            (cascade_set.count > 0).then(|| ShadowFrame {
+            (cascade_set.count > 0).then_some(ShadowFrame {
                 cascades: &cascade_set,
                 casters: &caster_lists,
                 atlas: &atlas,

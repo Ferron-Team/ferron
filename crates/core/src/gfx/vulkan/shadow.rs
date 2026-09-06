@@ -240,6 +240,10 @@ impl ShadowPass {
     /// `atlas.casters` — one culled list per *light*, drawn into each of its
     /// faces, because a point light's reach is small enough that culling its six
     /// frustums apart would cost more test than it saved draw.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a pass records from the frame's bindings; a params struct only renames the list"
+    )]
     pub(super) fn record_atlas(
         &self,
         builder: &mut Recorder,

@@ -189,10 +189,10 @@ impl EditorState {
     }
 
     pub fn apply(&mut self, world: &mut World, registry: &Registry) {
-        if let Some(kind) = self.spawn_request.take() {
-            if let Some(entity) = spawn(world, kind) {
-                self.selected = Some(entity);
-            }
+        if let Some(kind) = self.spawn_request.take()
+            && let Some(entity) = spawn(world, kind)
+        {
+            self.selected = Some(entity);
         }
         if let Some(entity) = self.despawn_request.take() {
             crate::scene::despawn_recursive(world, entity);

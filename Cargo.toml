@@ -46,6 +46,11 @@ uuid = { version = "1", features = ["v4"] }
 
 [profile.dev]
 opt-level = 1
+# Line tables, not full debuginfo: this is the bulk of dev link time and of
+# the target dir, and it buys back nothing the engine reads. Panic backtraces
+# and profiler symbolication still resolve; only variable inspection in a
+# debugger is lost. Codegen is untouched, so the frame costs do not move.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3

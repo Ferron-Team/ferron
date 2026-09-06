@@ -25,7 +25,7 @@ pub(super) fn partition(costs: &[u32], groups: usize) -> Vec<Range<usize>> {
         return Vec::new();
     }
     if groups <= 1 {
-        return vec![0..costs.len()];
+        return std::iter::once(0..costs.len()).collect();
     }
 
     // Binary search the answer rather than solving the split directly: `runs`
