@@ -594,11 +594,16 @@ impl ApplicationHandler for App {
                     let input = self.world.resource::<InputState>();
                     self.world.resource_mut::<Actions>().resolve(&input);
                 }
+                // Drained into a local first: the `Actions` borrow a `for` over
+                // the call would hold lives to the end of the loop, and the
+                // resources here are one `RefCell` each.
                 let frame = self.world.resource::<Time>().frame_count();
-                for warning in self.world.resource_mut::<Actions>().take_warnings() {
-                    self.world
-                        .resource_mut::<LogBuffer>()
-                        .push(LogLevel::Warning, warning, frame);
+                let warnings = self.world.resource_mut::<Actions>().take_warnings();
+                if !warnings.is_empty() {
+                    let mut log = self.world.resource_mut::<LogBuffer>();
+                    for warning in warnings {
+                        log.push(LogLevel::Warning, warning, frame);
+                    }
                 }
 
                 {

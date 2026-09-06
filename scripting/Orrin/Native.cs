@@ -53,6 +53,10 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<uint, uint, byte> ActionPressed;
     public delegate* unmanaged<uint, uint, byte> ActionReleased;
     public delegate* unmanaged<uint, uint, float> AxisValue;
+    // The mouse's edges, appended after the named input, matching the Rust
+    // struct; never reordered above it.
+    public delegate* unmanaged<uint, byte> MouseButtonPressed;
+    public delegate* unmanaged<uint, byte> MouseButtonReleased;
 }
 
 public static unsafe class Native
@@ -139,6 +143,10 @@ public static unsafe class Native
     public static bool KeyReleased(uint code) => _api.KeyReleased(code) != 0;
 
     public static bool MouseButtonDown(uint button) => _api.MouseButtonDown(button) != 0;
+
+    public static bool MouseButtonPressed(uint button) => _api.MouseButtonPressed(button) != 0;
+
+    public static bool MouseButtonReleased(uint button) => _api.MouseButtonReleased(button) != 0;
 
     public static (float X, float Y) CursorPos()
     {

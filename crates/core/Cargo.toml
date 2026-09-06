@@ -37,6 +37,9 @@ gilrs = "0.11.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Already a dependency above; the input tests need it to build the focus-loss
+# window event, which is the one part of `InputState` with no other door in.
+winit.workspace = true
 
 [features]
 default = ["scripting"]

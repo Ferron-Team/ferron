@@ -211,6 +211,14 @@ extern "C" fn mouse_button_down(button: u32) -> bool {
     with_input(|input| input.mouse_button_down(button))
 }
 
+extern "C" fn mouse_button_pressed(button: u32) -> bool {
+    with_input(|input| input.mouse_button_pressed(button))
+}
+
+extern "C" fn mouse_button_released(button: u32) -> bool {
+    with_input(|input| input.mouse_button_released(button))
+}
+
 // Named input. `action_id` needs `&mut Actions` to intern, which is why it is
 // the one input entry point that takes the resource mutably; the queries below
 // only read.
@@ -861,6 +869,8 @@ fn build_api() -> OrrinApi {
         action_pressed,
         action_released,
         axis_value,
+        mouse_button_pressed,
+        mouse_button_released,
         ..orrin_script::default_api()
     }
 }

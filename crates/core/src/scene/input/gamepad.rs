@@ -134,11 +134,6 @@ impl Gamepads {
         }
     }
 
-    /// The player slot a pad holds, for the editor to show.
-    pub fn slot_of(&self, player: usize) -> Option<GamepadId> {
-        self.slots.get(player).copied().flatten()
-    }
-
     fn attach(&mut self, id: GamepadId, input: &mut InputState) {
         if self.slots.contains(&Some(id)) {
             return;

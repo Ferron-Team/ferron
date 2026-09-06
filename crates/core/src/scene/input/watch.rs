@@ -55,7 +55,7 @@ impl ConfigWatcher {
                 if !(event.kind.is_create() || event.kind.is_modify()) {
                     return;
                 }
-                if event.paths.iter().any(|changed| *changed == target) {
+                if event.paths.contains(&target) {
                     let _ = changes_tx.send(());
                 }
             })

@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use super::binding::{Binding, TRIGGER_THRESHOLD};
+use super::binding::{Binding, MOTION_THRESHOLD, TRIGGER_THRESHOLD};
 use super::keys::MouseAxis;
 use super::{InputState, MAX_PLAYERS};
 
@@ -36,8 +36,11 @@ use super::{InputState, MAX_PLAYERS};
 pub struct ActionId(pub u32);
 
 /// The largest deadzone a config may ask for. Past this the rescale divides by
-/// almost nothing and a stick becomes a switch.
-const MAX_DEADZONE: f32 = 0.9;
+/// almost nothing and a stick becomes a switch. Enforced by
+/// [`config`](super::config), so a file naming a bigger one is refused rather
+/// than quietly clamped; the clamp below is the guard for [`Actions::apply`]
+/// being called with a `Spec` that came from somewhere else.
+pub const MAX_DEADZONE: f32 = 0.9;
 
 /// What a name resolves to. A name may be interned before anything defines it,
 /// which is the shape a typo takes: an id that answers no to everything.
@@ -89,6 +92,10 @@ pub struct Actions {
     held: Vec<[bool; MAX_PLAYERS]>,
     held_last: Vec<[bool; MAX_PLAYERS]>,
     values: Vec<[f32; MAX_PLAYERS]>,
+    /// Whether anything has ever asked for this name's id — which is what makes
+    /// it worth reporting as unbound. A name interned only to be an axis's
+    /// component is nobody's mistake until a script names it too.
+    requested: Vec<bool>,
     /// Set when bindings change, cleared by the next resolve, which seeds the
     /// previous frame from the current one so the swap itself fires no edges.
     /// A rebind while the old key is held would otherwise read as a release,
@@ -107,14 +114,24 @@ impl Actions {
     /// chose on both sides of the file, and a case-folded match would hide the
     /// mismatch rather than report it.
     pub fn id(&mut self, name: &str) -> ActionId {
-        let known = self.ids.contains_key(name);
         let id = self.intern(name);
-        if !known && self.defs[id.0 as usize] == Definition::Unbound {
-            self.warnings.push(format!(
-                "input action `{name}` is not bound; nothing in the input config defines it"
-            ));
+        let index = id.0 as usize;
+        let first = !std::mem::replace(&mut self.requested[index], true);
+        if first && self.defs[index] == Definition::Unbound {
+            self.warn_unbound(index);
         }
         id
+    }
+
+    /// Report a name a caller asked for that nothing binds. Raised once when the
+    /// name is first asked for, and again after any reload that leaves it
+    /// unbound — the second is the one that catches an action renamed in the
+    /// file and not in the script, which is the mistake live reload invites.
+    fn warn_unbound(&mut self, index: usize) {
+        self.warnings.push(format!(
+            "input action `{}` is not bound; nothing in the input config defines it",
+            self.names[index]
+        ));
     }
 
     fn intern(&mut self, name: &str) -> ActionId {
@@ -128,21 +145,20 @@ impl Actions {
         self.held.push([false; MAX_PLAYERS]);
         self.held_last.push([false; MAX_PLAYERS]);
         self.values.push([0.0; MAX_PLAYERS]);
+        self.requested.push(false);
         id
-    }
-
-    /// The id for a name only if it already has one.
-    pub fn lookup(&self, name: &str) -> Option<ActionId> {
-        self.ids.get(name).copied()
-    }
-
-    pub fn name(&self, id: ActionId) -> Option<&str> {
-        self.names.get(id.0 as usize).map(String::as_str)
     }
 
     /// Replace every definition. Names absent from `defs` keep their ids and
     /// fall back to unbound, so a binding deleted from the file stops firing
-    /// without stranding a script that still asks for it.
+    /// without stranding a script that still asks for it — and anything that had
+    /// already asked for one is warned about, here rather than at interning,
+    /// because that is where the name went quiet.
+    ///
+    /// Sets `reseed`, which suppresses the next resolve's edges. That matters
+    /// for the reload this is usually called for, and equally for the
+    /// edit-to-play transition, where the same stale comparison would fire a
+    /// press for every key already held when play began.
     pub fn apply(&mut self, specs: Vec<(String, Spec)>) {
         for def in &mut self.defs {
             *def = Definition::Unbound;
@@ -167,14 +183,11 @@ impl Actions {
             };
             self.defs[id.0 as usize] = def;
         }
-        self.reseed = true;
-    }
-
-    /// Seed the previous frame from the current one, suppressing edges on the
-    /// next resolve. Bindings do this for themselves; the other caller is the
-    /// edit-to-play transition, where the same stale comparison would fire a
-    /// press for every key already held when play began.
-    pub fn reseed(&mut self) {
+        for index in 0..self.defs.len() {
+            if self.requested[index] && self.defs[index] == Definition::Unbound {
+                self.warn_unbound(index);
+            }
+        }
         self.reseed = true;
     }
 
@@ -274,12 +287,23 @@ impl Actions {
 /// Keyboard and mouse answer for player 0 only. They are one device between
 /// however many players are in the room, and letting them answer for every slot
 /// would have player two jumping on player one's spacebar.
+///
+/// An evented source reads held if it is *either* down now or was pressed during
+/// this frame. The second half is what keeps a tap whose press and release both
+/// landed between two resolves: on level state alone it was never down when
+/// anyone looked, so the action would miss what the raw `key_pressed` beside it
+/// catches. It reads held for one frame and released on the next, which is what
+/// a tap is. A pad has no edges to consult — it is sampled, not evented — so a
+/// tap shorter than a frame is invisible there and always was.
 fn digital(input: &InputState, binding: Binding, player: usize) -> bool {
     match binding {
-        Binding::Key(code) => player == 0 && input.key_down(code),
-        Binding::MouseButton(button) => player == 0 && input.mouse_button_down(button as u32),
+        Binding::Key(code) => player == 0 && (input.key_down(code) || input.key_pressed(code)),
+        Binding::MouseButton(button) => {
+            let button = button as u32;
+            player == 0 && (input.mouse_button_down(button) || input.mouse_button_pressed(button))
+        }
         Binding::MouseAxis(_) => {
-            player == 0 && analog(input, binding, player).abs() >= TRIGGER_THRESHOLD
+            player == 0 && analog(input, binding, player).abs() >= MOTION_THRESHOLD
         }
         Binding::PadButton(button) => input.pad_button_down(player, button),
         Binding::PadAxis(axis) => input.pad_axis(player, axis).abs() >= TRIGGER_THRESHOLD,
@@ -312,14 +336,4 @@ fn apply_deadzone(value: f32, deadzone: f32) -> f32 {
         return 0.0;
     }
     (((magnitude - deadzone) / (1.0 - deadzone)).min(1.0)).copysign(value)
-}
-
-impl Binding {
-    /// Whether this source rests at zero and saturates at one, and so can be
-    /// deadzoned and rescaled. Mouse movement is neither: it is a delta in
-    /// pixels with no upper bound, and clamping it to one would cap how fast a
-    /// player may turn.
-    fn is_normalised(self) -> bool {
-        matches!(self, Self::PadAxis(_))
-    }
 }

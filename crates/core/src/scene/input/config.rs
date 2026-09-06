@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::actions::Spec;
+use super::actions::{MAX_DEADZONE, Spec};
 use super::binding::{self, Binding, UnknownBinding};
 
 /// Bumped when the grammar changes in a way an older file does not satisfy.
@@ -78,7 +78,7 @@ pub enum ConfigError {
     },
     AxisShape {
         axis: String,
-        message: &'static str,
+        message: String,
     },
     UnknownComponent {
         axis: String,
@@ -190,11 +190,11 @@ fn axis_spec(name: &str, axis: &RawAxis, file: &File) -> Result<Spec, ConfigErro
                 }
             }
             if axis.deadzone.is_some() || axis.scale.is_some() {
-                return Err(ConfigError::AxisShape {
-                    axis: name.to_owned(),
-                    message: "`deadzone` and `scale` shape an analog source; a \
-                              composed axis is already −1, 0 or 1",
-                });
+                return Err(shape(
+                    name,
+                    "`deadzone` and `scale` shape an analog source; a composed \
+                     axis is already −1, 0 or 1",
+                ));
             }
             Ok(Spec::Composed {
                 positive: positive.clone(),
@@ -206,20 +206,70 @@ fn axis_spec(name: &str, axis: &RawAxis, file: &File) -> Result<Spec, ConfigErro
                 name: name.to_owned(),
                 source: error,
             })?;
+
+            // A deadzone only means something on a source that rests at zero and
+            // saturates at one. Naming one on mouse movement is a
+            // misunderstanding worth reporting: there is no full deflection to
+            // rescale against, so the number would be read and dropped.
+            let deadzone = match (axis.deadzone, source.is_normalised()) {
+                (Some(_), false) => {
+                    return Err(shape(
+                        name,
+                        "`deadzone` needs a source that rests at zero and \
+                         saturates at one — a stick or a trigger. Mouse motion \
+                         is a pixel delta with no full deflection to rescale \
+                         against; use `scale` to set its sensitivity",
+                    ));
+                }
+                (Some(deadzone), true) => deadzone,
+                (None, _) => DEFAULT_DEADZONE,
+            };
+            if !(0.0..=MAX_DEADZONE).contains(&deadzone) {
+                return Err(shape(
+                    name,
+                    &format!(
+                        "`deadzone` is {deadzone}, which is outside 0 to \
+                         {MAX_DEADZONE}. Past that the rescale divides by almost \
+                         nothing and the stick becomes a switch"
+                    ),
+                ));
+            }
+
+            let scale = axis.scale.unwrap_or(1.0);
+            if !scale.is_finite() {
+                return Err(shape(
+                    name,
+                    &format!(
+                        "`scale` is {scale}, which is not a number. It multiplies \
+                         the axis every frame, so the value would reach a \
+                         transform and take the geometry with it"
+                    ),
+                ));
+            }
+
             Ok(Spec::Analog {
                 source,
-                deadzone: axis.deadzone.unwrap_or(DEFAULT_DEADZONE),
-                scale: axis.scale.unwrap_or(1.0),
+                deadzone,
+                scale,
             })
         }
-        (None, None, None) => Err(ConfigError::AxisShape {
-            axis: name.to_owned(),
-            message: "needs either `positive` and `negative`, or `source`",
-        }),
-        _ => Err(ConfigError::AxisShape {
-            axis: name.to_owned(),
-            message: "mixes a composed axis with an analog one; give either \
-                      `positive` and `negative`, or `source`, not both",
-        }),
+        (None, None, None) => Err(shape(
+            name,
+            "needs either `positive` and `negative`, or `source`",
+        )),
+        (Some(_), None, None) => Err(shape(name, "has `positive` but no `negative`")),
+        (None, Some(_), None) => Err(shape(name, "has `negative` but no `positive`")),
+        _ => Err(shape(
+            name,
+            "mixes a composed axis with an analog one; give either `positive` \
+             and `negative`, or `source`, not both",
+        )),
+    }
+}
+
+fn shape(axis: &str, message: &str) -> ConfigError {
+    ConfigError::AxisShape {
+        axis: axis.to_owned(),
+        message: message.to_owned(),
     }
 }

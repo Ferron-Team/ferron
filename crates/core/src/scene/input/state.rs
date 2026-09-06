@@ -12,7 +12,9 @@
 //!
 //! `pressed`/`released` are edge-triggered and valid for exactly one frame —
 //! [`end_frame`](InputState::end_frame) clears them after scripts have observed
-//! them.
+//! them. Keys and mouse buttons both carry them, which is what lets a tap that
+//! begins and ends inside one frame still reach a script; a pad does not,
+//! because it is sampled rather than evented (see [`super::gamepad`]).
 
 use std::collections::HashSet;
 
@@ -29,6 +31,7 @@ pub struct InputState {
     released: HashSet<u32>,
     mouse_held: u8, // bitmask: bit 0 = left, 1 = right, 2 = middle
     mouse_pressed: u8,
+    mouse_released: u8,
     cursor: (f32, f32),
     mouse_delta: (f32, f32),
     pads: [PadState; MAX_PLAYERS],
@@ -79,16 +82,15 @@ impl InputState {
                 }
             }
             WindowEvent::MouseInput { button, state, .. } => {
-                let Some(bit) = mouse_bit(*button) else {
+                let Some(index) = mouse_index(*button) else {
                     return;
                 };
                 if state.is_pressed() {
                     if !egui_wants {
-                        self.mouse_pressed |= bit & !self.mouse_held;
-                        self.mouse_held |= bit;
+                        self.press_mouse_button(index);
                     }
                 } else {
-                    self.mouse_held &= !bit;
+                    self.release_mouse_button(index);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -115,6 +117,7 @@ impl InputState {
         self.pressed.clear();
         self.released.clear();
         self.mouse_pressed = 0;
+        self.mouse_released = 0;
         self.mouse_delta = (0.0, 0.0);
     }
 
@@ -137,6 +140,10 @@ impl InputState {
 
     pub fn mouse_button_pressed(&self, button: u32) -> bool {
         button < 3 && self.mouse_pressed & (1 << button) != 0
+    }
+
+    pub fn mouse_button_released(&self, button: u32) -> bool {
+        button < 3 && self.mouse_released & (1 << button) != 0
     }
 
     /// Cursor position in window coordinates (physical pixels).
@@ -164,6 +171,7 @@ impl InputState {
         for code in std::mem::take(&mut self.held) {
             self.released.insert(code);
         }
+        self.mouse_released |= self.mouse_held;
         self.mouse_held = 0;
         for slot in 0..MAX_PLAYERS {
             self.clear_pad(slot);
@@ -189,6 +197,24 @@ impl InputState {
     pub fn release(&mut self, code: u32) {
         if self.held.remove(&code) {
             self.released.insert(code);
+        }
+    }
+
+    /// Record a mouse button going down. `button`: 0 = left, 1 = right,
+    /// 2 = middle, matching [`mouse_button_down`](Self::mouse_button_down).
+    pub fn press_mouse_button(&mut self, button: u32) {
+        if button < 3 {
+            let bit = 1 << button;
+            self.mouse_pressed |= bit & !self.mouse_held;
+            self.mouse_held |= bit;
+        }
+    }
+
+    pub fn release_mouse_button(&mut self, button: u32) {
+        if button < 3 {
+            let bit = 1 << button;
+            self.mouse_released |= bit & self.mouse_held;
+            self.mouse_held &= !bit;
         }
     }
 
@@ -242,11 +268,13 @@ impl InputState {
     }
 }
 
-fn mouse_bit(button: MouseButton) -> Option<u8> {
+/// Our button numbering for a winit button, or `None` for one we have no name
+/// for. See [`keys::MOUSE_BUTTONS`](super::keys::MOUSE_BUTTONS).
+fn mouse_index(button: MouseButton) -> Option<u32> {
     Some(match button {
-        MouseButton::Left => 1 << 0,
-        MouseButton::Right => 1 << 1,
-        MouseButton::Middle => 1 << 2,
+        MouseButton::Left => 0,
+        MouseButton::Right => 1,
+        MouseButton::Middle => 2,
         _ => return None,
     })
 }

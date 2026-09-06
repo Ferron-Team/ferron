@@ -38,9 +38,9 @@ public enum MouseButton : uint
     Middle = 2,
 }
 
-// Polled input, valid during OnStart/OnUpdate. GetKeyDown/GetKeyUp are
-// edge-triggered: true only on the frame the key changed state. Input the
-// editor UI claims (e.g. typing in a panel) is not visible here.
+// Polled input, valid during OnStart/OnUpdate. The Down/Up queries are
+// edge-triggered: true only on the frame the key or button changed state. Input
+// the editor UI claims (e.g. typing in a panel) is not visible here.
 //
 // Prefer the named actions below to the raw key queries: a name is bound in
 // the project's input.toml, so remapping a control is a text edit rather than
@@ -64,6 +64,14 @@ public static class Input
     /// True while the mouse button is held.
     public static bool GetMouseButton(MouseButton button) =>
         Native.MouseButtonDown((uint)button);
+
+    /// True on the frame the mouse button went down.
+    public static bool GetMouseButtonDown(MouseButton button) =>
+        Native.MouseButtonPressed((uint)button);
+
+    /// True on the frame the mouse button was released.
+    public static bool GetMouseButtonUp(MouseButton button) =>
+        Native.MouseButtonReleased((uint)button);
 
     /// True while any binding for the action is held.
     public static bool IsHeld(string action, int player = 0) =>
@@ -91,12 +99,21 @@ public static class Input
     // invalidating and a name crosses the boundary once rather than per query.
     private static readonly Dictionary<string, uint> Handles = new();
 
+    // What the engine answers when there was no table to intern into. Mirrors
+    // `orrin_script::NO_ACTION`.
+    private const uint NoAction = uint.MaxValue;
+
     private static uint Handle(string name)
     {
         if (Handles.TryGetValue(name, out var id))
             return id;
         id = Native.ActionId(name);
-        Handles[name] = id;
+        // A non-answer is not cached. The cache never invalidates, so storing
+        // one would make a single unlucky early query — asked before the engine
+        // had a world to intern into — permanent for the process, and the name
+        // would read as unbound forever afterwards.
+        if (id != NoAction)
+            Handles[name] = id;
         return id;
     }
 

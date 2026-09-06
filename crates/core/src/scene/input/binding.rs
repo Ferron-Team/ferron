@@ -7,17 +7,26 @@
 //! shape of the file.
 //!
 //! Sources divide into digital and analog, and either can serve either role.
-//! An action binding to an analog source compares it against
-//! [`TRIGGER_THRESHOLD`]; an axis binding to a digital source reads it as 0 or
-//! 1. That is what makes a trigger usable as a jump button and `W` usable as
-//! half of an axis without two vocabularies.
+//! An action binding to an analog source compares it against a threshold; an
+//! axis binding to a digital source reads it as zero or one. That is what makes
+//! a trigger usable as a jump button and `W` usable as half of an axis without
+//! two vocabularies.
 
 use super::keys::{self, MouseAxis, PadAxis, PadButton};
 
-/// How far an analog source must travel to read as a pressed button. Past the
-/// resting slop of a worn trigger, short of the point where a player would say
-/// they had pulled it.
+/// How far a *bounded* analog source — a stick, a trigger — must travel to read
+/// as a pressed button. Past the resting slop of a worn trigger, short of the
+/// point where a player would say they had pulled it.
 pub const TRIGGER_THRESHOLD: f32 = 0.5;
+
+/// How far the mouse must travel in a frame to read as a pressed button.
+///
+/// Its own constant rather than [`TRIGGER_THRESHOLD`]'s, because the two are not
+/// the same quantity: a trigger is a fraction of full travel, mouse motion is a
+/// pixel delta with no upper bound. Half a pixel is the smallest honest answer
+/// to "did the mouse move this frame", and a fraction-of-travel number would
+/// mean nothing here.
+pub const MOTION_THRESHOLD: f32 = 0.5;
 
 /// One physical source a binding can name.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -30,10 +39,16 @@ pub enum Binding {
 }
 
 impl Binding {
-    /// Whether this source belongs to a gamepad, and so resolves against the
-    /// pad assigned to a player rather than against the one keyboard.
-    pub fn is_pad(self) -> bool {
-        matches!(self, Self::PadButton(_) | Self::PadAxis(_))
+    /// Whether this source rests at zero and saturates at one, and so can be
+    /// deadzoned and rescaled.
+    ///
+    /// Mouse movement is neither: it is a delta in pixels with no upper bound,
+    /// and clamping it to one would cap how fast a player may turn. A digital
+    /// source is not one either — it is already exactly zero or one, so there is
+    /// no slop to cut out. Read by resolution to decide whether to deadzone, and
+    /// by [`config`](super::config) to refuse a deadzone that would do nothing.
+    pub fn is_normalised(self) -> bool {
+        matches!(self, Self::PadAxis(_))
     }
 }
 

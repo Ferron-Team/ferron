@@ -108,6 +108,11 @@ pub struct OrrinApi {
     pub action_pressed: extern "C" fn(u32, u32) -> bool,
     pub action_released: extern "C" fn(u32, u32) -> bool,
     pub axis_value: extern "C" fn(u32, u32) -> f32,
+    // The mouse's edges, appended after the named input. `mouse_button_down`
+    // above is level state; these two are the one-frame edges its keyboard
+    // counterparts have had since the beginning.
+    pub mouse_button_pressed: extern "C" fn(u32) -> bool,
+    pub mouse_button_released: extern "C" fn(u32) -> bool,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -155,6 +160,8 @@ pub fn default_api() -> OrrinApi {
         action_pressed: stub_action_query,
         action_released: stub_action_query,
         axis_value: stub_axis_value,
+        mouse_button_pressed: stub_key_query,
+        mouse_button_released: stub_key_query,
     }
 }
 

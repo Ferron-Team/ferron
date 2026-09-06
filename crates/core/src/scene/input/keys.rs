@@ -112,7 +112,9 @@ pub const KEYS: &[Key] = &[
     key("RightAlt", 54, KeyCode::AltRight),
 ];
 
-/// Mouse buttons, by the bit they occupy in [`super::InputState`]'s mask.
+/// Mouse buttons, by the number [`super::InputState`] and the C# `MouseButton`
+/// enum both address them with. An index, not a mask bit — the mask is private
+/// to `state`, which shifts by these.
 pub const MOUSE_BUTTONS: &[(&str, u8)] = &[("Left", 0), ("Right", 1), ("Middle", 2)];
 
 /// Mouse movement, in window pixels accumulated over the frame.
@@ -222,9 +224,4 @@ pub fn key_from_winit(code: KeyCode) -> Option<u32> {
     KEYS.iter()
         .find(|key| key.winit == code)
         .map(|key| key.code)
-}
-
-/// The canonical name of an engine key code, for error messages and the editor.
-pub fn key_name(code: u32) -> Option<&'static str> {
-    KEYS.iter().find(|key| key.code == code).map(|key| key.name)
 }
