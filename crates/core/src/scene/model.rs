@@ -648,7 +648,7 @@ fn fallback_tangent(normal: Vec3) -> Vec4 {
 /// shared vertex's normal further than a sliver does.
 fn derive_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
     let mut normals = vec![Vec3::ZERO; positions.len()];
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let [i0, i1, i2] = [
             triangle[0] as usize,
             triangle[1] as usize,
@@ -690,7 +690,7 @@ fn derive_tangents(
     let mut tangents = vec![Vec3::ZERO; positions.len()];
     let mut bitangents = vec![Vec3::ZERO; positions.len()];
 
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let [i0, i1, i2] = [
             triangle[0] as usize,
             triangle[1] as usize,

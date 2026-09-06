@@ -613,11 +613,10 @@ mod shadow_culling_tests {
 
         assert_eq!(kept, reference_kept, "per-cascade caster counts differ");
         // A sweep where every box is kept, or none is, would agree trivially.
-        for index in 0..set.count {
+        for (index, &count) in kept.iter().take(set.count).enumerate() {
             assert!(
-                kept[index] > 0 && kept[index] < tested,
-                "cascade {index} kept {} of {tested}: the sweep straddles nothing",
-                kept[index],
+                count > 0 && count < tested,
+                "cascade {index} kept {count} of {tested}: the sweep straddles nothing",
             );
         }
     }

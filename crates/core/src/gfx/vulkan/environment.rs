@@ -296,6 +296,10 @@ impl EnvironmentPass {
 
     /// Record the skybox. Called at the end of the forward pass body, after the
     /// geometry, so the depth test rejects it everywhere something was drawn.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a pass records from the frame's bindings; a params struct only renames the list"
+    )]
     pub fn record_skybox(
         &self,
         builder: &mut Recorder,
@@ -355,7 +359,7 @@ impl EnvironmentPass {
                     depth_range: 0.0..=1.0,
                 }],
             )
-            .bind_pipeline_graphics(&pipeline)
+            .bind_pipeline_graphics(pipeline)
             .bind_descriptor_sets(PipelineBindPoint::Graphics, pipeline.layout(), 0, &[set])
             .push_constants(
                 pipeline.layout(),
@@ -517,12 +521,12 @@ fn render_level<P: BufferContents>(
                     depth_range: 0.0..=1.0,
                 }],
             )
-            .bind_pipeline_graphics(&pipeline)
+            .bind_pipeline_graphics(pipeline)
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 pipeline.layout(),
                 0,
-                &[set.clone()],
+                std::slice::from_ref(set),
             )
             .push_constants(pipeline.layout(), 0, &push(face as usize));
         builder.draw(3, 1, 0, 0);
@@ -893,7 +897,6 @@ fn build_skybox_pipeline(
                 depth: Some(DepthState {
                     write_enable: false,
                     compare_op: CompareOp::LessOrEqual,
-                    ..Default::default()
                 }),
                 ..Default::default()
             }),

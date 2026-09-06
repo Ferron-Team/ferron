@@ -158,6 +158,7 @@ impl GraphImages {
     }
 
     /// How many frames' worth of images this holds.
+    #[allow(dead_code, reason = "counterpart to `set_slot`; reads the same field")]
     pub fn slots(&self) -> usize {
         self.views.len()
     }

@@ -128,11 +128,11 @@ impl CameraController {
     }
 
     pub fn process_device_event(&mut self, event: &DeviceEvent) {
-        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.looking {
-                self.look_delta.0 += *dx as f32;
-                self.look_delta.1 += *dy as f32;
-            }
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
+            && self.looking
+        {
+            self.look_delta.0 += *dx as f32;
+            self.look_delta.1 += *dy as f32;
         }
     }
 

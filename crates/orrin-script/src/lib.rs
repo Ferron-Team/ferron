@@ -286,6 +286,13 @@ extern "C" fn stub_cursor_pos(x: *mut f32, y: *mut f32) {
 }
 
 /// Logging callback C# invokes through [`OrrinApi::log`].
+//
+// The three log sinks below take a raw pointer without being `unsafe fn`, which
+// clippy denies by default. They cannot be `unsafe fn`: `OrrinApi` declares
+// these fields as safe `extern "C" fn` pointers, and that struct is the frozen
+// ABI the managed side reads. The pointer is never supplied by Rust — CoreCLR
+// is the only caller — and each one null-checks before it reads.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn orrin_log(message: *const c_char) {
     if message.is_null() {
         return;
@@ -298,6 +305,7 @@ pub extern "C" fn orrin_log(message: *const c_char) {
 /// Default warning sink (the engine overrides it to route into the editor
 /// console). Prints to stderr so a script's diagnostics are still visible when
 /// no console is present.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn orrin_log_warn(message: *const c_char) {
     if message.is_null() {
         return;
@@ -308,6 +316,7 @@ pub extern "C" fn orrin_log_warn(message: *const c_char) {
 }
 
 /// Default error sink; see [`orrin_log_warn`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn orrin_log_error(message: *const c_char) {
     if message.is_null() {
         return;

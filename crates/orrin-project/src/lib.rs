@@ -1,5 +1,4 @@
 use crate::ProjectError::ParentDirInPath;
-use serde;
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 

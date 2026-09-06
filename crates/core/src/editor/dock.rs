@@ -346,7 +346,7 @@ fn dock_style(style: &egui::Style) -> Style {
 
     // A tool body is a panel: panel fill, one hairline outline, no fill change.
     dock.tab.tab_body.bg_fill = visuals.panel_fill;
-    dock.tab.tab_body.stroke = egui::Stroke::new(1.0, outline);
+    dock.tab.tab_body.stroke = egui::Stroke::new(1.0_f32, outline);
     dock.tab.tab_body.corner_radius = egui::CornerRadius::ZERO;
     dock.tab.tab_body.inner_margin = egui::Margin::same(8);
 
@@ -467,9 +467,11 @@ mod tests {
         // None of it may be hard-coded: a user theme has to carry through. The
         // accent reaches the dock through the hover stroke now that no fill
         // uses it, and the surfaces move with the theme's greys.
-        let mut ember = crate::editor::theme::Theme::default();
-        ember.accent = [255, 120, 60];
-        ember.widget = [70, 60, 55];
+        let ember = crate::editor::theme::Theme {
+            accent: [255, 120, 60],
+            widget: [70, 60, 55],
+            ..crate::editor::theme::Theme::default()
+        };
         crate::editor::theme::apply(&ctx, &ember);
         let themed = dock_style(&ctx.style());
         assert_ne!(

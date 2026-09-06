@@ -234,7 +234,7 @@ fn graph(
 
     for (ms, color) in [(16.67, theme::GUIDE_60), (33.33, theme::GUIDE_30)] {
         if ms <= scale_ms {
-            painter.hline(rect.x_range(), y_for(ms), egui::Stroke::new(1.0, color));
+            painter.hline(rect.x_range(), y_for(ms), egui::Stroke::new(1.0_f32, color));
         }
     }
 
@@ -249,7 +249,7 @@ fn graph(
                     egui::pos2(x, y_for(ms))
                 })
                 .collect();
-            painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, color)));
+            painter.add(egui::Shape::line(points, egui::Stroke::new(1.5_f32, color)));
         }
     }
 }

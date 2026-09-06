@@ -147,6 +147,10 @@ pub fn spawn_point_light(
 /// `lumens` is the same quantity a point light takes, and the spot gets a
 /// reflector: the cone concentrates that power rather than masking it, so
 /// narrowing `outer_angle` brightens the beam.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is one physical quantity of the light"
+)]
 pub fn spawn_spot_light(
     world: &mut World,
     name: impl Into<String>,

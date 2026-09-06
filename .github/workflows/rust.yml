@@ -26,8 +26,12 @@ jobs:
           sudo apt-get install -y cmake ninja-build python3 build-essential git \
             pkg-config libudev-dev
 
+      # Nightly, to match rust-toolchain.toml. The file alone would be enough —
+      # cargo honours it and fetches the channel itself — but then this step
+      # would install a stable that nothing ever runs, so the two are kept in
+      # step instead.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
 
       # Scripting is a default feature, so the workspace build compiles
       # orrin-script and hosts CoreCLR. The Rust half needs only the nethost
@@ -48,11 +52,36 @@ jobs:
           # an earlier failing run.
           prefix-key: "v2-rust"
 
+      # Neither of these ran here before, which is how `cargo clippy` came to be
+      # failing on three FFI lints without CI ever saying so. `-D warnings` is
+      # what keeps that from happening again — with the cost, on a floating
+      # nightly, that a lint added upstream turns the build red on a day nobody
+      # changed anything. Relax to a bare `cargo clippy` if that trade stops
+      # being worth it.
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Build
         run: cargo build --workspace --verbose
 
+      # Prebuilt binary, so this costs a download rather than a compile.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # nextest runs each test in its own process and schedules them across the
+      # runner's cores: 4.7s -> 1.1s on this suite locally. Retries are
+      # deliberately not enabled — a test that only passes on the second
+      # attempt is a bug worth failing over, not noise worth hiding.
       - name: Test
-        run: cargo test --workspace --verbose
+        run: cargo nextest run --workspace
+
+      # nextest does not run doctests, so they keep their own step. Dropping
+      # this would silently stop compiling the one in `World::spawn_entity`.
+      - name: Doctests
+        run: cargo test --workspace --doc
 
       # The other build shape. Scripting is on by default because a
       # second-class build is one nobody compiles until it has already rotted —

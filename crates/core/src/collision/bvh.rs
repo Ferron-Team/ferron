@@ -168,7 +168,7 @@ impl Bvh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::{Vec3, Vec3A};
+    use glam::Vec3A;
 
     fn aabb(min: [f32; 3], max: [f32; 3]) -> Aabb {
         Aabb {

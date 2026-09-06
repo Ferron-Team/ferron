@@ -131,7 +131,7 @@ impl LinePass {
                     depth_range: 0.0..=1.0,
                 }],
             )
-            .bind_pipeline_graphics(&pipeline)
+            .bind_pipeline_graphics(pipeline)
             .push_constants(pipeline.layout(), 0, &view_proj)
             .bind_vertex_buffers(0, buffer);
 
@@ -198,7 +198,6 @@ fn build_pipeline(
                 depth: Some(DepthState {
                     write_enable: false,
                     compare_op: CompareOp::Less,
-                    ..Default::default()
                 }),
                 ..Default::default()
             }),

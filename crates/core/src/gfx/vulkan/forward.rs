@@ -1029,7 +1029,7 @@ impl ForwardPass {
         // and a frame where nothing punctual casts still has to bind something
         // for the descriptor. Every light's face index is -1 in that frame, so
         // the row is never read.
-        let face_count = atlas.faces.len().min(MAX_ATLAS_FACES).max(1);
+        let face_count = atlas.faces.len().clamp(1, MAX_ATLAS_FACES);
         let shadow_faces = self
             .shadow_face_allocator
             .allocate_slice::<GpuShadowFace>(face_count as u64);
@@ -1174,7 +1174,7 @@ impl ForwardPass {
                 // and this is a formality — but it is the formality that keeps
                 // it true if one of them ever stops being.
                 builder
-                    .bind_pipeline_graphics(&pipeline)
+                    .bind_pipeline_graphics(pipeline)
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
                         pipeline.layout(),
@@ -1199,7 +1199,7 @@ impl ForwardPass {
         for region in draws.regions() {
             let pipeline = if region.masked { masked } else { plain };
             builder
-                .bind_pipeline_graphics(&pipeline)
+                .bind_pipeline_graphics(pipeline)
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
                     pipeline.layout(),
@@ -1548,7 +1548,6 @@ fn build_pipeline(
                     DepthState {
                         write_enable: false,
                         compare_op: CompareOp::Equal,
-                        ..Default::default()
                     }
                 } else {
                     DepthState::simple()

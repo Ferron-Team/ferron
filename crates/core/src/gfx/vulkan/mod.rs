@@ -1754,7 +1754,7 @@ impl VulkanRenderer {
             .iter()
             .map(|segment| (segment.queue, segment.passes.clone()))
             .collect();
-        let overlay_pass = raw_passes.iter().any(|body| *body == PassBody::Overlay);
+        let overlay_pass = raw_passes.contains(&PassBody::Overlay);
 
         let mut recorded: Vec<(GraphQueue, CommandBuffer, record::KeepAlive)> =
             Vec::with_capacity(ranges.len());
@@ -1912,7 +1912,7 @@ impl VulkanRenderer {
             head_commands,
             head_keep,
             &head_waits,
-            &[head_done.clone()],
+            std::slice::from_ref(&head_done),
         );
 
         // 2. The previous frame's trailing segment, behind this frame's head.
@@ -1985,7 +1985,7 @@ impl VulkanRenderer {
             compute_commands,
             compute_keep,
             &compute_waits,
-            &[compute_done.clone()],
+            std::slice::from_ref(&compute_done),
         ));
         self.in_flight.push(in_flight);
 
@@ -2410,7 +2410,7 @@ impl FrameRecord<'_> {
                         .collect();
                     self.ssr.record_hiz(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.images.view(prepass.depth),
                         &mips,
                         self.extent,
@@ -2426,7 +2426,7 @@ impl FrameRecord<'_> {
                         .map(|level| self.images.mip_view(ids.source_pyramid, level))
                         .collect();
                     self.ssr
-                        .record_source(builder, &self.ctx, self.view_of(ids.source), &mips);
+                        .record_source(builder, self.ctx, self.view_of(ids.source), &mips);
                 }
                 PassBody::SsrTrace => {
                     let ids = self
@@ -2441,7 +2441,7 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled reflections with no prepass");
                     self.ssr.record_trace(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.images.view(ids.hiz),
                         self.images.view(prepass.depth),
                         self.images.view(prepass.normal),
@@ -2463,7 +2463,7 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled reflections with no prepass");
                     self.ssr.record_resolve(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.view_of(ids.source),
                         self.images.view(ids.rays),
                         self.images.view(prepass.depth),
@@ -2476,7 +2476,7 @@ impl FrameRecord<'_> {
                 }
                 PassBody::FogScatter => {
                     self.fog
-                        .record_scatter(builder, &self.ctx, self.shadow_view.clone());
+                        .record_scatter(builder, self.ctx, self.shadow_view.clone());
                 }
                 PassBody::FogIntegrate => {
                     let ids = self
@@ -2485,7 +2485,7 @@ impl FrameRecord<'_> {
                         .fog
                         .expect("fog passes without their volumes");
                     self.fog
-                        .record_integrate(builder, &self.ctx, self.images.view(ids.volume));
+                        .record_integrate(builder, self.ctx, self.images.view(ids.volume));
                 }
                 PassBody::SubsurfaceBlurHorizontal | PassBody::SubsurfaceBlurVertical => {
                     let ids = self
@@ -2508,7 +2508,7 @@ impl FrameRecord<'_> {
                     };
                     self.subsurface.record_blur(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.images.view(source),
                         self.images.view(prepass.depth),
                         self.images.view(target),
@@ -2523,7 +2523,7 @@ impl FrameRecord<'_> {
                         .expect("subsurface diffusion without its targets");
                     self.subsurface.record_composite(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.view_of(ids.source),
                         self.images.view(ids.blurred_y),
                         self.images.view(ids.output),
@@ -2537,7 +2537,7 @@ impl FrameRecord<'_> {
                         .expect("transparency without its targets");
                     self.oit.record_composite(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.view_of(ids.source),
                         self.images.view(ids.accum),
                         self.images.view(ids.reveal),
@@ -2555,7 +2555,7 @@ impl FrameRecord<'_> {
                         .collect();
                     self.refraction.record_pyramid(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.view_of(ids.source),
                         &mips,
                     );
@@ -2568,7 +2568,7 @@ impl FrameRecord<'_> {
                         .expect("refraction without its images");
                     self.refraction.record_composite(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.view_of(ids.source),
                         self.images.view(ids.accum),
                         self.images.view(ids.output),
@@ -2583,7 +2583,7 @@ impl FrameRecord<'_> {
                     let taa = self.frame.ids.taa.expect("TAA without its images");
                     self.taa.record(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         &self.view,
                         self.view_of(taa.source),
                         self.images.view(ids.velocity),
@@ -2603,7 +2603,7 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled depth of field with no prepass");
                     self.dof.record_prefilter(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.view_of(ids.source),
                         self.images.view(prepass.depth),
                         self.images.view(ids.prefiltered),
@@ -2617,7 +2617,7 @@ impl FrameRecord<'_> {
                         .expect("depth of field without its images");
                     self.dof.record_tile_max(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.images.view(ids.prefiltered),
                         self.images.view(ids.tile),
                     );
@@ -2630,7 +2630,7 @@ impl FrameRecord<'_> {
                         .expect("depth of field without its images");
                     self.dof.record_gather(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.images.view(ids.prefiltered),
                         self.images.view(ids.tile),
                         self.images.view(ids.near),
@@ -2650,7 +2650,7 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled depth of field with no prepass");
                     self.dof.record_composite(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.view_of(ids.source),
                         self.images.view(prepass.depth),
                         self.images.view(ids.near),
@@ -2671,7 +2671,7 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled motion blur with no prepass");
                     self.motion_blur.record_tile_max(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         &self.view,
                         self.images.view(prepass.velocity),
                         self.images.view(prepass.depth),
@@ -2686,7 +2686,7 @@ impl FrameRecord<'_> {
                         .expect("motion blur without its images");
                     self.motion_blur.record_neighbour_max(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.images.view(ids.tile),
                         self.images.view(ids.neighbour),
                     );
@@ -2704,7 +2704,7 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled motion blur with no prepass");
                     self.motion_blur.record_gather(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         &self.view,
                         self.view_of(ids.source),
                         self.images.view(prepass.velocity),
@@ -2743,26 +2743,25 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled the occlusion pyramid with no prepass");
                     self.occlusion.record(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.images.view(prepass.depth),
                         self.extent,
                     );
                 }
                 PassBody::LuminanceHistogram => self.exposure.record_histogram(
                     builder,
-                    &self.ctx,
+                    self.ctx,
                     self.extent,
                     self.scene_color.clone(),
                 ),
                 PassBody::LuminanceAverage => {
-                    self.exposure
-                        .record_average(builder, &self.ctx, self.extent)
+                    self.exposure.record_average(builder, self.ctx, self.extent)
                 }
                 PassBody::BloomPrefilter => {
                     let ids = self.frame.ids.bloom.expect("bloom pass without levels");
                     self.bloom.record_prefilter(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.scene_color.clone(),
                         self.images.view(ids.down(0)),
                         self.exposure.exposure_buffer(),
@@ -2773,7 +2772,7 @@ impl FrameRecord<'_> {
                     let level = level as usize;
                     self.bloom.record_downsample(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.images.view(ids.down(level - 1)),
                         self.images.view(ids.down(level)),
                     );
@@ -2791,7 +2790,7 @@ impl FrameRecord<'_> {
                     };
                     self.bloom.record_upsample(
                         builder,
-                        &self.ctx,
+                        self.ctx,
                         self.images.view(coarse),
                         self.images.view(ids.down(level)),
                         self.images.view(ids.up(level)),
@@ -2810,7 +2809,7 @@ impl FrameRecord<'_> {
         // time and a positional clear list that had to match its order.
         let rendering = rendering::rendering_info(
             &self.frame.ids,
-            &self.images,
+            self.images,
             &self.swapchain_view,
             body,
             self.env.background,
@@ -2940,7 +2939,7 @@ impl FrameRecord<'_> {
                 // and would otherwise paint over them.
                 self.environment.record_skybox(
                     builder,
-                    &self.ctx,
+                    self.ctx,
                     &self.view,
                     self.extent,
                     self.env,
@@ -2992,7 +2991,7 @@ impl FrameRecord<'_> {
             }
             PassBody::Tonemap => self.hdr.record_tonemap(
                 builder,
-                &self.ctx,
+                self.ctx,
                 self.extent,
                 self.scene_color.clone(),
                 self.exposure.exposure_buffer(),
