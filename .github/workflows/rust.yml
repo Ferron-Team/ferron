@@ -17,10 +17,14 @@ jobs:
       # shaderc-sys builds a *static* libshaderc from source, so the
       # vulkano-shaders proc-macro is self-contained — nothing for rustc to
       # dynamically resolve when it loads the macro (the E0463 we were hitting).
-      - name: Install shaderc build dependencies
+      #
+      # libudev is gilrs's Linux backend: it enumerates gamepads through
+      # /dev/input, so the input crate does not link without the headers.
+      - name: Install shaderc and gamepad build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build python3 build-essential git
+          sudo apt-get install -y cmake ninja-build python3 build-essential git \
+            pkg-config libudev-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

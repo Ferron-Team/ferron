@@ -90,7 +90,35 @@ pub struct OrrinApi {
     pub set_world_transform: extern "C" fn(CEntity, *const CTransform) -> bool,
     pub get_parent: extern "C" fn(CEntity) -> CEntity,
     pub set_parent: extern "C" fn(CEntity, CEntity, bool) -> bool,
+    // Named input. Appended after `set_parent`; never reordered above it.
+    //
+    // `action_id` interns a name and hands back a handle that is stable for the
+    // life of the process — reloading a binding file changes what a handle
+    // points at, never what it is, so C# may cache one and keep it across a
+    // reload. A name nothing binds still gets a handle; it simply answers no.
+    // The name is the only string here, crossed once per action rather than on
+    // every query.
+    //
+    // The trailing `u32` is the player slot. Keyboard and mouse bindings answer
+    // for slot 0 only; a gamepad binding answers for the pad assigned to that
+    // slot. `action_held` and friends read false for an id naming an axis, and
+    // `axis_value` reads zero for one naming an action.
+    pub action_id: extern "C" fn(*const c_char) -> u32,
+    pub action_held: extern "C" fn(u32, u32) -> bool,
+    pub action_pressed: extern "C" fn(u32, u32) -> bool,
+    pub action_released: extern "C" fn(u32, u32) -> bool,
+    pub axis_value: extern "C" fn(u32, u32) -> f32,
+    // The mouse's edges, appended after the named input. `mouse_button_down`
+    // above is level state; these two are the one-frame edges its keyboard
+    // counterparts have had since the beginning.
+    pub mouse_button_pressed: extern "C" fn(u32) -> bool,
+    pub mouse_button_released: extern "C" fn(u32) -> bool,
 }
+
+/// The handle `action_id` returns when there is no engine behind the table.
+/// Distinct from a real id so a stubbed query cannot be mistaken for action
+/// zero.
+pub const NO_ACTION: u32 = u32::MAX;
 
 /// A table with the generic functions wired and the rest stubbed; the engine
 /// overrides `get_transform`/`set_transform` and the input functions with real
@@ -127,7 +155,26 @@ pub fn default_api() -> OrrinApi {
         set_world_transform: stub_set_transform,
         get_parent: stub_get_parent,
         set_parent: stub_set_parent,
+        action_id: stub_action_id,
+        action_held: stub_action_query,
+        action_pressed: stub_action_query,
+        action_released: stub_action_query,
+        axis_value: stub_axis_value,
+        mouse_button_pressed: stub_key_query,
+        mouse_button_released: stub_key_query,
     }
+}
+
+extern "C" fn stub_action_id(_name: *const c_char) -> u32 {
+    NO_ACTION
+}
+
+extern "C" fn stub_action_query(_id: u32, _player: u32) -> bool {
+    false
+}
+
+extern "C" fn stub_axis_value(_id: u32, _player: u32) -> f32 {
+    0.0
 }
 
 extern "C" fn stub_debug_draw_line(

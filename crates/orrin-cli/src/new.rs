@@ -31,6 +31,7 @@ pub fn scaffold(name: &str, parent: &Path) -> Fallible {
 
     let files = [
         ("orrin.toml", manifest(name, &assembly)),
+        ("input.toml", INPUT.to_string()),
         (".gitignore", GITIGNORE.to_string()),
         ("README.md", readme(name, &assembly)),
         ("assets/.gitkeep", String::new()),
@@ -128,6 +129,41 @@ dir = "assets"
     )
 }
 
+/// The starting bindings. Present rather than left to the user because a
+/// project without the file has no actions at all, and `Input.IsPressed("Jump")`
+/// answering false forever is a poor first experience of a system whose whole
+/// point is that controls are data.
+const INPUT: &str = r#"format_version = 1
+
+# What each control is called. A name may list several sources; any of them
+# fires it. Keyboard keys are unprefixed; other devices are not.
+[actions]
+Jump    = ["Space", "Gamepad.South"]
+Left    = ["A", "LeftArrow", "Gamepad.DPadLeft"]
+Right   = ["D", "RightArrow", "Gamepad.DPadRight"]
+Forward = ["W", "UpArrow", "Gamepad.DPadUp"]
+Back    = ["S", "DownArrow", "Gamepad.DPadDown"]
+
+# Axes compose the actions above, so a key is named once and rebinding an
+# action moves every axis built on it. An axis may instead read one analog
+# source directly, with a deadzone and a scale.
+[axes.Horizontal]
+positive = "Right"
+negative = "Left"
+
+[axes.Vertical]
+positive = "Forward"
+negative = "Back"
+
+[axes.LookX]
+source = "Mouse.X"
+scale = 0.1
+
+[axes.LookY]
+source = "Mouse.Y"
+scale = 0.1
+"#;
+
 const GITIGNORE: &str = "# Build output
 bin/
 obj/
@@ -142,6 +178,10 @@ fn readme(name: &str, assembly: &str) -> String {
         (
             "  orrin.toml",
             "project manifest — the engine reads this from cwd (or any parent)",
+        ),
+        (
+            "  input.toml",
+            "action and axis bindings, reloaded when you save it",
         ),
         ("  assets/", "source assets + .meta sidecars"),
         ("  scripts/", "C# game code"),
